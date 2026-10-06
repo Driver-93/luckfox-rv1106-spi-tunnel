@@ -33,14 +33,6 @@
   超过 5% 时页面变红提示"超时过短，正在误停"。
 * 图传走 WebRTC（低延迟），带宽吃紧时自动可切档位。
 
-## 实车
-
-| 整车 | 侧面 | 接线 |
-|---|---|---|
-| ![整车](docs/images/car-top.jpg) | ![侧面](docs/images/car-side.jpg) | ![接线](docs/images/car-wiring.jpg) |
-
-![硬件总览](docs/images/hardware-overview.png)
-
 ---
 
 ## 为什么值得一看
