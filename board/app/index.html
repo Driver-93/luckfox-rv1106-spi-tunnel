@@ -386,9 +386,7 @@ kbd{background:#21262d;border:1px solid var(--line);border-bottom-width:2px;
       </div>
 
       <div class="btns">
-        <button class="b stop wide" id="btnStop">■ 停止</button>
-        <button class="b ghost" id="btnCenter">回正摇杆</button>
-        <button class="b ghost" id="btnBrake">刹车</button>
+        <button class="b stop wide" id="btnStop">■ 停止 / 回正</button>
       </div>
 
       <div id="dirbar">
@@ -1226,18 +1224,33 @@ function bindTurn(el, dir){
 bindTurn($('rotL'), -1);
 bindTurn($('rotR'), +1);
 
+/* 键盘按键状态。**必须声明在 btnStop 之前** —— 停止按钮要清空它,
+   否则"按住 W 时点停止"会让车立刻又走起来 (keys 里还留着 w)。 */
+const keys = {};
+
+/* ---- 停止 / 回正 (一个按钮, 两件事一起做) ----
+ * 原来是三个按钮: 停止 / 回正摇杆 / 刹车。用户要求只留一个 —— 因为"停"和
+ * "回正"在开车时永远是同一个动作 (急停之后摇杆当然要回中), 分成两个按钮
+ * 只会让人在慌乱时点错。
+ *
+ * 所以这一个按钮同时做四件事:
+ *   1. 把运动矢量归零 (vx/vy = 0)
+ *   2. 松开可能按住的方向键 (否则键盘还按着, 下一次 keyApply 又把它推回去)
+ *   3. 把摇杆圆点**视觉上**弹回中心 (否则数值停了但圆点还歪着, 看着像没停)
+ *   4. 停掉原地转 + 给板子发 stop
+ *
+ * 注意第 2 条: 之前"停止"按钮不清 keys, 导致"按住 W 的同时点停止, 车会
+ * 立刻又走起来" —— 这是真实踩过的坑。
+ */
 $('btnStop').onclick = () => {
   vx = vy = 0; turnStop();
-  knob.style.transform = 'translate(-50%,-50%)'; updOut(); api('/api/cmd', {c:'stop'});
-};
-$('btnCenter').onclick = () => { stickEnd(); api('/api/cmd', {c:'stop'}); };
-$('btnBrake').onclick = () => {
-  vx = vy = 0; turnStop();
-  knob.style.transform = 'translate(-50%,-50%)'; updOut(); api('/api/cmd', {c:'brake'});
+  for(const k in keys) delete keys[k];
+  dragId = null; stick.classList.remove('active');
+  knob.style.transform = 'translate(-50%,-50%)';
+  updOut(); api('/api/cmd', {c:'stop'});
 };
 
 /* ---- 键盘 ---- */
-const keys = {};
 function keyApply(){
   let x=0, y=0;
   if(keys['w']||keys['arrowup']) y += 1;
