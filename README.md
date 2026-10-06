@@ -35,6 +35,16 @@
 
 ---
 
+## 实车
+
+| 整车 | 侧面 | 接线 |
+|---|---|---|
+| ![整车](docs/images/car-top.jpg) | ![侧面](docs/images/car-side.jpg) | ![接线](docs/images/car-wiring.jpg) |
+
+![硬件总览](docs/images/hardware-overview.png)
+
+---
+
 ## 为什么值得一看
 
 这个项目里大部分代码不是"写出来"的，是**被单核 + 无重传 + 无 IP 通路这三重约束逼出来的**。
