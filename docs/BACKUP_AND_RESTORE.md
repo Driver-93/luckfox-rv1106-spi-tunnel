@@ -91,7 +91,7 @@ cd /root/spitun_build   # 里面有 Makefile (obj-m := spitun.o, KDIR=objs_kerne
 make
 # 产物 spitun.ko ~362KB, vermagic=5.10.160
 ```
-源码副本：仓库 `spitun_kmod/spitun.c`（与 SDK 的 `drv_sys/…/spitun/spitun.c` 保持同步）。
+源码副本：仓库 `driver/spitun.c`（与 SDK 的 `drv_sys/…/spitun/spitun.c` 保持同步）。
 
 ### 热替换（会断网几秒，必须后台跑）
 

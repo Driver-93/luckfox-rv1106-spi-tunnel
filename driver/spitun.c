@@ -18,7 +18,7 @@
  * 内核里这些全部消失: 直接调 SPI 子系统, DMA 直接读写, 中断直接处理,
  * 而且可以连续提交多帧而不逐帧等待 —— 不再受 stop-and-wait 的往返限制。
  *
- * ---- 协议 (必须与 C5 固件 spi_tunnel_c3/main/tunnel.h 完全一致) ----
+ * ---- 协议 (必须与 C5 固件 firmware/c5-tunnel/tunnel.h 完全一致) ----
  *
  * 帧头 16 字节, 小端:
  *     off  0  u32 magic     0x3254464C

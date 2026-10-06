@@ -2,7 +2,7 @@
   "_说明": [
     "这是 sanitized 模板, 真实凭据不在仓库里。",
     "部署时把它拷成 car/car_config.json 并填入你的实际值:",
-    "  cp car_config.example.json car/car_config.json  然后改 broker/password/token",
+    "  cp board/config/car_config.example.json car/car_config.json  然后改 broker/password/token",
     "pin 段按你的实际接线改 (默认是与 MD240A + TB6612 对应的 GPIO 号)。"
   ],
   "mqtt": {

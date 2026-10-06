@@ -152,7 +152,7 @@ print('%.1f ms' % ((time.time()-t0)*1000))
 
 | 日期 | 变更 | 文件 |
 |---|---|---|
-| 09-23 | Q/E 左右转符号互换 | `car/index.html` |
+| 09-23 | Q/E 左右转符号互换 | `board/app/index.html` |
 | 09-23 | WiFi 信号显示上网页 | `web_server.py`, `index.html`, `spinet.py`, C3 `tunnel.c` |
 | 09-23 | C3 状态经 SPI 隧道推送 (`TUN_T_STAT`) | C3 `tunnel.c`, `netlog.c` |
 | 09-23 | C3 改静态 IP 192.168.3.69 | C3 `main.c` |
@@ -357,7 +357,7 @@ W revproxy: feed miss id=... len=642 (slot gone)
 
 用户报"按了没反应，偶尔成功，有时候延迟执行"。用板子侧指令追踪
 （`/userdata/cmd_trace.log`，`do_POST` 里按需记录）+ C5 串口 + 单进程观测器
-`fs_watch.py` 三方对齐后，结论如下。
+`tools/diagnose/watch-failsafe.py` 三方对齐后，结论如下。
 
 ## 1. ✅ 指令链路是通的（不是网络/前端不通）
 
@@ -378,7 +378,7 @@ W revproxy: feed miss id=... len=642 (slot gone)
 
 用户确认："主要靠 USB/调试线供电，电池没接或没开"。
 
-`car/WIRING.md` 里**早就记过同一个坑**：
+`docs/WIRING.md` 里**早就记过同一个坑**：
 
 > ⚠️ 供电（必须电池，不能用板子USB）
 > 电机走板子 USB 供电 → 电机启动拉垮供电 → **板子欠压掉线**；
@@ -407,7 +407,7 @@ W revproxy: feed miss id=... len=642 (slot gone)
 **0% idle**，web 线程和 250Hz 软件 PWM 线程一起被饿死。
 恰好覆盖用户按键盘的那段时间，直接造成了一轮"按了没反应"。
 
-已改成单进程常驻 `fs_watch.py`（开销 <1%）。
+已改成单进程常驻 `tools/diagnose/watch-failsafe.py`（开销 <1%）。
 **教训**：在这块板子上，任何"循环里起 python 进程"的脚本都是故障源。
 
 ---

@@ -1,4 +1,4 @@
-# Luckfox Pico Pro Max 4G/WiFi 遥控小车
+# Luckfox Pico Pro Max 遥控小车
 
 一台**单核 Linux 小车**的完整实现：摄像头图传、网页遥控、失控保护，
 以及本项目最核心的部分 —— **用 ESP32-C5 当 SPI 从机做的内核态网络隧道**。
@@ -15,6 +15,34 @@
 
 ---
 
+## 目录结构
+
+```
+firmware/c5-tunnel/     ESP32-C5 侧固件 (SPI 从机 + WiFi + NAPT)
+driver/spitun.c         板子侧内核模块: SPI 隧道 (核心)
+board/
+  app/                  板子侧应用 (网页服务 / 电机 / 图传 / 摄像头 / GPS)
+  init.d/               开机启动链 (按启动顺序编号, 名字即用途)
+  config/               配置模板 (car_config / mediamtx)
+  dts/                  SPI0 + spitun 节点的设备树 overlay
+tools/
+  build/                交叉编译 (内核 / 内核模块)
+  deploy/               部署 (整机部署 / 模块热替换 / 只刷 boot)
+  diagnose/             测量与观测 (控制延迟 / 失控保护 / SPI 丢帧 / TCP 重传)
+docs/                   文档与截图
+```
+
+| 关心什么 | 看哪里 |
+|---|---|
+| 隧道怎么做的、为什么这么做 | `driver/spitun.c` + `docs/SPI_TUNNEL_DESIGN.md` |
+| 延迟瓶颈的实测分析 | `docs/SPI_LATENCY_ANALYSIS.md` |
+| 完整的开发过程与踩坑记录 | `docs/PROGRESS.md` |
+| 硬件怎么接 | `docs/WIRING.md` |
+| 板上怎么部署 | `board/init.d/` + `tools/deploy/` |
+| 出问题怎么查 | `docs/ISSUES.md` + `tools/diagnose/` |
+
+---
+
 ## 界面
 
 网页控制端（PC / 手机同一套，自适应）：
@@ -28,10 +56,10 @@
 界面里几个**为排查问题专门做**的元素（都是踩坑之后加的）：
 
 * **`已发 N 条 · 距上次发出 xxms · RTT xxms`** —— 一眼看出"页面到底有没有在发指令"。
-  这个数一直变大 = 页面卡住了；板子 1 秒收不到指令就会自动停车。
+  这个数一直变大 = 页面卡住了；板子收不到指令就会自动停车。
 * **失效保护告警** —— 板子统计"指令到达间隔超过失控超时的比例"（误停率），
   超过 5% 时页面变红提示"超时过短，正在误停"。
-* 图传走 WebRTC（低延迟），带宽吃紧时自动可切档位。
+* 图传走 WebRTC（低延迟），带宽吃紧时可切档位。
 
 ---
 
@@ -40,7 +68,7 @@
 这个项目里大部分代码不是"写出来"的，是**被单核 + 无重传 + 无 IP 通路这三重约束逼出来的**。
 每个非显然的设计决定，代码注释里都记了**实测数据和踩过的坑**。
 
-### 1. SPI 隧道做在内核里（`spitun_kmod/spitun.c`）
+### 1. SPI 隧道做在内核里（`driver/spitun.c`）
 
 原来跑在用户态 Python（`spinet.py`），在单核 A7 上**忙轮询吃掉 25~36% CPU**，
 把视频编码饿死。搬到内核后 CPU 占用降到 ~0%，帧率恢复。
@@ -73,31 +101,16 @@ ip route replace 192.168.3.0/24 dev spitun0 src 10.77.0.2 table 100
 
 ### 3. 失控保护（deadman）+ 前导沿心跳
 
-网页曾经"只在数值变化时才发指令"，按住不动时板子 1 秒收不到 → 停车 →
+网页曾经"只在数值变化时才发指令"，按住不动时板子收不到心跳 → 停车 →
 表现为"车走走停停"。现在**输入一变立刻发 + 100ms 心跳 + 请求超时**，
-并且超时可配置、页面能自检版本（改了没生效会自动重载）。
+并且超时可配置（`board/config/board/config/car_config.example.json` 的 `failsafe_s`）、
+页面能自检版本（改了没生效会自动重载）。
 
 ### 4. 单核上的每一毫秒都要算
 
 注释里能看到大量"这里曾经吃掉多少 CPU"的记录：软件 PWM 从 1kHz 降到 250Hz、
 遥测采集从 5Hz 降回 1Hz（`read_adc_mv` 单次 264ms，5Hz 就是 132% CPU，
 物理上跑不完）、Nagle 关闭省下 36ms/条指令……
-
----
-
-## 目录
-
-| 路径 | 说明 |
-|---|---|
-| `spitun_kmod/spitun.c` | **板子侧 SPI 隧道内核模块**（含重传/打包/优先队列） |
-| `spi_tunnel_c3/main/` | **ESP32-C5 侧固件**（SPI 从机 + WiFi + NAPT）|
-| `car/` | 板子侧应用：`web_server.py`、`car_motor.py`、`index.html`、`video_ctl.py`、`cam_ctl.py` |
-| `car/S22spinet` 等 | init.d 脚本（隧道/网页/图传/看门狗）|
-| `hw_spi_v1.dts` / `hw_spi.dtbo` | 启用 SPI0 与 `spitun` 节点匹配的设备树 |
-| `wsl_*.sh` | 交叉编译内核/模块的脚本 |
-| `PROGRESS.md` | **完整的开发日志**（每轮的问题、数据、结论、弯路）|
-| `SPI_LATENCY_ANALYSIS.md` | SPI 隧道延迟的实测分析（为什么是"每帧固定开销"限制吞吐）|
-| `BACKUP_README.md` | 两代备份（用户态 / 内核态）与恢复步骤 |
 
 ---
 
@@ -130,29 +143,47 @@ ip route replace 192.168.3.0/24 dev spitun0 src 10.77.0.2 table 100
 
 ---
 
-## 配置
+## 部署
 
-真实凭据**不在仓库里**。拷贝模板再填：
+**1. 配置**（真实凭据不在仓库里，用模板填）：
 
 ```sh
-cp car_config.example.json car/car_config.json   # 填 MQTT broker/密码、引脚
-cp spi_tunnel_c3/main/main.c.example spi_tunnel_c3/main/main.c  # 填 WiFi SSID/密码
+cp board/config/board/config/car_config.example.json /userdata/car/car_config.json
+# 填 MQTT broker / 密码 / 引脚
+cp firmware/c5-tunnel/main.c.example firmware/c5-tunnel/main.c
+# 填 WiFi SSID / 密码, 然后用 idf.py build flash
 ```
 
-`.gitignore` 已排除 `car_config.json`、`main.c`、`sdkconfig`、私钥等。
+**2. 板子侧**：
+
+```sh
+# 应用
+scp board/app/* root@<板子IP>:/userdata/car/
+# 启动链 (注意: init.d 里的文件名必须与板上一致)
+scp board/init.d/S* root@<板子IP>:/etc/init.d/
+ssh root@<板子IP> "chmod 755 /etc/init.d/S*; reboot"
+# 设备树 overlay
+scp board/dts/spi0-tunnel.dts ...     # 编译成 .dtbo 后由 hwcfg 加载
+```
+
+**3. 内核模块**（必须与运行内核同源编译）：
+
+```sh
+tools/build/build-spitun.sh        # WSL 里跑, 产物 spitun.ko
+tools/deploy/reload-tunnel.sh      # 热替换 (会断网几秒, 自动回滚)
+```
 
 ---
 
-## 编译
+## 诊断工具
 
-**内核模块**（需要与运行内核同源的 SDK 与工具链）：
-
-```sh
-export PATH=$SDK/tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf/bin:$PATH
-cd spitun_kmod && make        # 产物 spitun.ko, vermagic 必须与板子内核一致
-```
-
-**ESP32-C5 固件**：标准 ESP-IDF 工程，`idf.py build flash`。
+| 工具 | 用途 |
+|---|---|
+| `tools/diagnose/measure-control-latency.sh` | 控制往返延迟分解测量 |
+| `tools/diagnose/test-failsafe.sh` | 失控保护验证（覆盖"误停"与"漏停"）|
+| `tools/diagnose/watch-failsafe.py` | 板子侧观测失控触发与 C5 复位 |
+| `tools/diagnose/watch-spi-loss.py` | SPI 帧失败率 / 重传观测 |
+| `tools/diagnose/tcp-retransmits.py` | TCP 重传计数（丢包的间接证据）|
 
 ---
 

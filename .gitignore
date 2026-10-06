@@ -1,4 +1,4 @@
-# ?????? / ??? (??????)
+﻿# 构建产物 / 固件
 *.img
 *.bin
 *.elf
@@ -19,59 +19,47 @@
 *.pyc
 __pycache__/
 
-# ?????/ ?????? / ?????platform-tools/
+# 厂商工具与刷机包
+platform-tools/
 SocToolKit/
 DriverAssitant/
 boardimg/
 firmware_out/
 fw_4g/
 Luckfox_Pico_Pro_Max_Flash_250607/
-spi_tunnel_c3/build/
-spi_tunnel_c3/bin/
-spi_tunnel_c3/managed_components/
-spi_tunnel_c3/dependencies.lock
-car/c/ffmpeg_armhf
-car/c/rtsp_relay
-car/c/carctl_static
+firmware/c5-tunnel/build/
+firmware/c5-tunnel/managed_components/
+firmware/c5-tunnel/dependencies.lock
 mediamtx_armv7.tar.gz
 tun.ko
 
-# ??? / ???
-*.pdf
-*.ts
+# 媒体
 *.m3u8
-car/preview/
-_shots/
+*.ts
+*.pdf
 
-# ---- ??? (???!) ----
+# ---- 凭据 (绝不入库) ----
 id_ed25519
 id_ed25519.pub
 server_car.pem
 *.pem
 *.key
 *.ppk
-car/car_config.json
-spi_tunnel_c3/main/main.c
-spi_tunnel_c3/main/main.c.pre-wififix
-spi_tunnel_c3/sdkconfig
-spi_tunnel_c3/sdkconfig.old
-tools_20261003/_patch_c5*.py
-_debug_archive/srv_emqx_user.sh
+board/config/car_config.json
+firmware/c5-tunnel/main.c
+firmware/c5-tunnel/sdkconfig
+firmware/c5-tunnel/sdkconfig.old
 
-# ?????/ ??? / ???
+# 运行时 / 日志
 *.log
-c3_serial*.log
-hb_log.csv
 .mimocode/
 _tools/
-_debug_archive/
-board_backup_*/
-backup_*/
 _public/
-_snap_kernel/
-_snap_kernel.tar.gz
+_staging/
 
-# ?????????? (docs/images), ???????
+# 图片: 只允许 docs/images 下的配图
+*.png
+*.jpg
+*.jpeg
 !docs/images/*.png
 !docs/images/*.jpg
-
