@@ -176,23 +176,78 @@ main{max-width:1100px;margin:0 auto;padding:10px 12px 24px}
   text-transform:uppercase;letter-spacing:.5px}
 
 /* 转盘 + 左右两侧的原地转按钮。
- * 用 flex 把两个三角贴在圆盘左右, 与圆盘**垂直居中**对齐。
- * 三角用 CSS border 画 (纯字符 ▲ 在不同字体下大小/基线不一致)。 */
-#stickWrap{display:flex;align-items:center;justify-content:center;gap:10px}
-.rotb{width:44px;height:44px;flex:none;border-radius:50%;cursor:pointer;
-  border:1px solid var(--line);background:var(--card2);padding:0;
+ *
+ * 形状要求 (用户指定): **直角三角, 左右镜像对称**。
+ *
+ *     ◀▏  ( O )  ▕▶
+ *     左          右
+ *
+ *   左三角: 直角边(竖直)贴圆盘, 尖朝**左**
+ *   右三角: 直角边(竖直)贴圆盘, 尖朝**右**
+ *   两者是严格的镜像 —— 看起来就像圆盘左右各长出一个"播放键"。
+ * 这样三角是"贴"在圆盘外缘的, 不占额外方框, 手机上左右拇指正好
+ * 落在圆盘两侧, 手掌不用移动就能按到。
+ *
+ * ---- border 画三角的原理 (这里踩过坑, 实测记录) ----
+ * 宽高都是 0 的盒子, 四条 border 各自斜切成三角形。
+ *
+ * ⚠️ 想让实色部分成为**直角三角**, 必须**只留一条透明边**:
+ *     border-top:36px transparent  +  border-right:24px solid
+ *         -> 直角在右下角, 尖朝左, 斜边从左下到右上  ✓ 直角三角
+ *     若写成 border-top:18px + border-bottom:18px 都透明
+ *         -> 得到的是**等腰三角** (尖在左中, 上下对称)  ✗ 不是我想要的
+ *
+ * 一开始我就是写成了两条透明边, 渲染出来是等腰三角, 被用户指出来了。
+ * 现在这份是**用真实浏览器逐像素量过**的 (见 _tritest.js):
+ *   变体 B/C = 直角三角 (宽度从 24 单调收到 1, 最宽行贴在圆盘那侧)
+ *   变体 A/D = 等腰三角 (宽度 1->24->1, 中间最宽)
+ */
+#stickWrap{display:flex;align-items:center;justify-content:center;gap:0}
+.rotb{flex:none;cursor:pointer;padding:0;border:0;background:none;
   display:flex;align-items:center;justify-content:center;
+  /* 触摸热区 (透明), 比三角形本身大一圈, 手机上好按 */
+  width:36px;height:64px;
   touch-action:none;-webkit-tap-highlight-color:transparent;
-  transition:background .12s,transform .06s,border-color .12s}
+  border-radius:var(--r-sm);
+  transition:background .12s}
+/* 直角三角本体 (伪元素)。宽=0 高=0, 全靠 border 撑出形状。
+ *
+ * 目标形状 (实测逐像素调出来的):
+ *
+ *     左 ◀            右 ▶
+ *     ┌              ┐
+ *     │╲             ╱│
+ *     │ ╲           ╱ │      <- 竖直直角边贴圆盘
+ *     │  ╲         ╱  │
+ *     └              ┘
+ *     竖直边在贴圆盘那侧, 尖朝外 —— 像播放器的"快退/快进"。
+ *
+ * 关键: 只想得到**直角三角**, 就必须**只留一条透明边**。
+ *   border-left(或 right) 为 0 的那条边决定哪一侧是"竖直直角边"。
+ * 两条都留 -> 等腰三角 (错了, 一开始就是这么写的)。
+ *
+ * 四个方向对应关系 (实测):
+ *   透明 top    + 实色 right  ->  ╲│  竖直边在右, 尖在左上
+ *   透明 bottom + 实色 right  ->  ╱│  竖直边在右, 尖在左下   <-- 左边用这个
+ *   透明 top    + 实色 left   ->  │╱  竖直边在左, 尖在右上
+ *   透明 bottom + 实色 left   ->  │╲  竖直边在左, 尖在右下   <-- 右边用这个
+ *
+ * 用**上下各半**的方式不好, 所以这里用"透明边占满高度, 另一条竖直边为 0",
+ * 这样得到的就是标准的左右指向直角三角。
+ */
 .rotb:after{content:"";display:block;width:0;height:0;
-  border-top:7px solid transparent;border-bottom:7px solid transparent}
-.rotb.l:after{border-right:11px solid #8b949e;margin-left:-3px}
-.rotb.r:after{border-left:11px solid #8b949e;margin-right:-3px}
-.rotb:hover{background:#262d36}
-/* 按住时: 变蓝 + 三角变白, 明确反馈"正在原地转" */
-.rotb.on{background:rgba(47,129,247,.9);border-color:#2f81f7;transform:scale(.95)}
-.rotb.on.l:after{border-right-color:#fff}
-.rotb.on.r:after{border-left-color:#fff}
+  transition:border-color .12s}
+/* 左: 竖直直角边贴圆盘(在右侧), 尖朝左 */
+.rotb.l:after{border-top:0;border-bottom:32px solid transparent;
+  border-left:0;border-right:22px solid #6e7681}
+/* 右: 与左严格镜像 (竖直直角边在左, 尖朝右) */
+.rotb.r:after{border-top:32px solid transparent;border-bottom:0;
+  border-right:0;border-left:22px solid #6e7681}
+.rotb:hover{background:rgba(255,255,255,.07)}
+/* 按住时: 三角变亮蓝, 明确反馈"正在原地转" */
+.rotb.on{background:rgba(47,129,247,.18)}
+.rotb.on.l:after{border-right-color:#4a9eff}
+.rotb.on.r:after{border-left-color:#4a9eff}
 
 #stick{position:relative;width:100%;max-width:300px;aspect-ratio:1;margin:0 auto;
   border-radius:50%;
@@ -264,14 +319,14 @@ input[type=range]::-moz-range-thumb{width:15px;height:15px;border:0;border-radiu
   input[type=range]::-webkit-slider-thumb{width:20px;height:20px;margin-top:-8px}
   /* 小屏上把整个转盘装配收窄, 保证 "三角 + 圆盘 + 三角" 不溢出。
      圆盘是 aspect-ratio:1 的正方形, 所以用 flex:1 + max-width 让它自适应。 */
-  #stickWrap{gap:6px}
+  #stickWrap{gap:0}
   #stick{flex:1;min-width:0;max-width:none}
-  .rotb{width:38px;height:38px}
+  /* 手机上触摸热区给足 (≥44px 高), 三角形本体大小不变 */
+  .rotb{width:32px;height:60px}
 }
 /* 窄到 360px 以下再收一档 */
 @media(max-width:380px){
-  #stickWrap{gap:4px}
-  .rotb{width:34px;height:34px}
+  .rotb{width:28px;height:56px}
 }
 
 #dirbar{display:flex;align-items:center;gap:6px;margin-top:9px;font-size:11px;
@@ -368,7 +423,7 @@ kbd{background:#21262d;border:1px solid var(--line);border-bottom-width:2px;
       <!-- 左右原地转: 两个三角按钮贴在转盘**左右两侧** (原来是下面的滑条)。
            按住持续转, 松开回正 —— 见 rotBtnDown/rotBtnUp。 -->
       <div id="stickWrap">
-        <button class="rotb l" id="rotL" title="按住原地左转 (或按 Q)">◀</button>
+        <button class="rotb l" id="rotL" title="按住原地左转 (或按 Q)" aria-label="原地左转"></button>
         <div id="stick">
           <div class="ring"></div>
           <div class="cross"></div>
@@ -376,7 +431,7 @@ kbd{background:#21262d;border:1px solid var(--line);border-bottom-width:2px;
           <div class="lbl l">左</div><div class="lbl r">右</div>
           <div id="knob"></div>
         </div>
-        <button class="rotb r" id="rotR" title="按住原地右转 (或按 E)">▶</button>
+        <button class="rotb r" id="rotR" title="按住原地右转 (或按 E)" aria-label="原地右转"></button>
       </div>
 
       <div class="row">
