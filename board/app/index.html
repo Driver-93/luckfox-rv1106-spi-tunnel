@@ -323,11 +323,17 @@ input[type=range]::-moz-range-thumb{width:15px;height:15px;border:0;border-radiu
   .rotb.r span{left:49px;top:25px}
 }
 
-#dirbar{display:flex;align-items:center;gap:6px;margin-top:9px;font-size:11px;
+/* 输出数值 (vx/vy/w): **只要文字, 不要方框** (用户要求)。
+ * 原来每个数都套一个带底色+描边的胶囊 (background/border/border-radius),
+ * 看起来像三个按钮, 而且和方向标签的字体撞在一起显乱。
+ * 现在去掉方框, 只留等宽数字, 用间距区分。 */
+#dirbar{display:flex;align-items:center;gap:12px;margin-top:9px;font-size:11px;
   color:var(--dim);flex-wrap:wrap}
-#dirbar .tag{padding:2px 8px;border-radius:var(--r-sm);background:var(--card2);
-  border:1px solid var(--line);color:var(--fg);font-weight:600;
-  font-variant-numeric:tabular-nums;font-size:11px}
+#dirbar .tag{padding:0;border:0;background:none;border-radius:0;color:var(--fg);
+  font-weight:600;font-variant-numeric:tabular-nums;font-size:11px}
+/* "失控超时过短"告警仍然需要醒目 —— 只有它保留底色, 因为它是要人注意的提示 */
+#dirbar .tag#hbTxt{padding:2px 8px;border-radius:var(--r-sm);
+  background:rgba(248,81,73,.16);border:1px solid rgba(248,81,73,.5);color:#ff7b72}
 .hint{font-size:var(--fs-sm);color:#5a6472;line-height:1.6;margin-top:8px}
 /* 手机上隐藏长说明 —— 开车时没人看, 而且占垂直空间 */
 @media(max-width:600px){.hint{display:none}}
