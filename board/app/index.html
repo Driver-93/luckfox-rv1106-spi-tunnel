@@ -93,6 +93,9 @@ main{max-width:1100px;margin:0 auto;padding:10px 12px 24px}
   background:rgba(0,0,0,.5);padding:3px 7px;border-radius:5px;
   backdrop-filter:blur(8px);display:none;font-variant-numeric:tabular-nums;
   z-index:5;white-space:nowrap}
+/* RTT 还没拿到时 (页面刚加载/idle), 隐藏那个空的 #hudRtt 和它后面的分隔符,
+   否则会出现 "RTT…图传" 粘在一起或孤零零的 " · "。 */
+#vhud.no-rtt #hudRtt,#vhud.no-rtt .sep{display:none}
 #vfull{position:absolute;right:10px;top:10px;background:rgba(0,0,0,.55);color:#fff;
   border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:5px 11px;
   font-size:12px;cursor:pointer;backdrop-filter:blur(6px)}
@@ -432,8 +435,7 @@ kbd{background:#21262d;border:1px solid var(--line);border-bottom-width:2px;
       <div class="hint">
         摇杆拖动 = 前后/左右/斜向 · 左右三角 = 原地转<br>
         松开自动停 · 键盘 <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> 移动，
-        <kbd>Q</kbd><kbd>E</kbd> 转，<kbd>空格</kbd> 停<br>
-        曝光 / 画质档位在<b>画面右下角「⚙ 设置」</b>里 (鼠标移到画面上就能看到)
+        <kbd>Q</kbd><kbd>E</kbd> 转，<kbd>空格</kbd> 停
       </div>
     </div>
   </div>
@@ -637,6 +639,11 @@ function startStats(p){
   updHud(0, 0, 0, 0);
 }
 
+/* HUD 是**常驻**的: 页面一加载就显示, 不等图传连上。
+ * 原因: RTT 是判断控制链路好坏的唯一指标, 图传断了/还没连上时
+ * 更要能看到 RTT (那正是最需要排查的时候)。图传那部分显示 -- 即可。 */
+updHud(0, 0, 0, 0);
+
 /* 左上角 HUD: 显示**控制 RTT + 图传指标**
  *
  * 为什么把 RTT 放这里: RTT 是"手感"的唯一客观来源 —— 手指动到车响应之间的
@@ -653,34 +660,50 @@ function updHud(rate, jb, fps, lost){
   const rttColor = rtt === null ? '#8b949e'
                  : (rtt < 80 ? '#3fb950' : (rtt < 200 ? '#d29922' : '#f85149'));
   let html = '';
-  if(rtt !== null)
-    html += `<span style="color:${rttColor};font-weight:700">RTT ${rtt}ms</span> · `;
+  /* #hudRtt 这个 span 必须一直存在 (即使是空的): hudRtt() 只改它的
+     textContent/color, 靠它定位。
+     ⚠️ 分隔符 " · " 写在 #hudRtt **外面**, 而不是拼在 innerHTML 里 ——
+     否则 RTT 还没拿到时(idle 那一瞬间)会渲染成 "RTT…图传" 粘在一起,
+     或者出现孤零零的 " · 图传"。用 CSS 控制: 空 span 不显示, 分隔符跟着走。 */
+  const rttTxt = rtt !== null ? `RTT ${rtt}ms` : '';
+  el.classList.toggle('no-rtt', rtt === null);
+  html += `<span id="hudRtt" style="color:${rttColor};font-weight:700">${rttTxt}</span>`;
+  html += `<span class="sep"> · </span>`;
   html += `<span style="color:#8b949e">图传</span> ${fmtRate(rate)} · ${Math.round(jb)}ms`;
   if(fps) html += ` · ${Math.round(fps)}fps`;
   if(lost) html += ` · <span style="color:#f85149">丢${lost}</span>`;
   el.innerHTML = html;
   el.style.display = 'block';
 }
-function stopStats(){ clearInterval(statsT); $('vhud').style.display='none'; }
+/* 图传停了也要保留 HUD (只把图传那部分显示成 --), 不能整块隐藏 ——
+   用户要求 RTT 常驻左上角, 因为它是判断控制链路好不好的唯一指标。 */
+function stopStats(){
+  clearInterval(statsT);
+  const el = $('vhud');
+  if(el) el.style.display = 'block';
+}
 
-/* 只刷新 HUD 里的 RTT 部分 (被控制循环每次成功请求后调用)
- * 图传指标由 startStats 每 2 秒更新, 这里只动 RTT, 两者互不覆盖。 */
+/* 只刷新 HUD 里的 RTT 部分 (被控制循环每次成功请求后调用)。
+ *
+ * ⚠️ 这里曾经有个 bug: 原来用 `el.insertBefore(span, ...)` 把 RTT span
+ * **插进** HUD, 而 updHud() 又会用 innerHTML 写**整块** HUD (含 RTT)。
+ * 两者都在写 RTT -> 按住方向键时(控制循环每 25ms 跑一次 hudRtt)
+ * 画面上会**出现两个 RTT**。
+ *
+ * 现在: HUD 的结构由 updHud() 单独负责, 这里**只改文本内容和颜色**,
+ * 绝不插入/删除节点。用 `#hudRtt` 这个 span (由 updHud 生成) 定位。 */
 function hudRtt(){
   const el = $('vhud');
   if(!el || el.style.display === 'none') return;
+  const span = el.querySelector('#hudRtt');
+  if(!span) return;                     // updHud 还没建好 -> 等它来写
   const rtt = (typeof ctlRtt === 'number' && ctlRtt >= 0) ? Math.round(ctlRtt) : null;
   if(rtt === null) return;
-  const color = rtt < 80 ? '#3fb950' : (rtt < 200 ? '#d29922' : '#f85149');
-  let span = el.querySelector('#hudRtt');
-  if(!span){
-    span = document.createElement('span');
-    span.id = 'hudRtt';
-    el.insertBefore(span, el.firstChild);
-    el.insertBefore(document.createTextNode(' · '), span.nextSibling);
-  }
-  span.style.color = color;
-  span.style.fontWeight = '700';
+  span.style.color = rtt < 80 ? '#3fb950' : (rtt < 200 ? '#d29922' : '#f85149');
   span.textContent = 'RTT ' + rtt + 'ms';
+  /* 拿到第一个 RTT 后要把 no-rtt 摘掉, 否则 #hudRtt 和分隔符一直被
+     CSS 隐藏着 (updHud 只在图传回调里跑, 可能迟迟不跑)。 */
+  el.classList.remove('no-rtt');
 }
 $('vretry').onclick = playWHEP;
 $('vfull').onclick = () => {
