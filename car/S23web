@@ -1,0 +1,42 @@
+#!/bin/sh
+# /etc/init.d/S23web -- onboard web control service
+#
+# Started early so the page is ready as soon as the tunnel is, and with NO
+# blocking sleeps. The old version slept 2s before and 4s after (six seconds of
+# pure boot delay that nothing consumed) and ran `killall -q python3`, which
+# would now kill spinet -- the tunnel -- on every boot.
+
+APP=/userdata/car/web_server.py
+LOG=/tmp/web.log
+
+kill_web() {
+    for p in $(ps | grep '[w]eb_server.py' | awk '{print $1}'); do
+        kill -9 "$p" 2>/dev/null
+    done
+}
+
+case "$1" in
+    start)
+        kill_web
+        echo "[S23web] starting onboard web control service"
+        setsid sh -c "python3 -u $APP 80 > $LOG 2>&1" </dev/null >/dev/null 2>&1 &
+        ;;
+    stop)
+        kill_web
+        echo "[S23web] stopped"
+        ;;
+    restart)
+        kill_web; sleep 1
+        exec "$0" start
+        ;;
+    status)
+        if netstat -tln 2>/dev/null | grep -q ':80 '; then
+            echo "running (listening :80)"
+        else
+            echo "not running"
+        fi
+        ;;
+    *)
+        echo "usage: $0 {start|stop|restart|status}"; exit 1
+        ;;
+esac

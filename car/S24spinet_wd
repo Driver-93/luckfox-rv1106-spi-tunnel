@@ -1,0 +1,240 @@
+#!/bin/sh
+#
+# S24spinet_wd — SPI 隧道看门狗 (内核模块版)
+#
+# ============================================================================
+# 原来这个看门狗盯两样东西:
+#   1. /var/run/spinet.pid 里的用户态 Python 进程是否活着
+#   2. /tmp/c3_state.json 的时间戳 (C5 每秒写一次状态帧)
+#
+# 现在隧道是**内核模块**, 这两样都不存在了:
+#   * 没有用户态进程, 没有 pidfile
+#   * 状态帧还在收, 但驱动只存在 last_stat 里, 不再落盘成文件
+#
+# 所以判据换成**真正有意义的那个: 隧道能不能通信**。
+#
+# ---- 为什么用 ping 而不是"看模块在不在" ----
+#
+# "模块已加载" 是个很弱的判据。实测就遇到过:
+#     spitun 模块加载成功、spitun0 接口 UP、dmesg 一切正常
+#     但一个包都过不去 (IP 协议号解析错, 包全被内核丢掉)
+# 这时候看模块状态完全健康, 而实际隧道是死的。
+#
+# 唯一诚实的判据是端到端能不能通: ping 一次对端 (10.77.0.1)。
+#
+# ---- 为什么"ping 不通"不立刻重启 ----
+#
+# C5 连 WiFi 要几秒到几十秒, 期间 ping 必然不通, 但隧道本身是好的。
+# 早期版本一看到不通就重启, 结果在 C5 联网期间反复折腾接口。
+# 现在要求**连续多次**失败才动作, 而且动作只是重新配置接口
+# (ip addr/up), 不重新加载模块 —— 模块重载会丢掉 SPI 设备绑定。
+# ============================================================================
+
+NAME=spinet-wd
+PIDF=/var/run/spinet_wd.pid
+LOG=/userdata/spinet_wd.log
+
+INTERVAL=5          # 多久检查一次
+FAIL_LIMIT=6        # 连续失败几次才动作 (~30 秒)
+COOLDOWN=10         # 动作后等多久再判断
+
+TUN_NAME=spitun0
+TUN_PEER=10.77.0.1
+
+# 需要经 WiFi 回包的客户端 (调试用的那台 PC)。与 S22spinet 保持一致。
+CLIENTS="192.168.3.64"
+
+# 隧道健康判据: C5 的状态帧是否在持续到达。
+#
+# ---- 为什么不能用 ping (这是个真实的坑) ----
+#
+# 原来看门狗 ping 10.77.0.1, 而那个 ping **永远不可能成功**: C5 的 spi0
+# 接口 napt=1, lwIP 的本地投递要求 `!inp->napt`, 所以发往 C5 自己地址的
+# ICMP 不进本地投递, 走转发路径后被丢掉。(实测: c3_status 的 up_ms 在涨,
+# 而 ping 100% 丢包。)
+#
+# 后果很严重: 看门狗每 5 秒 ping 一次, 连续失败就"重启"隧道, 而 restart
+# 会 `ip link set spitun0 down` —— 期间所有 TCP 全断。表现是"网页时通
+# 时不通", 根因却藏在看门狗里。
+#
+# 现在用 C5 每秒主动推的状态帧: up_ms 在涨 = SPI 双向都活着。
+tunnel_alive() {
+    A=$(sed 's/.*"up_ms":\([0-9]*\).*/\1/' \
+        /sys/class/net/spitun0/c3_status 2>/dev/null)
+    [ -n "$A" ] || return 1
+    sleep 1
+    B=$(sed 's/.*"up_ms":\([0-9]*\).*/\1/' \
+        /sys/class/net/spitun0/c3_status 2>/dev/null)
+    [ -n "$B" ] || return 1
+    [ "$A" != "$B" ]
+}
+
+module_loaded() {
+    grep -q '^spitun ' /proc/modules 2>/dev/null
+}
+
+# ---- 接口地址检查 (原来看门狗的盲区) ----
+#
+# `tunnel_alive()` 只证明 **SPI 双向通** (C5 的状态帧在到达), 它完全不关心
+# 本机 spitun0 有没有 IP。这两件事是可以分开的, 实测踩到过:
+#
+#     C5 侧一切正常 (串口 frames 一直在涨, err=2, WiFi 已连)
+#     板子侧 dmesg 也正常, RX 甚至能看到"包从隧道里进来"
+#     但 spitun0 **没有 10.77.0.2** —— 于是包进了内核却无人应答,
+#     网页/SSH 从 WiFi 全部超时, 而看门狗认为"隧道健康", 一直不动手。
+#
+# 原因是 rkipc 反复拉起的 `udhcpc -i spitun0`, 它的 helper 会
+# `ip addr flush` 把地址抹掉。守卫 (S22spinet 开机自装) 是第一道防线,
+# 这里是第二道: 地址真丢了就立刻补回来, **不需要重启隧道**。
+iface_addr_ok() {
+    ip addr show "$TUN_NAME" 2>/dev/null | grep -q '10\.77\.0\.2'
+}
+
+# 补地址 + 补回程路由。都是幂等的, 重复执行无害。
+fix_iface_addr() {
+    ip link set "$TUN_NAME" up 2>/dev/null
+    iface_addr_ok || ip addr add 10.77.0.2/24 dev "$TUN_NAME" 2>/dev/null
+    # 回程路由: 让板子把发给无线客户端的包经 WiFi 回, 而不是走 eth0。
+    # 丢了会导致"能收到请求、回包走错网卡" -> TCP 半死。
+    #
+    # 2026-10-05 改: 以前是写死客户端 IP 的 /32, 客户端一换 IP (DHCP 变了)
+    # 就彻底失联。现在用**源地址策略路由**: 板子经隧道发的包源地址恒为
+    # 10.77.0.2, 单独查表 100; 客户端是谁都不用管。这里同样幂等补齐。
+    ip rule show 2>/dev/null | grep -q 'from 10.77.0.2 lookup 100' || \
+        ip rule add from 10.77.0.2 lookup 100 pref 100 2>/dev/null
+    ip route show table 100 2>/dev/null | grep -q 'dev '"$TUN_NAME" || \
+        ip route replace 192.168.3.0/24 dev "$TUN_NAME" src 10.77.0.2 table 100 2>/dev/null
+    for c in $CLIENTS; do
+        ip route show | grep -q "^$c " || ip route add "$c/32" dev "$TUN_NAME" 2>/dev/null
+    done
+}
+
+start_wd() {
+    if [ -f "$PIDF" ] && kill -0 "$(cat $PIDF)" 2>/dev/null; then
+        echo "$NAME already running (pid $(cat $PIDF))"
+        return 0
+    fi
+
+    # 后台循环必须**彻底脱离当前会话的 stdio**。
+    #
+    # 实测踩到: `ssh root@板子 "/etc/init.d/S24spinet_wd restart"` 会把
+    # 输出全部打印完, 然后**一直不返回**, 直到 ssh 超时。原因就是这个
+    # `( ... ) &` 子壳继承了 sshd 那一端的 stdout 管道 —— 只要它还活着,
+    # 管道就不关闭, ssh 客户端就一直等。
+    #
+    # 所以显式把三个 fd 都挪走: stdin 接 /dev/null, stdout/stderr 追加
+    # 到日志 (循环内部本来就是往 $LOG 写的)。
+    (
+        # 开机后先等一会儿, 让模块加载和 C5 联网都有机会完成
+        sleep 20
+
+        FAILS=0
+        while :; do
+            # 顺手清理: 没有网线时云端中继会推流到不可达的服务器,
+            # 在单核板子上白烧 ~23% CPU。
+            for p in $(ps | grep -E 'relay_loop|/root/ffmpeg' | grep -v grep | awk '{print $1}'); do
+                kill -9 "$p" 2>/dev/null
+                echo "$(date) killed stray relay pid=$p" >> "$LOG"
+            done
+
+            if tunnel_alive; then
+                FAILS=0
+                # SPI 通了不代表接口可用 —— 地址可能被 udhcpc 抹掉了 (见
+                # iface_addr_ok 的注释)。这里顺手检查并补齐, 不重启隧道。
+                if ! iface_addr_ok; then
+                    echo "$(date) $TUN_NAME 地址丢失 -> 补回 (不重启隧道)" >> "$LOG"
+                    fix_iface_addr
+                fi
+            else
+                FAILS=$((FAILS + 1))
+                echo "$(date) tunnel ping 失败 ($FAILS/$FAIL_LIMIT)" >> "$LOG"
+
+                if [ "$FAILS" -ge "$FAIL_LIMIT" ]; then
+                    # ---- 先撤掉隧道路由, 恢复网线通道 ----
+                    #
+                    # 这是**必须的**, 是踩了大坑换来的:
+                    #
+                    # 回程路由 (192.168.3.64/32 -> spitun0) 的目的是让板子
+                    # 经 WiFi 回包。副作用是**调试用的网线通道会被切断** ——
+                    # 同一个 PC 只有一个地址, 回包只能走一条路。
+                    #
+                    # 于是隧道一旦死掉, 板子就同时失去无线和有线两条路,
+                    # 只能物理断电。实测发生过好几次。
+                    #
+                    # 所以: 隧道判定为坏的时候, 第一件事就是撤掉这条路,
+                    # 让网线立刻恢复。隧道修好后 S22spinet 会重新加上。
+                    for c in $(ip route show | awk '$0 ~ /dev spitun0/ && $0 !~ /10\.77\./ {print $1}'); do
+                        ip route del "$c" 2>/dev/null
+                        echo "$(date) 隧道故障 -> 撤掉回程路由 $c (恢复网线)" >> "$LOG"
+                    done
+                    # 策略路由 (表 100 + ip rule) 一并撤掉, 保证网线通道彻底恢复。
+                    # 隧道修好后 S22spinet / fix_iface_addr 会重新装上。
+                    ip rule del from 10.77.0.2 lookup 100 2>/dev/null
+                    ip route flush table 100 2>/dev/null
+                    echo "$(date) 隧道故障 -> 撤掉策略路由 (表 100)" >> "$LOG"
+
+                    if ! module_loaded; then
+                        # 模块真没了 —— 重新加载
+                        echo "$(date) spitun.ko 未加载 -> 重新加载" >> "$LOG"
+                        [ -f /oem/usr/ko/spitun.ko ] && \
+                            insmod /oem/usr/ko/spitun.ko >> "$LOG" 2>&1
+                    fi
+
+                    # 只重配接口, 不重载模块。
+                    # 重载会丢掉 SPI 设备的 probe 结果, 代价大得多。
+                    echo "$(date) 重新配置 $TUN_NAME 接口" >> "$LOG"
+                    fix_iface_addr
+
+                    FAILS=0
+                    sleep "$COOLDOWN"
+                fi
+            fi
+
+            sleep "$INTERVAL"
+        done
+    ) </dev/null >> "$LOG" 2>&1 &
+    echo $! > "$PIDF"
+    echo "$NAME started (pid $(cat $PIDF), poll ${INTERVAL}s, fail>${FAIL_LIMIT})"
+    return 0
+}
+
+stop_wd() {
+    echo "Stopping $NAME"
+    [ -f "$PIDF" ] && { kill "$(cat $PIDF)" 2>/dev/null; rm -f "$PIDF"; }
+
+    # 兜底清扫其它残留循环。
+    # 只杀 pidfile 里那个是不够的: start_wd() 每次都覆盖 pidfile,
+    # 所以任何一次多余的 start 都会泄漏一个永不退出的循环。
+    # 两个看门狗同时跑会互相把接口拆掉。
+    #
+    # 但清扫必须排除 `sh -c "..."` —— 实测踩到: 管理员执行
+    #     ssh root@板子 "sh /tmp/deploy.sh"      (deploy.sh 里调用了 S24spinet_wd)
+    # 时, 那条 ssh 命令的 cmdline 里也含 "S24spinet_wd", 于是被自己的
+    # 清扫逻辑杀掉, 表现为"SSH 跑一半卡死/超时", 极难排查。
+    # 看门狗循环本身是 `/bin/sh /etc/init.d/S24spinet_wd start`, 不含 "sh -c"。
+    for p in $(ps | grep "[S]24spinet_wd" | grep -v "sh -c" | awk '{print $1}'); do
+        [ "$p" = "$$" ] && continue
+        kill -9 "$p" 2>/dev/null
+    done
+    return 0
+}
+
+case "$1" in
+    start)   start_wd ;;
+    stop)    stop_wd ;;
+    restart) stop_wd; sleep 1; start_wd ;;
+    status)
+        if [ -f "$PIDF" ] && kill -0 "$(cat $PIDF)" 2>/dev/null; then
+            echo "$NAME running (pid $(cat $PIDF))"
+            if tunnel_alive; then
+                echo "tunnel: 可达"
+            else
+                echo "tunnel: 不可达"
+            fi
+        else
+            echo "$NAME not running"
+            exit 1
+        fi
+        ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

@@ -1,0 +1,67 @@
+#!/bin/sh
+# /etc/init.d/S20lo -- 确保回环接口有 127.0.0.1
+#
+# ============================================================================
+# 为什么需要这个脚本 (踩过两次, 第二次是刷机打回来的)
+# ============================================================================
+# Buildroot 生成的 /etc/network/interfaces 里确实写了:
+#       auto lo
+#       iface lo inet loopback
+# 但**这个系统启动时没有任何东西去执行 `ifup lo`**。
+# 内核也**不会**在 lo 起来时自动添加 127.0.0.1 —— 那是用户态的活。
+#
+# 实测结果就是 lo 只有 IPv6 的 ::1/128, 没有 127.0.0.1:
+#       1: lo: <LOOPBACK,UP,LOWER_UP>
+#           inet6 ::1/128 scope host
+#
+# 后果 (都很隐蔽, 极易误判):
+#   1) mediamtx 连不上 rkipc 的 RTSP, 视频一直转圈 ——
+#        ERR [path car] [RTSP source] dial tcp 127.0.0.1:554: i/o timeout
+#      而 rkipc 明明在正常出流 (554 在听)、mediamtx 明明启动成功、
+#      8889/8189/8888 端口全开。看起来像"网络问题", 实际是回环没地址。
+#   2) 板子自己访问 http://127.0.0.1:80 超时, 但 http://<eth0 IP>:80 正常
+#      -> 会让人以为"网页服务挂了"。实测就是这样误判过一次。
+#
+# 修法: 启动早期就把 127.0.0.1/8 加上。幂等, 已经有就什么都不做。
+# 放在 S20 (linkmount/urandom 那批) —— 必须早于 rkipc/mediamtx/web。
+# ============================================================================
+
+LO_IP="127.0.0.1/8"
+
+case "$1" in
+    start)
+        # lo 必须在 UP 状态, 否则加了地址也不通
+        ip link set lo up 2>/dev/null
+
+        if ip addr show lo 2>/dev/null | grep -q '127\.0\.0\.1'; then
+            echo "[S20lo] lo 已有 127.0.0.1"
+        else
+            ip addr add "$LO_IP" dev lo 2>/dev/null
+            # 不信任 ip 的退出码, 回读验证
+            if ip addr show lo 2>/dev/null | grep -q '127\.0\.0\.1'; then
+                echo "[S20lo] 已为 lo 配置 $LO_IP"
+            else
+                echo "[S20lo] !! 配置 $LO_IP 失败"
+                exit 1
+            fi
+        fi
+        ;;
+    stop)
+        # 回环地址不要撤 —— 撤了会让本机大量依赖 localhost 的东西立刻失效,
+        # 而且下次 start 会重新加回来。这里只做 no-op。
+        echo "[S20lo] stop: 保留 127.0.0.1 (撤掉会破坏本机 IPC)"
+        ;;
+    restart)
+        exec "$0" start
+        ;;
+    status)
+        if ip addr show lo 2>/dev/null | grep -q '127\.0\.0\.1'; then
+            echo "running (lo has 127.0.0.1)"
+        else
+            echo "not configured (lo 没有 127.0.0.1)"
+            exit 1
+        fi
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

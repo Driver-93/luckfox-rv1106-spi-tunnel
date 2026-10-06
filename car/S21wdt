@@ -1,0 +1,179 @@
+#!/bin/sh
+# /etc/init.d/S21wdt -- 硬件看门狗喂狗
+#
+# ============================================================================
+# 为什么必须有这个
+# ============================================================================
+# 实测板子会**内核级硬卡死**:
+#   * eth0、USB gadget、SPI 轮询全部停止
+#   * 但 C5 还活着 (串口显示 wifi=UP rssi=-56, 而它那边的 sp tx/rx 计数
+#     **完全冻结** —— 说明板子不再发起 SPI 传输)
+#   * SSH / 网页 / ADB / USB 网络全部进不去, **只能物理断电**
+#
+# 卡了 5 分钟以上没有任何自愈。原因就是: 这台板子的硬件看门狗**从来没开过**——
+# SoC dtsi 里 wdt 节点是 status = "disabled", 板级 dts 也没启用过,
+# 所以 /dev/watchdog 根本不存在 (实测 `ls: No such file or directory`)。
+#
+# userspace 看门狗在这种场景下**完全没用**: 调度器都不跑了, 任何进程都
+# 不会被调度, 更不可能去执行"检测到没响应就重启"的逻辑。只有硬件 WDT
+# 能在没人喂狗时直接复位 SoC。
+#
+# 这正是需求里"长时间没响应就自动重启"的正确实现方式。
+#
+# ============================================================================
+# 参数选择
+# ============================================================================
+# 超时 30 秒 / 喂狗间隔 10 秒。
+#   为什么不更短: 单核 240MHz 板子, 视频 + 隧道 + 网页同时跑时偶有卡顿。
+#     超时太短会因为"某次繁忙"就误复位, 那比不装还糟。
+#     而且这个卡死是**彻底**的 (不是慢), 30 秒完全够用。
+#   为什么不更长: 真死机后用户要等的时间 = 超时。30 秒是可接受的。
+#   喂狗间隔取超时的 1/3, 留足够余量。
+#
+# ============================================================================
+# 注意: watchdog 进程**不能**被误杀
+# ============================================================================
+# 这里用 pidfile 而不是 `ps | grep watchdog | kill`。
+# 那个写法在本项目里已经踩过三次坑 (S24spinet_wd / S25mediamtx):
+# `[w]atchdog` 挡不住**其它命令行里含 "watchdog" 的进程** ——
+# 包括执行本脚本的 shell 自己, 于是脚本把自己杀掉。
+# ============================================================================
+
+DEV=/dev/watchdog
+PIDF=/var/run/hw_wdt.pid
+TIMEOUT=30
+INTERVAL=10
+
+# 找正在跑的喂狗进程。
+#
+# ⚠️ 不能用 `$!`, 也不能用 `ps | grep watchdog`:
+#   1) `setsid watchdog ... &` 里的 `$!` 是 **setsid 自己**的 pid ——
+#      setsid fork 出真正的子进程后就退出了。更麻烦的是 busybox 的
+#      `watchdog` 默认还会**再 fork 一次**变成守护进程 (除非加 -F)。
+#      实测: 进程明明在跑 (ps 能看到 `watchdog -T 30 -t 10 /dev/watchdog`,
+#      而且 /dev/watchdog 确实被它打开), 但 pidfile 里记的是 setsid 的
+#      pid, `kill -0` 立刻失败 -> 脚本误报"启动失败"。第一次就是这么被
+#      骗过去的。
+#   2) `ps | grep watchdog` 会匹配到**本脚本自己**(命令行含 "S21wdt"?
+#      不一定, 但执行本脚本的 shell / 管理员那条 ssh 命令可能含
+#      "watchdog" 字样), 这个坑在本项目已经踩过三次。
+#
+# pidof 按**进程名**精确匹配, 是这里唯一可靠的办法。
+wdt_pid() {
+    pidof watchdog 2>/dev/null | awk '{print $1}'
+}
+
+# 按 pidfile 精确停; 不用 ps|grep 文本匹配。
+stop_wdt() {
+    p=$(wdt_pid)
+    if [ -n "$p" ]; then
+        kill "$p" 2>/dev/null
+        echo "  killed watchdog pid=$p"
+    fi
+    rm -f "$PIDF"
+
+    # 关键: 确认设备已经没有被打开。
+    # 如果 CONFIG_WATCHDOG_NOWAYOUT 被打开, 那么即使进程退出硬件计时器
+    # **仍然在跑**, 30 秒后板子会自己复位 —— 变成开机死循环。
+    # 这里明确提示一下, 免得以后踩。
+    if [ -e "$DEV" ]; then
+        holder=""
+        for q in /proc/[0-9]*; do
+            for fd in $q/fd/*; do
+                case "$(readlink $fd 2>/dev/null)" in
+                    "$DEV") holder="$q"; break ;;
+                esac
+            done
+            [ -n "$holder" ] && break
+        done
+        if [ -n "$holder" ]; then
+            echo "  ⚠️ $DEV 仍被打开 ($holder) —— 若内核开了 WATCHDOG_NOWAYOUT,"
+            echo "     硬件计时器不会停, 到点会复位板子"
+        else
+            echo "  $DEV 已无人持有 (NOWAYOUT 未开时即已停表)"
+        fi
+    fi
+}
+
+start_wdt() {
+    if [ -n "$(wdt_pid)" ]; then
+        echo "hw-wdt already running (pid $(wdt_pid))"
+        return 0
+    fi
+
+    if [ ! -e "$DEV" ]; then
+        echo "!! $DEV 不存在 —— 设备树里的 &wdt 没启用, 硬件看门狗不可用"
+        echo "   (这是严重问题: 板子硬卡死时无法自动复位, 只能断电)"
+        return 1
+    fi
+
+    : > /tmp/hw_wdt.log
+
+    # setsid + 三个 fd 全部挪走。
+    # 不这么做的话 ssh 执行本脚本会被这个后台进程拖住不返回
+    # (它继承了 sshd 那端的 stdout 管道) —— S24spinet_wd 踩过这个坑。
+    #
+    # ⚠️ busybox 的 watchdog 参数语义 (实测 usage, 和直觉相反, 别搞混):
+    #       -T N   Reboot after N seconds if not reset   ← **硬件超时**
+    #       -t N   Reset every N seconds                 ← **喂狗间隔**
+    #    而且设备路径是**位置参数**, 不能漏 —— 漏了就只打印 usage 然后退出。
+    setsid watchdog -T "$TIMEOUT" -t "$INTERVAL" "$DEV" \
+        </dev/null >>/tmp/hw_wdt.log 2>&1 &
+
+    # 等它 fork 完毕再按进程名取 pid
+    P=""
+    i=0
+    while [ $i -lt 10 ]; do
+        sleep 1
+        P=$(wdt_pid)
+        [ -n "$P" ] && break
+        i=$((i + 1))
+    done
+
+    if [ -n "$P" ]; then
+        echo "$P" > "$PIDF"
+        echo "hw-wdt started (pid $P, 硬件超时 ${TIMEOUT}s, 喂狗间隔 ${INTERVAL}s)"
+        # 顺便确认设备真的被打开了 —— 这是"硬件计时器真的在跑"的直接证据
+        for q in /proc/$P/fd/*; do
+            case "$(readlink $q 2>/dev/null)" in
+                "$DEV") echo "  已持有 $DEV (硬件计时器已启动)"; return 0 ;;
+            esac
+        done
+        echo "  ⚠️ 进程在跑但没打开 $DEV —— 计时器可能没启动, 看日志:"
+        tail -5 /tmp/hw_wdt.log
+        return 1
+    else
+        echo "!! hw-wdt 启动失败:"
+        tail -5 /tmp/hw_wdt.log
+        return 1
+    fi
+}
+
+status_wdt() {
+    p=$(wdt_pid)
+    if [ -n "$p" ]; then
+        echo "running (pid $p)"
+        opening=""
+        for q in /proc/$p/fd/*; do
+            case "$(readlink $q 2>/dev/null)" in
+                "$DEV") opening="yes" ;;
+            esac
+        done
+        if [ -n "$opening" ]; then
+            echo "hardware watchdog ARMED ($DEV open)"
+        else
+            echo "⚠️ 进程在跑但没持有 $DEV"
+        fi
+    else
+        echo "not running"
+        exit 1
+    fi
+}
+
+case "$1" in
+    start)   start_wdt ;;
+    stop)    echo "Stopping hw-wdt"; stop_wdt ;;
+    restart) stop_wdt; sleep 1; start_wdt ;;
+    status)  status_wdt ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

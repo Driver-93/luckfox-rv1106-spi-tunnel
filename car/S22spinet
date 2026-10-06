@@ -1,0 +1,307 @@
+#!/bin/sh
+#
+# S22spinet — 配置 SPI 隧道网络接口 (内核模块版)
+#
+# ============================================================================
+# 这个脚本原来是启动一个用户态 Python 隧道进程 (spinet.py)。
+#
+# 现在隧道已经做成**内核模块** (spitun.ko, 由 insmod_ko.sh 在开机时加载),
+# 所以这里不再需要启动任何进程 —— 只需要把网络配置好:
+#
+#     ip addr add 10.77.0.2/24 dev spitun0
+#     ip link set spitun0 up
+#
+# ---- 为什么改成内核模块 ----
+#
+# 实测单次 SPI exchange 的耗时分布 (4096 字节帧 @ 20MHz):
+#     纯线上时间     1.64 ms
+#     用户态总耗时   3.10 ms
+#     ─────────────────────
+#     净开销         1.46 ms   (47%, 全是 ioctl + 双向拷贝 + Python + 调度)
+#
+# 内核模块把这些全部消掉, 实测 CPU 从 **24-26% 降到 ~0%**
+# (用户态 spinet 进程完全消失), 单核板子上这就是把四分之一的 CPU
+# 还给了 rkipc 编码和 mediamtx。
+#
+# ---- 保留的兼容性 ----
+#
+# 这个脚本的**接口不变** (start/stop/restart/status), 因为:
+#   * S24spinet_wd (看门狗) 会调 `S22spinet restart`
+#   * 看门狗原本靠检查 Python 进程是否存活来判断隧道健康
+#
+# 所以 start() 仍然要做"真的可用了吗"的验证, 只是判据从
+# "进程活着" 变成 "spitun0 拿到了地址, 而且真的能 ping 通对端"。
+#
+# 为什么 S22 而不是 S99z: 所有 init 脚本按数字顺序跑。作为 S99z 时
+# t~16s 才启动, 板子重启后前 30 秒完全不可达。它的依赖 (SPI 设备、
+# 模块) 都早就绪了, 没有东西要等。
+# ============================================================================
+
+DIR=/userdata/car
+LOG=/userdata/spinet.log
+
+# 隧道参数 (必须与内核模块 spitun.c 和 C5 的 tunnel.h 一致)
+TUN_NAME=spitun0
+TUN_LOCAL=10.77.0.2/24
+TUN_PEER=10.77.0.1
+TUN_MTU=1350
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"
+}
+
+iface_has_addr() {
+    ip addr show "$TUN_NAME" 2>/dev/null | grep -q "${TUN_LOCAL%%/*}"
+}
+
+module_loaded() {
+    grep -q '^spitun ' /proc/modules 2>/dev/null
+}
+
+# 隧道健康判据: C5 的状态帧是否在持续到达。
+#
+# ---- 为什么不能用 ping (这是个真实的坑) ----
+#
+# 原来这里 ping 10.77.0.1, 结果**永远超时** —— 但那不代表隧道坏了。
+#
+# 原因: C5 的 spi0 接口开了 NAPT, 而 lwIP 的本地投递检查是
+#     if (!inp->napt && dest == netif_ip4_addr(inp))  -> 本地投递
+# spi0 的 napt=1 (必须是 1, 否则 NAPT 转发不工作, 见 spinet.h),
+# 所以发往 10.77.0.1 的 ICMP **不进本地投递分支**, 而是走转发路径,
+# 最后被丢掉。实测: c3_status 的 up_ms 一直在涨 (隧道健康), 而
+# ping 10.77.0.1 是 100% 丢包。
+#
+# 更糟的是看门狗也用这个判据, 于是每 30 秒就把隧道"重启"一次 ——
+# 而重启会 `ip link set spitun0 down`, 期间所有 TCP 连接全断。
+# 表现就是"网页时通时不通", 极难排查。
+#
+# 现在改用 C5 主动推的状态帧: 它每秒一帧, 只要 up_ms 在涨就是活的。
+# 这是**唯一可靠**的健康信号 —— 它直接证明 SPI 双向都在工作。
+tunnel_alive() {
+    A=$(sed 's/.*"up_ms":\([0-9]*\).*/\1/' \
+        /sys/class/net/spitun0/c3_status 2>/dev/null)
+    [ -n "$A" ] || return 1
+    sleep 1
+    B=$(sed 's/.*"up_ms":\([0-9]*\).*/\1/' \
+        /sys/class/net/spitun0/c3_status 2>/dev/null)
+    [ -n "$B" ] || return 1
+    [ "$A" != "$B" ]
+}
+
+# ---- udhcpc 守卫: 开机自装 (这是刷机回归的防线) ----
+#
+# 背景: rkipc 会为 spitun0 拉起 `udhcpc`, 而 BusyBox 的 helper 脚本
+# (/usr/share/udhcpc/default.script) 在 renew/bound 时执行
+# `ip addr flush` + `ip route flush`, 把隧道地址和路由**全部清掉**。
+#
+# 之前是靠**手工**在那份 rootfs 文件里加守卫。结果一次刷固件就被冲回
+# 原形 (实测: 重启后 S22spinet 报告 "spitun0 ready: 10.77.0.2/24",
+# 紧接着 `ip addr show spitun0` 里就没有 inet 了, WiFi 控制整条断掉,
+# 而 C5 侧一切正常、串口显示 frames 一直在涨 —— 极易误判成隧道坏了)。
+#
+# 所以不再依赖 rootfs 里那一份: 每次开机检查并按需重装。
+# 守卫写在 shebang 之后, 只对 spitun0/tun0 放行, 不影响 eth0/usb0 的 DHCP。
+UDHCPC_SCRIPT=/usr/share/udhcpc/default.script
+ensure_udhcpc_guard() {
+    [ -f "$UDHCPC_SCRIPT" ] || return 0
+    # 已经有守卫就什么都不做 (幂等)
+    grep -q 'spitun0|tun0' "$UDHCPC_SCRIPT" 2>/dev/null && return 0
+
+    # 留一份原始备份, 便于对照
+    [ -f "$UDHCPC_SCRIPT.stock" ] || cp -f "$UDHCPC_SCRIPT" "$UDHCPC_SCRIPT.stock" 2>/dev/null
+
+    # 方法说明: 不用 `sed 1a` —— 那是 GNU 扩展, BusyBox sed 未必支持。
+    # 直接用 head/tail 拼一个新文件, 在任何 shell 里都稳。
+    {
+        head -n 1 "$UDHCPC_SCRIPT"
+        echo '# [S22spinet] spitun0/tun0 是点对点隧道, 永远没有 DHCP 服务器。'
+        echo '# 本脚本后面的 ip addr flush / ip route flush 会清掉隧道地址和路由。'
+        echo 'case "$interface" in'
+        echo '    spitun0|tun0) exit 0 ;;'
+        echo 'esac'
+        tail -n +2 "$UDHCPC_SCRIPT"
+    } > "$UDHCPC_SCRIPT.new" 2>/dev/null
+
+    if [ -s "$UDHCPC_SCRIPT.new" ] && grep -q 'spitun0|tun0' "$UDHCPC_SCRIPT.new"; then
+        cat "$UDHCPC_SCRIPT.new" > "$UDHCPC_SCRIPT"
+        chmod 755 "$UDHCPC_SCRIPT"
+        rm -f "$UDHCPC_SCRIPT.new"
+        log "已重装 udhcpc 守卫 (spitun0/tun0 不再被 flush)"
+        echo "  udhcpc 守卫: 已安装"
+    else
+        rm -f "$UDHCPC_SCRIPT.new"
+        log "!! udhcpc 守卫安装失败 (rootfs 只读?)"
+        echo "  !! udhcpc 守卫安装失败"
+    fi
+}
+
+start() {
+    echo "Starting SPI tunnel ($TUN_NAME, kernel module)"
+
+    # 0) 先保证 udhcpc 的 helper 不会清掉隧道, 再干掉当前活着的那个。
+    #
+    #    顺序很重要: 必须先装守卫再杀进程。反过来的话, rkipc 在这两步之间
+    #    重新拉起一个 udhcpc, 它照样会把地址清掉。
+    ensure_udhcpc_guard
+
+    # 0b) 干掉 udhcpc —— spitun0 是点对点接口, 永远没有 DHCP 服务器,
+    #     这个客户端毫无意义。守卫是防线, 这里是主动清理。
+    #
+    #    实测症状: 网页时通时不通、路由凭空消失、spitun0 地址变成"没有"。
+    #
+    #    ⚠️ 2026-10-05 追加: 它还会**占住 554 端口**, 而 554 是 rkipc 的 RTSP。
+    #    结果是"一切档位切换都会失败"(从大往小切也不行), 图传黑屏。
+    #    busybox udhcpc 的发现 socket 绑在 0.0.0.0:554 —— 和 RTSP 撞车。
+    #    所以这里必须**按接口名 spitun0 杀干净** (老代码只匹配 tun0,
+    #    接口改名之后就再也杀不掉了, 这是切换失败的真正原因)。
+    for p in $(ps | grep '[u]dhcpc' | awk '{print $1}'); do
+        if tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q 'spitun0'; then
+            kill -9 "$p" 2>/dev/null
+            log "杀掉占用 spitun0 的 udhcpc pid=$p (它会占 554, 害 rkipc 绑不上)"
+        fi
+    done
+
+    # 1) 模块在不在。不在就尝试加载 —— 正常情况 insmod_ko.sh 已经加载过,
+    #    这里只是兜底 (比如手动 rmmod 之后)。
+    if ! module_loaded; then
+        if [ -f /oem/usr/ko/spitun.ko ]; then
+            insmod /oem/usr/ko/spitun.ko 2>/dev/null
+            sleep 1
+        fi
+    fi
+
+    if ! module_loaded; then
+        log "spitun.ko 没加载, 隧道无法启动"
+        echo "  !! spitun.ko 未加载 (检查 /oem/usr/ko/)"
+        return 1
+    fi
+
+    # 2) 等接口出现。模块加载与 SPI 设备 probe 之间没有顺序保证,
+    #    驱动要等到 probe 完成才会建好可用的 netdev。
+    i=0
+    while [ $i -lt 30 ]; do
+        ip link show "$TUN_NAME" >/dev/null 2>&1 && break
+        i=$((i + 1))
+        sleep 1
+    done
+
+    if ! ip link show "$TUN_NAME" >/dev/null 2>&1; then
+        log "$TUN_NAME 一直没出现"
+        echo "  !! $TUN_NAME 不存在"
+        return 1
+    fi
+
+    # 3) 配地址 + MTU + 起来
+    ip link set "$TUN_NAME" mtu "$TUN_MTU" 2>/dev/null
+    ip link set "$TUN_NAME" up 2>/dev/null
+
+    if ! iface_has_addr; then
+        ip addr add "$TUN_LOCAL" dev "$TUN_NAME" 2>/dev/null
+    fi
+
+    # 4) 验证地址真的生效了 (不信任 ip 命令的退出码)
+    i=0
+    while [ $i -lt 10 ]; do
+        iface_has_addr && break
+        i=$((i + 1))
+        ip addr add "$TUN_LOCAL" dev "$TUN_NAME" 2>/dev/null
+        sleep 1
+    done
+
+    if ! iface_has_addr; then
+        log "$TUN_NAME 地址配置失败"
+        echo "  !! 地址 $TUN_LOCAL 未生效"
+        return 1
+    fi
+
+    # 4.5) *** 回程路由: 这是 WiFi 访问能不能用的关键 ***
+    #
+    # 板子有两条路通外界:
+    #     eth0    192.168.3.x/24   (网线)
+    #     spitun0 10.77.0.2/24     (经 C5 到 WiFi)
+    #
+    # 浏览器从 WiFi 侧访问 http://192.168.3.69/ 时, 数据是
+    #     PC -> 路由器 -> C5 -> [SPI] -> 板子
+    # 而板子回包时查路由表, 看到 192.168.3.0/24 走 eth0 —— 从网线发出去了,
+    # C5 永远收不到, 浏览器一直转圈。
+    #
+    # ---- 2026-10-05 改: 从"写死客户端 IP"改成"按源地址策略路由" ----
+    #
+    # 旧写法是 CLIENTS="192.168.3.64" + `ip route replace $c/32 dev spitun0`,
+    # **客户端 IP 一变就彻底失联**。实测踩过: 用户 PC 的 DHCP 租约从
+    # 192.168.3.64 变成 192.168.3.65 之后, 网页和控制**完全没反应**——
+    # 而 C5 在线、隧道正常、板子 CPU 空闲、本地 /api/move 只要 12ms,
+    # 从板子侧看一切正常, 极难排查。补一条 /32 路由立刻恢复。
+    #
+    # 现在按**源地址**分流, 不需要知道客户端是谁:
+    #   * 板子经隧道发的包, 源地址一定是 10.77.0.2  -> 单独查表 100
+    #   * 网线侧发的包, 源地址是 eth0 的地址        -> 走主表, 完全不受影响
+    # 于是客户端是 .64 / .65 / 手机随便什么地址都能用, DHCP 变了也不会失联。
+    ip rule del from 10.77.0.2 lookup 100 2>/dev/null
+    ip route replace 192.168.3.0/24 dev "$TUN_NAME" src 10.77.0.2 table 100 2>/dev/null
+    ip rule add from 10.77.0.2 lookup 100 pref 100 2>/dev/null
+    log "回程路由: 源 10.77.0.2 -> 192.168.3.0/24 via $TUN_NAME (策略路由)"
+    echo "  route: tunnel clients via $TUN_NAME (policy routing, 不写死客户端 IP)"
+
+    # 兼容: 老的静态 /32 保留一份 (无害), 老客户端也不会因此断掉
+    for c in 192.168.3.64; do
+        ip route replace "$c/32" dev "$TUN_NAME" 2>/dev/null
+    done
+
+    # 5) 真的 ping 一次。C5 可能比板子启动慢, 所以给几次机会。
+    i=0
+    while [ $i -lt 15 ]; do
+        if tunnel_alive; then
+            log "隧道就绪 (内核模块, $TUN_LOCAL <-> $TUN_PEER)"
+            echo "  $TUN_NAME ready: $TUN_LOCAL <-> $TUN_PEER"
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 2
+    done
+
+    # 接口配好了但 ping 不通 —— 这不算启动失败。
+    # 很可能只是 C5 还在连 WiFi; 隧道本身是好的, 等它连上自然就通。
+    # 记为警告而不是错误, 免得看门狗误判成"隧道死了"反复重启。
+    log "隧道接口就绪但 ping 不通 (C5 可能还没连上 WiFi)"
+    echo "  $TUN_NAME up, 但 $TUN_PEER 不通 (等 C5 联网)"
+    return 0
+}
+
+stop() {
+    echo "Stopping SPI tunnel"
+    ip link set "$TUN_NAME" down 2>/dev/null
+    # 不 rmmod —— 模块是固件的一部分, 卸了反而要重配。
+    # 只是把接口停掉, 需要时可 start 恢复。
+    log "隧道接口已停"
+    return 0
+}
+
+status() {
+    if ! module_loaded; then
+        echo "spitun.ko 未加载"
+        return 1
+    fi
+    if ! ip link show "$TUN_NAME" >/dev/null 2>&1; then
+        echo "$TUN_NAME 不存在"
+        return 1
+    fi
+
+    echo "模块: 已加载"
+    ip addr show "$TUN_NAME" | grep -E 'inet|UP|mtu'
+    if tunnel_alive; then
+        echo "对端 $TUN_PEER: 可达"
+        return 0
+    else
+        echo "对端 $TUN_PEER: 不可达"
+        return 1
+    fi
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; sleep 1; start ;;
+    status)  status ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac
