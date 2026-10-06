@@ -175,6 +175,25 @@ main{max-width:1100px;margin:0 auto;padding:10px 12px 24px}
 .panel h3{margin:0 0 8px;font-size:10.5px;color:var(--dim);font-weight:600;
   text-transform:uppercase;letter-spacing:.5px}
 
+/* 转盘 + 左右两侧的原地转按钮。
+ * 用 flex 把两个三角贴在圆盘左右, 与圆盘**垂直居中**对齐。
+ * 三角用 CSS border 画 (纯字符 ▲ 在不同字体下大小/基线不一致)。 */
+#stickWrap{display:flex;align-items:center;justify-content:center;gap:10px}
+.rotb{width:44px;height:44px;flex:none;border-radius:50%;cursor:pointer;
+  border:1px solid var(--line);background:var(--card2);padding:0;
+  display:flex;align-items:center;justify-content:center;
+  touch-action:none;-webkit-tap-highlight-color:transparent;
+  transition:background .12s,transform .06s,border-color .12s}
+.rotb:after{content:"";display:block;width:0;height:0;
+  border-top:7px solid transparent;border-bottom:7px solid transparent}
+.rotb.l:after{border-right:11px solid #8b949e;margin-left:-3px}
+.rotb.r:after{border-left:11px solid #8b949e;margin-right:-3px}
+.rotb:hover{background:#262d36}
+/* 按住时: 变蓝 + 三角变白, 明确反馈"正在原地转" */
+.rotb.on{background:rgba(47,129,247,.9);border-color:#2f81f7;transform:scale(.95)}
+.rotb.on.l:after{border-right-color:#fff}
+.rotb.on.r:after{border-left-color:#fff}
+
 #stick{position:relative;width:100%;max-width:300px;aspect-ratio:1;margin:0 auto;
   border-radius:50%;
   background:radial-gradient(circle at 50% 50%,#1c2128 0%,#141a21 70%,#0f141a 100%);
@@ -230,7 +249,7 @@ input[type=range]::-moz-range-thumb{width:15px;height:15px;border:0;border-radiu
 .b.wide{grid-column:1/-1}
 .b.ghost{background:transparent}
 
-/* 速度/旋转行 (与滑条样式统一) */
+/* 速度行 (与滑条样式统一) */
 .row{display:flex;align-items:center;gap:8px;margin-top:9px}
 .row .t{font-size:11px;color:var(--dim);width:34px;flex:none}
 .row .n{font-size:11.5px;font-weight:700;width:36px;text-align:right;
@@ -243,6 +262,16 @@ input[type=range]::-moz-range-thumb{width:15px;height:15px;border:0;border-radiu
   .row{margin-top:8px}
   input[type=range]{height:24px}
   input[type=range]::-webkit-slider-thumb{width:20px;height:20px;margin-top:-8px}
+  /* 小屏上把整个转盘装配收窄, 保证 "三角 + 圆盘 + 三角" 不溢出。
+     圆盘是 aspect-ratio:1 的正方形, 所以用 flex:1 + max-width 让它自适应。 */
+  #stickWrap{gap:6px}
+  #stick{flex:1;min-width:0;max-width:none}
+  .rotb{width:38px;height:38px}
+}
+/* 窄到 360px 以下再收一档 */
+@media(max-width:380px){
+  #stickWrap{gap:4px}
+  .rotb{width:34px;height:34px}
 }
 
 #dirbar{display:flex;align-items:center;gap:6px;margin-top:9px;font-size:11px;
@@ -336,19 +365,20 @@ kbd{background:#21262d;border:1px solid var(--line);border-bottom-width:2px;
   <div>
     <div class="panel">
       <h3>方向摇杆</h3>
-      <div id="stick">
-        <div class="ring"></div>
-        <div class="cross"></div>
-        <div class="lbl t">前</div><div class="lbl b">后</div>
-        <div class="lbl l">左</div><div class="lbl r">右</div>
-        <div id="knob"></div>
+      <!-- 左右原地转: 两个三角按钮贴在转盘**左右两侧** (原来是下面的滑条)。
+           按住持续转, 松开回正 —— 见 rotBtnDown/rotBtnUp。 -->
+      <div id="stickWrap">
+        <button class="rotb l" id="rotL" title="按住原地左转 (或按 Q)">◀</button>
+        <div id="stick">
+          <div class="ring"></div>
+          <div class="cross"></div>
+          <div class="lbl t">前</div><div class="lbl b">后</div>
+          <div class="lbl l">左</div><div class="lbl r">右</div>
+          <div id="knob"></div>
+        </div>
+        <button class="rotb r" id="rotR" title="按住原地右转 (或按 E)">▶</button>
       </div>
 
-      <div class="row">
-        <div class="t">旋转</div>
-        <input type="range" id="rot" min="-100" max="100" value="0">
-        <div class="n" id="rotN">0</div>
-      </div>
       <div class="row">
         <div class="t">速度</div>
         <input type="range" id="spd" min="10" max="100" value="30">
@@ -362,7 +392,7 @@ kbd{background:#21262d;border:1px solid var(--line);border-bottom-width:2px;
       </div>
 
       <div id="dirbar">
-        输出 <span class="tag" id="vxTxt">0.00</span>
+        <span class="tag" id="vxTxt">0.00</span>
         <span class="tag" id="vyTxt">0.00</span>
         <span class="tag" id="wTxt">0.00</span>
         <!-- 正常时隐藏; 只有板子报"失控超时过短"才显示 (见 updHb) -->
@@ -370,7 +400,7 @@ kbd{background:#21262d;border:1px solid var(--line);border-bottom-width:2px;
       </div>
 
       <div class="hint">
-        摇杆拖动 = 前后/左右/斜向 · 旋转滑块 = 原地转<br>
+        摇杆拖动 = 前后/左右/斜向 · 左右三角 = 原地转<br>
         松开自动停 · 键盘 <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> 移动，
         <kbd>Q</kbd><kbd>E</kbd> 转，<kbd>空格</kbd> 停<br>
         曝光 / 画质档位在<b>画面右下角「⚙ 设置」</b>里 (鼠标移到画面上就能看到)
@@ -1014,7 +1044,6 @@ stick.addEventListener('pointermove', e => { if(e.pointerId===dragId) stickMove(
 stick.addEventListener('pointerup', e => { if(e.pointerId===dragId) stickEnd(); });
 stick.addEventListener('pointercancel', e => { if(e.pointerId===dragId) stickEnd(); });
 
-$('rot').addEventListener('input', e => { rot = +e.target.value; $('rotN').textContent = rot; updOut(); });
 $('spd').addEventListener('input', e => { speed = +e.target.value; $('spdN').textContent = speed;
   api('/api/speed', {s:speed}); });
 
@@ -1140,13 +1169,70 @@ async function pollVideo(){
 pollVideo();
 setInterval(pollVideo, 5000);
 
+/* ---- 原地转: 左右两个三角按钮 (按住持续转, 松开回正) ----
+ * 为什么不用滑条: 开车时滑条要"先拖到位置再保持", 单手很难; 三角按住即可,
+ * 松开自动回正 = 天然的失效保护 (手一松车就不转)。
+ *
+ * 保留 rot 这个 -100..100 的轴 (与 mqtt/键盘 Q E 同一套语义),
+ * 按钮只是把它推到 ±TURN_MAX。
+ */
+const TURN_MAX = 70;            // 按住时的转向量 (-100..100), 对齐原来滑条的常用区
+const TURN_SPEED = 8;           // 满量程耗时 = TURN_MAX/100*1s ≈ 700ms, 够快但不窜
+
+let turnDir = 0;                // -1 左 / 0 停 / +1 右
+let turnTimer = null;
+
+function turnStop(){
+  if(turnTimer){ clearInterval(turnTimer); turnTimer = null; }
+  turnDir = 0;
+  rot = 0;
+  $('rotL').classList.remove('on'); $('rotR').classList.remove('on');
+  updOut();
+}
+function turnStart(dir){
+  turnDir = dir;
+  (dir < 0 ? $('rotL') : $('rotR')).classList.add('on');
+  if(turnTimer) return;                       // 已在转, 不重复起定时器
+  turnTimer = setInterval(() => {
+    const target = turnDir * TURN_MAX;
+    /* 平滑逼近目标值, 避免瞬间满舵导致车身猛甩 */
+    if(Math.abs(rot - target) < TURN_SPEED) rot = target;
+    else rot += Math.sign(target - rot) * TURN_SPEED;
+    updOut();
+    if(rot === target){ clearInterval(turnTimer); turnTimer = null; }
+  }, 30);
+}
+
+/* 指针事件 (鼠标 + 触摸 + 笔统一)。
+ *
+ * ⚠️ 这里踩过一个坑 (实测发现): 一开始给按钮加了 setPointerCapture,
+ * 想保证"手指滑出按钮后仍能收到 pointerup"。但 capture 会把**所有**指针
+ * 事件都重定向到该元素, 于是 pointerleave **永远不会触发** ——
+ * 结果是"按住后把指针拖到别处, 车还在原地转", 对遥控车是危险的。
+ *
+ * 正确做法: **不要 capture**。把 pointerup/pointercancel 绑到 window
+ * (手指/鼠标在页面任何地方松开都能停), 同时用 pointerleave 在指针
+ * 离开按钮时立刻停 —— 双保险, 怎么松都能停。
+ */
+function bindTurn(el, dir){
+  el.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    turnStart(dir);
+  });
+  el.addEventListener('pointerleave', () => { if(turnDir === dir) turnStop(); });
+  ['pointerup','pointercancel'].forEach(ev =>
+    window.addEventListener(ev, () => { if(turnDir === dir) turnStop(); }));
+}
+bindTurn($('rotL'), -1);
+bindTurn($('rotR'), +1);
+
 $('btnStop').onclick = () => {
-  vx = vy = 0; rot = 0; $('rot').value = 0; $('rotN').textContent = '0';
+  vx = vy = 0; turnStop();
   knob.style.transform = 'translate(-50%,-50%)'; updOut(); api('/api/cmd', {c:'stop'});
 };
 $('btnCenter').onclick = () => { stickEnd(); api('/api/cmd', {c:'stop'}); };
 $('btnBrake').onclick = () => {
-  vx = vy = 0; rot = 0; $('rot').value = 0; $('rotN').textContent = '0';
+  vx = vy = 0; turnStop();
   knob.style.transform = 'translate(-50%,-50%)'; updOut(); api('/api/cmd', {c:'brake'});
 };
 
@@ -1167,7 +1253,6 @@ function keyApply(){
   if(keys['e']) r += 1;   /* E -> w +  -> 右转 */
   if(keys['q']) r -= 1;   /* Q -> w -  -> 左转 */
   vx = Math.max(-1,Math.min(1,x)); vy = Math.max(-1,Math.min(1,y)); rot = r*100;
-  $('rot').value = rot; $('rotN').textContent = rot;
   knob.style.transform = `translate(calc(-50% + ${vx*38}%),calc(-50% + ${-vy*38}%))`;
   updOut();
 }
