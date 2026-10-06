@@ -289,6 +289,93 @@ def processes():
     return found
 
 
+# ---- 线程级 CPU 热点定位 (2026-10-06 加) ----
+# 用户报"按住方向键 CPU 到 80-90%"。全局 CPU 百分比只说明"忙", 不能说明
+# **谁在忙**。load average 11.99 在单核板上意味着有十几个任务在抢 CPU,
+# 但那是历史平均, 也不能定位。
+#
+# 这里用 /proc/<pid>/task/*/stat 的 utime+stime 做**差分**, 直接算出每个
+# 线程在这一秒里吃掉了多少 CPU, 按占用排序。答案会自己浮出来, 不用猜。
+_prev_thr = {}
+
+
+def thread_cpu():
+    """返回本进程各线程的 CPU 占用 (按 % 降序)。
+
+    单位是"占单核的百分比"。100% 表示这个线程吃满一个核。
+    第一次调用没有基准, 返回空 (差分需要两次采样)。
+    """
+    global _prev_thr
+    pids = set()
+    try:
+        me = os.getpid()
+        pids.add(me)
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            nm = None
+            try:
+                with open("/proc/%s/comm" % pid) as f:
+                    nm = f.read().strip()
+            except OSError:
+                continue
+            if nm in ("rkipc", "mediamtx", "python3", "spitund"):
+                pids.add(int(pid))
+    except OSError:
+        pass
+
+    now = time.time()
+    cur = {}
+    for pid in pids:
+        tdir = "/proc/%d/task" % pid
+        try:
+            tids = os.listdir(tdir)
+        except OSError:
+            continue
+        for tid in tids:
+            try:
+                with open("%s/%s/stat" % (tdir, tid)) as f:
+                    raw = f.read()
+            except OSError:
+                continue
+            # comm 里可能有空格/括号, 取最后一个 ')' 之后才是字段
+            rp = raw.rfind(")")
+            if rp < 0:
+                continue
+            name = raw[raw.find("(") + 1:rp]
+            flds = raw[rp + 2:].split()
+            # 去掉 state(0) 后, utime 是第 11 个字段 => flds[11]
+            try:
+                ut, st = int(flds[11]), int(flds[12])
+            except (IndexError, ValueError):
+                continue
+            key = (pid, tid)
+            cur[key] = (name, ut + st)
+
+    out = []
+    hz = 100.0
+    dt = 1.0
+    if _prev_thr:
+        # 用实际的采样间隔换算, 避免 1Hz 定时漂移导致虚高
+        dt = max(0.2, now - _prev_thr.get("__t__", now))
+    for key, (name, ticks) in cur.items():
+        prev = _prev_thr.get(key)
+        if not prev:
+            continue
+        d = ticks - prev[1]
+        if d <= 0:
+            continue
+        pct = 100.0 * d / hz / dt
+        if pct < 0.5:
+            continue
+        out.append({"pid": key[0], "tid": key[1], "name": name,
+                    "pct": round(pct, 1)})
+    out.sort(key=lambda x: -x["pct"])
+    _prev_thr = dict(cur)
+    _prev_thr["__t__"] = now
+    return out[:8]
+
+
 def sample():
     """一次性采集全部系统状态。每秒调一次, 必须便宜。"""
     pct, cores = cpu_percent()
@@ -302,6 +389,7 @@ def sample():
         "npu": npu_info(),
         "detect": detect_info(),
         "proc": processes(),
+        "threads": thread_cpu(),
     }
 
 

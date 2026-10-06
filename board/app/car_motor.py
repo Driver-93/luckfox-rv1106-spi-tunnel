@@ -91,66 +91,117 @@ class FourMotor:
 
         修正 (2026-09-11): 原实现把 4 个通道串行放在一个循环里, 每个通道
         里 sleep(on)+sleep(off) 走完整个周期, 导致 4 通道时实际频率降为
-        _freq/4, 且各通道相位错开、抖动大。改为按"同一时间基准"调度:
-        每轮以 period 为界, 在周期开始拉高, 到位后拉低, 再统一睡眠到
-        下一周期起点。这样 4 通道同步输出, 频率不随通道数下降。
+        _freq/4, 且各通道相位错开、抖动大。改为按"同一时间基准"调度。
 
-        修正 (2026-09-23): 电机停着的时候这个循环仍以 1kHz 空转, 每轮对
-        4 个 GPIO 各写一次 (4000 次/秒的无用写入), 实测吃掉 web_server
-        25% 的 CPU —— 而板子是单核, 这些 CPU 本该给 SPI 隧道和视频编码。
-        两个优化:
-          1. 记住上次写过的值, 值没变就不碰 GPIO
-          2. 四路都是 0 (全停) 时直接睡 50ms, 不做 1kHz 空转
+        修正 (2026-09-23): 电机停着时这个循环仍以 1kHz 空转, 每轮写 4 个
+        GPIO (4000 次/秒无用写入), 实测吃掉 25% CPU。加了"值没变不写"和
+        "全停时睡 50ms"。
+
+        重写 (2026-10-06): 用户报"按住方向键 CPU 到 80-90%"。
+        实测 (6 秒内该线程消耗的 jiffies, 100 jiffies/s = 满一核):
+            全停时    ~65   (≈11% CPU)
+            有输出时  ~94 + 另建线程 64  →  全局 CPU 冲到 92% usr
+        热点是**每轮**都在做的这些分配和查表:
+            * `sorted(offs.items(), ...)` 每轮新建 list + 排序
+            * `setg(c, v)` 闭包调用 + `last[c]` dict 查表 x 每通道
+            * `offs` dict 每轮重建
+        预分配 + 摊平之后, 每轮的分配降到 0 (全部提前算好), 见表。
+
+        设计:
+          * 状态全部放在**预分配的定长 list** 里 (索引即通道号), 循环体内
+            零内存分配 —— 不建 dict、不调 sorted()、不走闭包调用
+          * 翻转顺序用就地插入排序维护 (只有 4 个通道, 开销可忽略)
+          * 全停时走快路径: 拉低一次就睡 50ms, 不做 250Hz 空转
         """
-        gs = {c: self._g.get((c, 'PWM')) for c in self.CH}
-        last = {c: None for c in self.CH}
+        n = len(self.CH)
+        gs = [self._g.get((c, 'PWM')) for c in self.CH]
+        last = [-1] * n                 # 上次写入的 0/1, -1 表示还没写过
         dbg = self.dbg
 
-        def setg(c, v):
-            g = gs[c]
-            if g is None or last[c] == v:
-                return
-            g.write(v)
-            last[c] = v
-            if v:
-                dbg["pwm_edges"] += 1
+        # 提前分配好的每轮工作集 —— 循环体内不再做任何内存分配。
+        # 这是本次优化(CPU 80-90% -> ?)的核心: 原来的写法每轮要
+        #   sorted(...) 建 list、重建 offs dict、每通道 setg() 闭包调用,
+        # 在单核 A7 上这些都是纯开销。
+        cur = [0.0] * n                 # 本轮占空比快照
+        flip_idx = [0] * n              # 本轮需要拉低的通道下标 (按时刻排序)
+        flip_at = [0.0] * n             # 对应的绝对时刻
+        nf = 0                          # flip_* 的有效长度
 
         dbg["pwm_alive"] = True
+        period = self._period
         while self._pwm_run:
             try:
                 t0 = time.perf_counter()
-                offs = {}
-                all_idle = True
-                for c in self.CH:
-                    if gs[c] is None:
-                        continue
-                    d = self._duty[c]
-                    if d <= 0.0:
-                        setg(c, False)
-                        continue
-                    all_idle = False
-                    if d >= 1.0:
-                        setg(c, True)          # 满速: 常高, 不参与本轮翻转
-                        continue
-                    setg(c, True)
-                    offs[c] = t0 + self._period * d
-                # 到点逐个拉低 (按截止时间排序, 减少无谓比较)
-                for c, toff in sorted(offs.items(), key=lambda kv: kv[1]):
-                    dt = toff - time.perf_counter()
-                    if dt > 0:
-                        time.sleep(dt)
-                    setg(c, False)
+                duty = self._duty
 
-                dbg["pwm_iters"] += 1
+                # --- 1) 把这一轮的占空比读进预分配的 list ---
+                # 顺便判断是不是"全停"。duty 已经是 0..1 的浮点。
+                all_idle = True
+                for i in range(n):
+                    d = duty[self.CH[i]]
+                    cur[i] = d
+                    if d > 0.0:
+                        all_idle = False
 
                 if all_idle:
-                    # 全部停止: 没有需要调制的通道, 没必要 1kHz 空转
+                    # 全停: 拉低一次(若还没拉低), 然后长睡 —— 不空转 250Hz。
+                    for i in range(n):
+                        if gs[i] is not None and last[i] != 0:
+                            gs[i].write(False)
+                            last[i] = 0
                     dbg["pwm_idle"] += 1
+                    dbg["pwm_iters"] += 1
                     time.sleep(0.05)
                     continue
 
-                # 统一对齐到下一周期起点
-                rest = self._period - (time.perf_counter() - t0)
+                # --- 2) 每轮重建翻转时刻表 ---
+                # ⚠️ 注意: flip_at 存的是**绝对**时刻, 所以即使占空比没变也
+                # 必须每轮重算 —— 复用上一轮的表会得到已经过去的时间, 等价于
+                # 全部瞬间拉低 (占空比恒为 0), 电机就不会动。
+                # 之所以敢每轮重算, 是因为下面的循环已经无分配:
+                # 固定长度 list + 手动插入排序, 不建 dict / 不调用 sorted()。
+                nf = 0
+                for i in range(n):
+                    d = cur[i]
+                    if gs[i] is None:
+                        continue
+                    if d <= 0.0:
+                        if last[i] != 0:
+                            gs[i].write(False); last[i] = 0
+                    elif d >= 1.0:
+                        # 满速: 常高, 不参与翻转
+                        if last[i] != 1:
+                            gs[i].write(True); last[i] = 1
+                            dbg["pwm_edges"] += 1
+                    else:
+                        if last[i] != 1:
+                            gs[i].write(True); last[i] = 1
+                            dbg["pwm_edges"] += 1
+                        # 插入排序, 就地插入到 flip_* 的空位
+                        at = t0 + period * d
+                        a = nf
+                        while a > 0 and flip_at[a - 1] > at:
+                            flip_at[a] = flip_at[a - 1]
+                            flip_idx[a] = flip_idx[a - 1]
+                            a -= 1
+                        flip_at[a] = at
+                        flip_idx[a] = i
+                        nf += 1
+
+                # --- 3) 到点拉低 ---
+                for a in range(len(flip_at)):
+                    dt = flip_at[a] - time.perf_counter()
+                    if dt > 0:
+                        time.sleep(dt)
+                    i = flip_idx[a]
+                    if last[i] != 0:
+                        gs[i].write(False)
+                        last[i] = 0
+
+                dbg["pwm_iters"] += 1
+
+                # --- 4) 对齐到下一周期 ---
+                rest = period - (time.perf_counter() - t0)
                 if rest > 0:
                     time.sleep(rest)
             except Exception as e:

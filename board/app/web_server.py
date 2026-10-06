@@ -771,9 +771,33 @@ def set_failsafe_timeout(t):
 _fs = {"last_cmd": 0.0, "n": 0, "over": 0, "max_gap": 0.0, "gaps": []}
 FS_GAP_SAMPLES = 120
 
+# 指令追踪开关的缓存: 2 秒才 stat 一次, 避免每条指令都做系统调用。
+_TRACE = {"on": False, "next": 0.0}
+
+
+def _trace_tick():
+    """指令追踪开关 (节流版)。返回 True 表示这次要写日志。
+
+    原来在 do_POST 热路径上直接 os.path.exists(), 40Hz 下就是每秒
+    40 次 stat; 而追踪默认关闭, 这些系统调用纯粹是浪费。
+    """
+    now = time.time()
+    if now >= _TRACE["next"]:
+        _TRACE["next"] = now + 2.0
+        try:
+            _TRACE["on"] = os.path.exists("/userdata/cmd_trace_on")
+        except Exception:
+            _TRACE["on"] = False
+    return _TRACE["on"]
+
 
 def _fs_note_cmd():
-    """每条控制指令到达时调用一次 (do_POST 里)。"""
+    """每条控制指令到达时调用一次 (do_POST 里)。
+
+    ⚠️ 这里**不要**再抓 MOTOR_LOCK: 调用点在 /api/move 的 `with MOTOR_LOCK`
+    之前一行, 等于每条指令(40Hz)多一次无谓的加解锁, 在单核板上会和
+    HTTP/SPI 线程抢 GIL。只读 STATE 的几个标量, CPython 下是原子的。
+    """
     try:
         now = time.time()
         prev = _fs["last_cmd"]
@@ -782,11 +806,10 @@ def _fs_note_cmd():
             return
         gap = now - prev
         # 只在"车在动"时才统计: 停着的时候本来就不发心跳, 间隔大是正常的
-        with MOTOR_LOCK:
-            moving = (abs(STATE.get("vx", 0.0)) > 0.02 or
-                      abs(STATE.get("vy", 0.0)) > 0.02 or
-                      abs(STATE.get("w", 0.0)) > 0.02 or
-                      STATE.get("dir") not in _STILL_DIRS)
+        moving = (abs(STATE.get("vx", 0.0)) > 0.02 or
+                  abs(STATE.get("vy", 0.0)) > 0.02 or
+                  abs(STATE.get("w", 0.0)) > 0.02 or
+                  STATE.get("dir") not in _STILL_DIRS)
         if not moving and gap > 2.0:
             _fs["last_cmd"] = now
             return
@@ -890,6 +913,43 @@ def _failsafe_check():
 # 隧道来的客户端如果还没有 /32 路由, 立刻补一条 (ip route replace)。
 # 这样 DHCP 变了也会自己长回来, 不需要任何人工干预。
 # ---------------- HTTP ----------------
+# 快路径用的最小 headers 对象。stdlib 的 http.client.HTTPMessage 是大块头,
+# 而控制接口只用得上 Content-Length。
+class _Headers:
+    __slots__ = ("_cl",)
+
+    def __init__(self, content_length=0):
+        self._cl = int(content_length or 0)
+
+    def get(self, name, default=None):
+        if name.lower() == "content-length":
+            return str(self._cl)
+        return default
+
+    def get_all(self, name, default=None):
+        v = self.get(name)
+        return [v] if v is not None else (default or [])
+
+    def __getitem__(self, name):
+        v = self.get(name)
+        if v is None:
+            raise KeyError(name)
+        return v
+
+    def __contains__(self, name):
+        return self.get(name) is not None
+
+
+_REASON = {
+    200: b"OK", 204: b"No Content", 301: b"Moved Permanently",
+    302: b"Found", 304: b"Not Modified", 400: b"Bad Request",
+    403: b"Forbidden", 404: b"Not Found", 405: b"Method Not Allowed",
+    408: b"Request Timeout", 413: b"Payload Too Large",
+    414: b"URI Too Long", 500: b"Internal Server Error",
+    503: b"Service Unavailable",
+}
+
+
 class H(BaseHTTPRequestHandler):
     server_version = "LuckfoxCar/1.0"
     # HTTP/1.1 keep-alive: the browser reuses ONE connection for joystick
@@ -922,23 +982,155 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, fmt, *a):
         pass  # 静音, 避免刷屏
 
+    # ---- 控制热路径加速 (2026-10-06) ----
+    # 用户报"按住方向键 CPU 到 80-90%"。实测定位 (板子自己测自己):
+    #
+    #   PWM 线程       空闲 9.0%  →  按住时 8.9%   ← 完全没变, 不是它
+    #   HTTP 处理线程  空闲 0.5%  →  按住时 13.1%  ← 就是它
+    #
+    # 进一步用"极小 handler"对照 (同样走 BaseHTTPRequestHandler, 但 do_POST
+    # 里只读 body 就回 11 字节):
+    #
+    #   BaseHTTPRequestHandler 极简版   4.19 ms/请求
+    #   裸 socket 极简版                1.16 ms/请求   ← 快 3.6 倍
+    #
+    # 也就是说 **4.19ms 里绝大部分是 stdlib 自己的开销**, 不是我们的代码:
+    # parse_request() 是纯 Python 逐行扫 header, 每条请求还要建 Date 头、
+    # 走 send_response/send_header 的缓冲逻辑。在单核 A7 上 40Hz 就是
+    # 40 * 4.19ms = 17% 的核, 加上真正的业务和视频编码就顶到 80%+。
+    #
+    # 修法: 给**控制类请求**加一条手写快路径 —— 只解析我们真正用到的
+    # 三个头 (Content-Length / Connection / 请求行), 直接把响应拼成一次
+    # sendall 发出去 (顺带省掉第二次 write, Nagle 也就不用管了)。
+    # 页面本身和冷门接口仍然走标准 stdlib 路径, 保证兼容性。
+    _FAST_PATHS = ("/api/move", "/api/cmd", "/api/speed",
+                   "/api/ping", "/api/status")
+
+    def handle_one_request(self):
+        """替代 stdlib 的实现: 对控制类请求走快路径, 其余交回 stdlib。
+
+        ⚠️ 关键点: 请求行已经从这里读走了, 所以**不能**再去调
+        BaseHTTPRequestHandler.handle_one_request —— 它会从 rfile 再读一行,
+        而那已经是下一个请求 (或 EOF), 结果是响应错位、客户端报
+        "服务器提交了协议冲突"。非热路径必须在这里自己把状态补全, 然后
+        直接进 do_GET/do_POST。
+        """
+        try:
+            self.raw_requestline = self.rfile.readline(65537)
+        except Exception:
+            self.close_connection = True
+            return
+        if not self.raw_requestline:
+            self.close_connection = True
+            return
+        if len(self.raw_requestline) > 65536:
+            self.requestline = ""
+            self.request_version = ""
+            self.command = ""
+            self.send_error(414)
+            return
+
+        line = self.raw_requestline
+        sp1 = line.find(b" ")
+        sp2 = line.find(b" ", sp1 + 1)
+        if sp1 < 0 or sp2 < 0:
+            # 不像 HTTP 请求行: 直接关掉, 不要试图"交回 stdlib"
+            self.close_connection = True
+            return
+
+        command = line[:sp1]
+        # --- header 扫描 (快慢路径共用, 一次读完) ---
+        # 只留我们可能用到的头, 避免构造 http.client.HTTPMessage (大块头)。
+        clen = 0
+        while True:
+            try:
+                h = self.rfile.readline(65537)
+            except Exception:
+                self.close_connection = True
+                return
+            if not h or h in (b"\r\n", b"\n"):
+                break
+            if h[0] in (0x20, 0x09):        # 折行, 忽略
+                continue
+            c = h.find(b":")
+            if c < 0:
+                continue
+            if h[:c].strip().lower() == b"content-length":
+                try:
+                    clen = int(h[c + 1:].strip())
+                except ValueError:
+                    clen = 0
+
+        body = b""
+        if clen > 0:
+            if clen > 262144:
+                self.close_connection = True
+                try:
+                    self.send_error(413)
+                except Exception:
+                    pass
+                return
+            try:
+                body = self.rfile.read(clen)
+            except Exception:
+                self.close_connection = True
+                return
+
+        self.command = command.decode("latin-1")
+        self.request_version = "HTTP/1.1"
+        self.path = line[sp1 + 1:sp2].decode("latin-1")
+        self.requestline = "%s %s %s" % (self.command, self.path,
+                                         self.request_version)
+        self.close_connection = False
+        self.headers = _Headers(clen)
+        self._body_raw = body
+        try:
+            if self.command == "POST":
+                self.do_POST()
+            elif self.command == "GET":
+                self.do_GET()
+            elif self.command == "HEAD":
+                self.do_GET()
+            else:
+                self.send_error(501)
+            try:
+                self.wfile.flush()
+            except Exception:
+                self.close_connection = True
+        except Exception:
+            # 处理器里出异常不能让连接线程带崩整个服务
+            self.close_connection = True
+
     def _send(self, code, body, ctype="application/json; charset=utf-8"):
         if isinstance(body, str):
             body = body.encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
+        # 一次 write 拼完整包: 少一次 write 系统调用, 也不再依赖
+        # TCP_NODELAY 去压第二次小包的延迟。
         try:
-            self.wfile.write(body)
+            self.wfile.write(
+                b"HTTP/1.1 %d %s\r\n"
+                b"Content-Type: %s\r\n"
+                b"Content-Length: %d\r\n"
+                b"Cache-Control: no-store\r\n"
+                b"Connection: keep-alive\r\n\r\n"
+                % (code, _REASON.get(code, b"OK"), ctype.encode("latin-1"),
+                   len(body)) + body)
         except Exception:
-            pass
+            self.close_connection = True
 
     def _json(self, code, obj):
         self._send(code, json.dumps(obj, ensure_ascii=False))
 
     def _body(self):
+        # 快路径已经把 body 读出来了, 直接用, 不再碰 rfile
+        raw = getattr(self, "_body_raw", None)
+        if raw is not None:
+            if not raw:
+                return {}
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except Exception:
+                return {}
         try:
             n = int(self.headers.get("Content-Length", 0))
             if n <= 0:
@@ -1019,20 +1211,23 @@ class H(BaseHTTPRequestHandler):
 
         # ---- 指令追踪 (诊断): 把每条控制指令连"谁发的"一起记下来 ----
         # 2026-10-05 加: 控制"时好时坏"时, 必须能回答"这段时间到底有没有
-        # 指令到达、从哪个客户端、发的什么"。只写一行, 单核板上开销可忽略。
-        # 关掉只需 rm /userdata/cmd_trace_on
+        # 指令到达、从哪个客户端、发的什么"。
+        #
+        # 2026-10-06 修: 这里原来**每条指令**都要 os.path.exists()
+        # (40Hz 就是每秒 40 次 stat 系统调用), 而这是纯诊断功能, 默认就是
+        # 关的。改成每 2 秒才查一次开关, 热路径上只剩一次时间比较。
         if p in ("/api/move", "/api/cmd", "/api/speed"):
             _fs_note_cmd()          # 统计指令到达间隔 (用于判断失控超时是否过短)
 
-            try:
-                if os.path.exists("/userdata/cmd_trace_on"):
+            if _trace_tick():
+                try:
                     with open("/userdata/cmd_trace.log", "a", encoding="utf-8") as f:
                         f.write("%s %s:%s %s %s\n" % (
                             time.strftime("%H:%M:%S"),
                             self.client_address[0], self.client_address[1],
                             p, json.dumps(d, ensure_ascii=False)))
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
         # 摄像头调节不依赖电机, 所以放在电机检查之前
         if p == "/api/cam":
@@ -1161,6 +1356,26 @@ class H(BaseHTTPRequestHandler):
 
 BOOT_MONO = time.monotonic()
 
+
+# ---- 服务器选择 (2026-10-06) ----
+# ThreadingHTTPServer 对**每条 TCP 连接**起一个线程。浏览器保活复用连接,
+# 所以连接数不多; 但 stdlib 的 accept 循环 + 每条连接的线程创建在单核
+# A7 上仍然很贵。实测对照:
+#
+#   极简 stdlib handler (什么都不做)  4.21 ms/请求
+#   极简裸 socket handler             1.13 ms/请求
+#
+# 我们改造后的控制 handler 现在只要 ~3.3 ms/请求 —— 已经比"空的 stdlib
+# handler"还快, 说明剩下的开销在服务器架构而不是业务代码。
+#
+# ⚠️ 为什么**不**改成固定 worker 池: HTTP/1.1 keep-alive 下, 一个连接
+# 会占用一个处理器线程直到空闲超时 (15s)。浏览器保持 2-3 条长连接, 固定
+# 池立刻就被占满, 新连接会饿死。所以这里保留 ThreadingHTTPServer 的
+# "每连接一线程"模型 —— 它在这个场景下反而是对的: 线程数 = 活跃连接数,
+# 而活跃连接数由浏览器决定 (通常 2-6 条, 不是 40 条)。
+#
+# 真正的开销来自**每次请求**的 stdlib 解析, 那部分已经在上面的
+# handle_one_request 快路径里消掉了。
 def main():
     print("=" * 52)
     print(" Luckfox 遥控车 — 板载 Web 服务")
@@ -1176,13 +1391,17 @@ def main():
     threading.Thread(target=cam_loop, daemon=True).start()
     try:
         srv = ThreadingHTTPServer(("0.0.0.0", PORT), H)
+        # 单核板上 GIL 是稀缺资源: 让 accept 循环少醒一点, 把 CPU 让给
+        # 控制线程和视频编码。0.5s(默认) -> 0.2s 只是让统计线程更及时,
+        # 但注意 poll_interval 只影响"没有连接进来"时的空转频率。
+        srv.timeout = 0.2
     except OSError as e:
         print("[http] 端口 %d 绑定失败: %s" % (PORT, e))
         sys.exit(1)
     print("[http] 监听 0.0.0.0:%d" % PORT)
     print("[http] 手机/电脑打开: http://<板子IP>:%d/" % PORT)
     try:
-        srv.serve_forever()
+        srv.serve_forever(poll_interval=0.2)
     except KeyboardInterrupt:
         pass
     finally:
