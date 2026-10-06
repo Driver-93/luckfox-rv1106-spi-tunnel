@@ -1,4 +1,4 @@
-# 构建产物 / 固件 (绝不入库)
+# ?????? / ??? (??????)
 *.img
 *.bin
 *.elf
@@ -19,8 +19,7 @@
 *.pyc
 __pycache__/
 
-# 工具链 / 厂商工具 / 刷机包
-platform-tools/
+# ?????/ ?????? / ?????platform-tools/
 SocToolKit/
 DriverAssitant/
 boardimg/
@@ -37,17 +36,14 @@ car/c/carctl_static
 mediamtx_armv7.tar.gz
 tun.ko
 
-# 媒体 / 截图
-*.jpg
-*.jpeg
-*.png
+# ??? / ???
 *.pdf
 *.ts
 *.m3u8
 car/preview/
 _shots/
 
-# ---- 凭据 (重要!) ----
+# ---- ??? (???!) ----
 id_ed25519
 id_ed25519.pub
 server_car.pem
@@ -62,7 +58,7 @@ spi_tunnel_c3/sdkconfig.old
 tools_20261003/_patch_c5*.py
 _debug_archive/srv_emqx_user.sh
 
-# 运行时 / 日志 / 临时
+# ?????/ ??? / ???
 *.log
 c3_serial*.log
 hb_log.csv
@@ -74,3 +70,8 @@ backup_*/
 _public/
 _snap_kernel/
 _snap_kernel.tar.gz
+
+# ?????????? (docs/images), ???????
+!docs/images/*.png
+!docs/images/*.jpg
+
