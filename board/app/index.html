@@ -178,49 +178,57 @@ main{max-width:1100px;margin:0 auto;padding:10px 12px 24px}
 .panel h3{margin:0 0 8px;font-size:10.5px;color:var(--dim);font-weight:600;
   text-transform:uppercase;letter-spacing:.5px}
 
-/* 原地转按钮: **等腰直角三角形**, 贴在转盘(摇杆圆盘)的左上角 / 右上角。
+/* 原地转按钮: **圆角等腰直角三角形**, 贴在转盘(摇杆圆盘)的左上角 / 右上角。
  *
- *     ◤▔▔▔▔▔▔▔▔◥        <- 两个三角的斜边朝内下, 直角在外侧上角
- *      ╲   O    ╱
- *       ╲      ╱
- *        ╲    ╱
- *         ╲  ╱
+ *     ╭──────────╮        <- 斜边朝内下, 直角在外侧上角
+ *      ╲  左     │
+ *       ╲        │
+ *        ╲       │
+ *         ╲      │
  *
- *   左上(◤): 直角在左上角, 斜边从左下 -> 右上 (朝内下)
- *   右上(◥): 直角在右上角, 斜边从右下 -> 左上 (朝内下)
- *   两者严格镜像。三角里面显示 "左" / "右" 汉字。
- * 放在圆盘上角 + 尺寸够大 -> 手机上左右拇指自然落在那里, 不用移动手掌。
+ *   左上: 直角在左上角, 斜边从左下 -> 右上
+ *   右上: 与左严格镜像
+ *   文字在三角形的**重心**位置 (居中), 不是贴着角。
  *
- * ---- 怎么做出"等腰直角三角形 + 里面还能放字" ----
- * 用 CSS border 画的三角**不能放文字**(伪元素里放不了内容),
- * 所以这里用 **clip-path** 把按钮本身裁成三角 —— 这样文字就在按钮里,
- * 而且触摸热区/点击判定都跟着形状走, 比 border 方案更好用。
+ * ---- 圆角怎么做的 ----
+ * `clip-path: polygon()` **不能做圆角** (多边形只有尖角)。
+ * 所以改用 `clip-path: path('...')` —— SVG 路径语法, 支持圆弧,
+ * 可以给三个角分别设圆角 (直角处圆角大一些, 锐角处小一些, 视觉才均匀)。
  *
- *   clip-path: polygon(...) 用**百分比**写, 天然自适应尺寸。
- *   等腰直角三角 = 三个顶点里有一个是 90 度、两条直角边等长。
+ * 路径用**固定像素**画 (配合下面 .rotb 的固定尺寸), 因为 path() 不支持
+ * 百分比。三个角半径:
+ *   直角(上角) r=12  -> 明显圆润
+ *   下方两角   r=4   -> 尖锐但不刺, 保留"三角"的感觉
+ *
+ * 文字居中: 用 flex 把 span 放在盒子里, 但**盒子是正方形、三角只占一半**,
+ * 所以直接居中会偏。正确做法是把 span 定位到三角形的**重心**
+ * (等腰直角三角形重心 = 直角顶点往斜边方向 1/3 处)。
+ * 这里用绝对定位 + transform 精确放到重心。
  */
 .rotb{position:absolute;top:0;width:78px;height:78px;padding:0;margin:0;
-  border:0;cursor:pointer;color:#8b949e;background:#1b2129;
-  font:600 15px/1 inherit;letter-spacing:0;
-  display:flex;align-items:flex-start;justify-content:center;
+  border:0;cursor:pointer;color:#c9d1d9;background:#1f2733;
   touch-action:none;-webkit-tap-highlight-color:transparent;
-  transition:background .12s,color .12s;
+  transition:background .13s,color .13s;
   -webkit-user-select:none;user-select:none}
-/* 左上: ◤ 直角在左上, 斜边从左下到右上; 文字靠近直角(左上)那一侧 */
+/* 左上 ◤ : 直角在左上。路径逆时针: 左上直角(圆角r12) -> 右上 -> 左下 */
 .rotb.l{left:0;
-  clip-path:polygon(0 0, 100% 0, 0 100%);
-  padding:9px 0 0 11px;
-  align-items:flex-start;justify-content:flex-start}
-/* 右上: ◥ 直角在右上, 斜边从右下到左上; 与左严格镜像 */
+  clip-path:path('M 12 0 L 74 0 A 4 4 0 0 1 78 4 L 4 78 A 4 4 0 0 1 0 74 L 0 12 A 12 12 0 0 1 12 0 Z')}
+/* 右上 ◥ : 与左严格镜像 (直角在右上) */
 .rotb.r{right:0;
-  clip-path:polygon(100% 0, 100% 100%, 0 0);
-  padding:9px 11px 0 0;
-  align-items:flex-start;justify-content:flex-end}
-.rotb:hover{background:#232b35;color:#c9d1d9}
+  clip-path:path('M 66 0 L 4 0 A 4 4 0 0 0 0 4 L 74 78 A 4 4 0 0 0 78 74 L 78 12 A 12 12 0 0 0 66 0 Z')}
+.rotb:hover{background:#26303d;color:#e6edf3}
 /* 按住时: 变蓝 + 字变白, 明确反馈"正在原地转" */
-.rotb.on{background:rgba(47,129,247,.92);color:#fff}
-/* 三角内部文字: 单独一个 span, 方便定位 */
-.rotb span{display:block;font-size:15px;font-weight:700;line-height:1}
+.rotb.on{background:rgba(47,129,247,.95);color:#fff}
+
+/* 三角内部的文字: 放到三角形**重心**上。
+ * 等腰直角三角形(直角在左上): 顶点(0,0) (78,0) (0,78)
+ *   重心 = ((0+78+0)/3, (0+0+78)/3) = (26, 26)
+ * 右上按钮镜像 -> 重心 = (52, 26)
+ * 用 left/top + translate(-50%,-50%) 把文字中心对到重心。 */
+.rotb span{position:absolute;display:block;font-size:15px;font-weight:700;
+  line-height:1;pointer-events:none}
+.rotb.l span{left:26px;top:26px;transform:translate(-50%,-50%)}
+.rotb.r span{left:52px;top:26px;transform:translate(-50%,-50%)}
 
 /* 转盘容器: 两个三角按钮相对它绝对定位 (贴在它的左上角/右上角)。
    所以这里必须是 position:relative。 */
@@ -294,18 +302,25 @@ input[type=range]::-moz-range-thumb{width:15px;height:15px;border:0;border-radiu
   .row{margin-top:8px}
   input[type=range]{height:24px}
   input[type=range]::-webkit-slider-thumb{width:20px;height:20px;margin-top:-8px}
-  /* 手机上三角按钮再放大一点: 拇指更好按 (触控目标 ≥48px) */
+  /* 手机上三角按钮再放大一点: 拇指更好按。
+     ⚠️ clip-path:path() 用的是**固定像素**, 所以尺寸变了路径必须跟着重写,
+     否则形状和尺寸对不上 (路径还是旧的 78px 坐标系)。
+     重心也跟着变: 86px 时重心 = (86/3, 86/3) ≈ (29, 29) / 镜像 (57, 29)。 */
   .rotb{width:86px;height:86px}
+  .rotb.l{clip-path:path('M 13 0 L 82 0 A 4 4 0 0 1 86 4 L 4 86 A 4 4 0 0 1 0 82 L 0 13 A 13 13 0 0 1 13 0 Z')}
+  .rotb.r{clip-path:path('M 73 0 L 4 0 A 4 4 0 0 0 0 4 L 82 86 A 4 4 0 0 0 86 82 L 86 13 A 13 13 0 0 0 73 0 Z')}
   .rotb span{font-size:16px}
-  .rotb.l{padding:10px 0 0 12px}
-  .rotb.r{padding:10px 12px 0 0}
+  .rotb.l span{left:29px;top:29px}
+  .rotb.r span{left:57px;top:29px}
 }
-/* 窄到 380px 以下按比例收一档 */
+/* 窄到 380px 以下按比例收一档 (74px 坐标系) */
 @media(max-width:380px){
   .rotb{width:74px;height:74px}
+  .rotb.l{clip-path:path('M 11 0 L 70 0 A 4 4 0 0 1 74 4 L 4 74 A 4 4 0 0 1 0 70 L 0 11 A 11 11 0 0 1 11 0 Z')}
+  .rotb.r{clip-path:path('M 63 0 L 4 0 A 4 4 0 0 0 0 4 L 70 74 A 4 4 0 0 0 74 70 L 74 11 A 11 11 0 0 0 63 0 Z')}
   .rotb span{font-size:14px}
-  .rotb.l{padding:8px 0 0 10px}
-  .rotb.r{padding:8px 10px 0 0}
+  .rotb.l span{left:25px;top:25px}
+  .rotb.r span{left:49px;top:25px}
 }
 
 #dirbar{display:flex;align-items:center;gap:6px;margin-top:9px;font-size:11px;
