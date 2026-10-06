@@ -62,7 +62,7 @@ docs/                   文档与截图
 | 延迟瓶颈的实测分析 | `docs/SPI_LATENCY_ANALYSIS.md` |
 | **时钟为什么故意不设时区** | `docs/TIME.md` |
 | **改图传 / 重启 rkipc 的正确姿势** | `docs/VIDEO_RESTART.md`（踩坑换来的操作规程）|
-| **NPU 人/狗检测做到哪一步了** | `docs/NPU_DETECTION.md`（实测：NPU 可用；但固件缺 rockiva 模型）|
+| **NPU 人/狗检测（已上线）** | `docs/NPU_DETECTION.md`（实测：可用、已持久化、控制延迟 +3ms）|
 | **部署"没生效"先查什么** | `docs/USERDATA_SPACE.md`（`/userdata` 只有 2.2MB）|
 | 完整的开发过程与踩坑记录 | `docs/PROGRESS.md` |
 | 硬件怎么接 | `docs/WIRING.md` |
