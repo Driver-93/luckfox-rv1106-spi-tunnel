@@ -156,11 +156,21 @@ main{max-width:1100px;margin:0 auto;padding:10px 12px 24px}
   z-index:8;text-align:center;padding:16px;backdrop-filter:blur(2px)}
 #vbusy.on{display:flex}
 
-/* ---- 状态卡片: 收紧内边距与字号, 别占太大地方 ---- */
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:8px}
-@media(max-width:560px){.stats{grid-template-columns:repeat(2,1fr)}}
+/* ---- 状态卡片 ----
+ * ⚠️ `repeat(4, 1fr)` 里的 `1fr` **不是硬性等宽**: 网格项的 min-width 默认是
+ * `auto`, 也就是"不小于内容的最小尺寸"。所以当某张卡片的文字很长时
+ * (实测 WiFi 那张的副标题 "C5 192.168.3.69 · 堆 109KB · 在线 4304s"),
+ * 那一列会被撑宽 —— 实测模板列变成 `150px 150px 193px 150px`,
+ * 同一行里 WiFi 卡片比邻居宽 44px, 看起来就不整齐了。
+ *
+ * 修法: 把网格项的 min-width 设成 0 (`minmax(0, 1fr)`), 强制等宽;
+ * 内容超出时由 .stat .s 自己的 `overflow:hidden + text-overflow:ellipsis`
+ * 负责截断 (它本来就有这套样式, 只是之前轮不到它生效)。
+ */
+.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:8px}
+@media(max-width:560px){.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .stat{background:var(--card);border:1px solid var(--line);border-radius:var(--r-md);
-  padding:7px 9px}
+  padding:7px 9px;min-width:0}
 .stat .k{font-size:var(--fs-sm);color:var(--dim);display:flex;align-items:center;gap:4px;
   text-transform:uppercase;letter-spacing:.3px}
 .stat .v{font-size:var(--fs-lg);font-weight:700;margin-top:2px;
@@ -344,47 +354,23 @@ kbd{background:#21262d;border:1px solid var(--line);border-bottom-width:2px;
  * 系统状态面板 (板子自身: CPU / 内存 / NPU / 检测 / 温度 / 磁盘)
  * ============================================================================
  * 数据来自 /api/status 的 sys 字段 —— 板子在**它自己的 1Hz 遥测循环**里
- * 采好放进缓存的, 网页只是读快照。所以这个面板**不增加板子任何开销**,
- * 也不会像"在网页里直接调接口"那样把单核打满。
+ * 采好放进缓存的, 网页只是读快照。所以**不增加板子任何开销**。
  *
- * ---- 为什么是"胶囊条"而不是卡片 ----
- * 第一版做成了带标题 + 2x2 网格 + 进度条 + 两行页脚的大卡片, 用户反馈
- * "太大了"。确实: 那是一整块 panel, 高度 ~150px, 而它承载的信息只是
- * 4 个数字 + 几个次要指标。
+ * ---- 尺寸: 和别的状态卡片**完全一样** ----
+ * 这里不再自定义容器样式, 直接用上面的 .stat (背景/边框/圆角/内边距/
+ * 字号/bar 全部复用)。所以四块系统卡和电池/GPS/WiFi/4G 是同一套外观,
+ * 在 .stats 网格里自然对齐 —— 不需要维护第二套尺寸。
  *
- * 改成一行胶囊:
- *   * 没有标题 (胶囊自带标签)
- *   * 没有进度条 —— 用**数值颜色**表达压力 (绿/黄/红), 省掉 4 条 bar 的高度
- *   * 只有一个次要信息行 (温度/负载/磁盘/运行), 用 · 分隔
- *   * 整条高度 ~26px, 不到原来的 1/5
- * 代价: 看不到"渐进的占用率"。但这个面板的用途是"有没有异常",
- * 而不是"精确读负载"—— 颜色足够回答前者。
+ * ⚠️ 走过的弯路: 先做成"一行细长胶囊条"(21px 高), 用户指出两点
+ *    (1) 要和其他方块一样大小  (2) SD 卡使用情况没显示。
+ *    所以改回标准卡片, 并补上 SD 卡。
+ *
+ * 颜色语义 (两套相反, 阈值必须分开):
+ *   占用类 (CPU/内存/SD): 越满越糟 -> >=90% 红, >=70% 黄
+ *   状态类 (NPU/检测):    正常绿, 待确认黄, 异常红
  */
-#sysPanel{margin-top:7px}
-#sysPanel .syschips{display:flex;align-items:center;gap:5px;flex-wrap:wrap;
-  font-variant-numeric:tabular-nums}
-#sysPanel .sp{flex:1}
-#sysPanel .chip{display:inline-flex;align-items:center;gap:4px;flex:none;
-  padding:2px 8px;border-radius:10px;    /* 更接近胶囊形 (高 21px, 半径 10 就够圆) */
-  background:var(--card2);border:1px solid var(--line);
-  font-size:var(--fs-sm);line-height:1.5;white-space:nowrap}
-#sysPanel .chip b{font-weight:500;color:var(--dim)}
-#sysPanel .chip i{font-style:normal;font-weight:700;color:var(--fg)}
-/* 压力上色: 数值变色即可, 不需要 bar */
-#sysPanel .chip.ok  i{color:var(--ok)}
-#sysPanel .chip.warn i{color:var(--warn)}
-#sysPanel .chip.bad  i{color:var(--err)}
-/* 整条告警时连边框也变 —— 扫一眼就知道哪块不对 */
-#sysPanel .chip.bad{border-color:rgba(248,81,73,.5);background:rgba(248,81,73,.1)}
-#sysPanel .chip.warn{border-color:rgba(210,153,34,.45)}
-#sysPanel .sysmini{font-size:var(--fs-sm);color:#5a6472;white-space:nowrap;
-  overflow:hidden;text-overflow:ellipsis}
-/* 手机上让"次要信息"换到第二行, 不要挤掉胶囊 */
-@media(max-width:600px){
-  #sysPanel .sp{display:none}
-  #sysPanel .sysmini{flex-basis:100%;font-size:9.5px}
-  #sysPanel .chip{padding:1px 6px}
-}
+/* 系统卡片的专用小尺寸 (只调 bar 上下的间距, 不改外观) */
+#sysCpuS, #sysNpuS, #memS, #sdS{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 </style>
 </head>
 <body>
@@ -440,7 +426,7 @@ kbd{background:#21262d;border:1px solid var(--line);border-bottom-width:2px;
       </div>
       <div class="stat">
         <div class="k"><span class="dot" id="gpsDot"></span>GPS</div>
-        <div class="v" style="font-size:13px" id="gpsV">--</div>
+        <div class="v" id="gpsV">--</div>
         <div class="s" id="gpsS">卫星 --</div>
         <div class="s" id="gpsA"></div>
       </div>
@@ -452,30 +438,41 @@ kbd{background:#21262d;border:1px solid var(--line);border-bottom-width:2px;
       </div>
       <div class="stat">
         <div class="k"><span class="dot" id="netDot"></span>4G</div>
-        <div class="v" style="font-size:13px" id="netV">--</div>
+        <div class="v" id="netV">--</div>
         <div class="s" id="netS">--</div>
       </div>
       <div class="stat">
         <div class="k"><span class="dot" id="carDot"></span>状态</div>
-        <div class="v" style="font-size:13px" id="carV">--</div>
+        <div class="v" id="carV">--</div>
         <div class="s" id="carS">--</div>
       </div>
-    </div>
 
-    <!-- 系统状态 (板子自身) —— **紧凑单行**, 不是一个大卡片。
-         数据来自 /api/status 的 sys 字段 (板子 1Hz 采集的缓存快照)。
-         设计目标: 占最小面积, 但一眼能看出"哪个不正常"。
-           * 常态只显示: CPU / 内存 / NPU / 检测 四个小胶囊 + 一行次要信息
-           * 数值用颜色表达压力 (绿/黄/红), 所以不需要进度条占高度
-           * 没有大标题 —— 胶囊本身自带标签 -->
-    <div id="sysPanel">
-      <div class="syschips">
-        <span class="chip" id="chipCpu"><b>CPU</b><i>--</i></span>
-        <span class="chip" id="chipMem"><b>内存</b><i>--</i></span>
-        <span class="chip" id="chipNpu"><b>NPU</b><i>--</i></span>
-        <span class="chip" id="chipDet"><b>检测</b><i>--</i></span>
-        <span class="sp"></span>
-        <span class="sysmini" id="sysMini">--</span>
+      <!-- 系统状态: **两块普通 .stat 卡片**, 与上面电池/GPS/WiFi 完全同款同尺寸
+           (用户要求"和其他方块一样大小" —— 早先自作主张做成细长条是错的)。
+           数据来自 /api/status 的 sys 字段 (板子 1Hz 采集的缓存快照)。 -->
+      <div class="stat">
+        <div class="k"><span class="dot" id="cpuDot"></span>系统</div>
+        <div class="v" id="sysCpuV">--</div>
+        <div class="bar"><i id="sysCpuBar"></i></div>
+        <div class="s" id="sysCpuS">--</div>
+      </div>
+      <div class="stat">
+        <div class="k"><span class="dot" id="sysDot"></span>NPU 检测</div>
+        <div class="v" id="sysNpuV">--</div>
+        <div class="bar"><i id="sysNpuBar"></i></div>
+        <div class="s" id="sysNpuS">--</div>
+      </div>
+      <div class="stat">
+        <div class="k"><span class="dot" id="memDot"></span>内存 / 温度</div>
+        <div class="v" id="memV">--</div>
+        <div class="bar"><i id="memBar"></i></div>
+        <div class="s" id="memS">--</div>
+      </div>
+      <div class="stat">
+        <div class="k"><span class="dot" id="sdDot"></span>SD 卡</div>
+        <div class="v" id="sdV">--</div>
+        <div class="bar"><i id="sdBar"></i></div>
+        <div class="s" id="sdS">--</div>
       </div>
     </div>
   </div>
@@ -1501,15 +1498,16 @@ function render(st){
   renderSys(st.sys);
 }
 
-/* ---- 系统状态 (紧凑胶囊条) ----
+/* ---- 系统状态 (四块标准卡片) ----
  * st.sys 是板子 1Hz 采集缓存下来的快照, 这里只做展示 —— 不在网页里另调接口,
  * 否则会变成"每次轮询都让板子重新算一遍", 那是把单核打满的老路。
  *
- * 只用**数值颜色**表达状态, 不画进度条 —— 省掉 4 条 bar 的高度。
- *   占用类 (CPU/内存): <70% 绿, <90% 黄, 更高红
- *   状态类 (NPU/检测): 正常绿, 待确认黄, 异常红
- * ⚠️ 这两类语义相反 (占用 100% = 糟, 状态满 = 好), 所以判定阈值分开写,
- *    不要共用一个函数 (第一版共用过, 结果"NPU 在用"被标成红)。
+ * 四块: 系统(CPU+负载) / NPU检测 / 内存温度 / SD卡
+ * 全部复用 .stat 的外观, 所以和电池/GPS/WiFi 视觉一致。
+ *
+ * 颜色语义两套相反, 判定分开写 (第一版共用过, 把"NPU 在用"标成红):
+ *   占用类 -> 高 = 糟 (>=90 红, >=70 黄)
+ *   状态类 -> 正常绿 / 待确认黄 / 异常红
  */
 function fmtUptime(s){
   if(s == null) return '--';
@@ -1518,64 +1516,94 @@ function fmtUptime(s){
   if(h) return h+'小时'+m+'分';
   return m+'分';
 }
-/* 设置一个胶囊: 值和压力等级 */
-function chip(id, text, level){
-  const e = $(id);
-  if(!e) return;
-  const i = e.querySelector('i');
-  if(i) i.textContent = text;
-  e.className = 'chip' + (level ? ' ' + level : '');
+/* 占用率 -> 颜色等级 */
+function useCls(pct, warnAt, badAt){
+  if(pct == null) return '';
+  return pct >= badAt ? 'bad' : (pct >= warnAt ? 'warn' : 'ok');
 }
+/* 填一块系统卡片 */
+function fillCard(dotId, vId, barId, sId, dotCls, vText, barPct, barColor, sub){
+  const d = $(dotId); if(d) d.className = 'dot ' + (dotCls || '');
+  const v = $(vId); if(v) v.textContent = vText;
+  const b = $(barId);
+  if(b){
+    b.style.width = Math.max(0, Math.min(100, barPct == null ? 0 : barPct)) + '%';
+    b.style.background = barColor || 'var(--ok)';
+  }
+  const s = $(sId); if(s) s.textContent = sub;
+}
+const C_OK = '#3fb950', C_WARN = '#d29922', C_ERR = '#f85149';
+const C_DIM = '#484f58';
+function lvlColor(l){ return l === 'bad' ? C_ERR : (l === 'warn' ? C_WARN : C_OK); }
+
 function renderSys(s){
   if(!s){
-    // 板子还没采到 (刚开机) 或老版本没这个字段
-    ['chipCpu','chipMem','chipNpu','chipDet'].forEach(id => chip(id, '--', ''));
-    const m = $('sysMini'); if(m) m.textContent = '--';
+    // 板子刚开机还没采到, 或老版本没有这个字段
+    fillCard('cpuDot','sysCpuV','sysCpuBar','sysCpuS','', '--', 0, C_DIM, '--');
+    fillCard('sysDot','sysNpuV','sysNpuBar','sysNpuS','', '--', 0, C_DIM, '--');
+    fillCard('memDot','memV','memBar','memS','', '--', 0, C_DIM, '--');
+    fillCard('sdDot','sdV','sdBar','sdS','', '--', 0, C_DIM, '--');
     return;
   }
-  // CPU (占用率)
+
+  // ---- 1) 系统: CPU 占用 + 负载 ----
   const cpu = s.cpu || {}, p = cpu.pct;
-  chip('chipCpu',
-    p == null ? '--' : p.toFixed(0)+'%',
-    p == null ? '' : (p >= 90 ? 'bad' : (p >= 70 ? 'warn' : 'ok')));
+  const cl = useCls(p, 70, 90);
+  const run = s.uptime_s != null ? fmtUptime(s.uptime_s) : '--';
+  fillCard('cpuDot','sysCpuV','sysCpuBar','sysCpuS',
+    cl === 'bad' ? 'off' : (cl === 'warn' ? 'mid' : 'on'),
+    p == null ? '--' : p.toFixed(0) + '%',
+    p, lvlColor(cl),
+    (s.load ? '载 ' + s.load.l1.toFixed(1) + ' · ' : '') + run);
 
-  // 内存 (占用率) —— 显示已用/总量, 比百分比更有信息量
-  const m = s.mem || {};
-  chip('chipMem',
-    m.used_pct == null ? '--' : (m.used_mb + 'M'),
-    m.used_pct == null ? '' : (m.used_pct >= 90 ? 'bad' : (m.used_pct >= 80 ? 'warn' : 'ok')));
-
-  // NPU: 硬件在 + 被持有 = 在用
+  // ---- 2) NPU 检测 ----
   const npu = s.npu || {}, det = s.detect || {};
   const npuOk = !!(npu.loaded && npu.dev);
-  chip('chipNpu',
-    npuOk ? (npu.in_use ? '在用' : '空闲') : '无',
-    npuOk ? (npu.in_use ? 'ok' : 'warn') : 'bad');
-
-  // 检测: 配置开着 **且** NPU 真被持有 才算"跑着"
   const on = det.enabled === true;
   const running = on && !!det.holder;
-  chip('chipDet',
-    running ? ((det.fps || '?') + 'fps') : (on ? '未生效' : (det.enabled === false ? '关' : '--')),
-    running ? 'ok' : (on ? 'warn' : (det.enabled === false ? 'bad' : '')));
+  const nlv = running ? 'ok' : (on ? 'warn' : (det.enabled === false ? 'bad' : ''));
+  fillCard('sysDot','sysNpuV','sysNpuBar','sysNpuS',
+    nlv === 'bad' ? 'off' : (nlv === 'warn' ? 'mid' : (nlv === 'ok' ? 'on' : '')),
+    running ? ((det.fps || '?') + 'fps') : (on ? '未生效' : (det.enabled === false ? '关闭' : '--')),
+    nlv === '' ? 0 : 100, lvlColor(nlv === '' ? 'warn' : nlv),
+    npuOk ? (running ? 'NPU 在用 · ' + det.holder : (npu.in_use ? 'NPU 在用' : 'NPU 空闲'))
+          : 'NPU 未加载');
 
-  // 次要信息拼成一行: 温度 · 负载 · 磁盘 · 运行时长
-  const bits = [];
-  const c = s.temp_c;
-  if(c != null) bits.push('温 ' + c.toFixed(0) + '°');
-  if(s.load) bits.push('载 ' + s.load.l1.toFixed(1));
-  if(s.disk && s.disk.root) bits.push('盘 ' + s.disk.root.free_mb + 'M');
-  if(s.uptime_s != null) bits.push('运行 ' + fmtUptime(s.uptime_s));
-  // 进程掉线才提 —— 正常时不占地方
-  const NAMES = {rkipc:'图传', mediamtx:'流媒体', 'web_server.py':'网页'};
-  const miss = [];
-  for(const k in NAMES){ if(!(s.proc || {})[k]) miss.push(NAMES[k]); }
-  if(miss.length) bits.push('缺失: ' + miss.join(','));
-  const mn = $('sysMini');
-  if(mn){
-    mn.textContent = bits.join(' · ');
-    // 有进程掉了就把这行标红 (只有异常时才显眼)
-    mn.style.color = miss.length ? 'var(--err)' : '#5a6472';
+  // ---- 3) 内存 / 温度 ----
+  const m = s.mem || {};
+  const ml = useCls(m.used_pct, 80, 90);
+  const t = s.temp_c;
+  const tl = t == null ? '' : (t >= 80 ? 'bad' : (t >= 70 ? 'warn' : ''));
+  // 取内存和温度里更严重的一个决定圆点颜色
+  const worst = (ml === 'bad' || tl === 'bad') ? 'off'
+              : ((ml === 'warn' || tl === 'warn') ? 'mid'
+              : ((ml || tl) ? 'on' : ''));
+  fillCard('memDot','memV','memBar','memS', worst,
+    m.used_pct == null ? '--' : m.used_pct.toFixed(0) + '%',
+    m.used_pct, lvlColor(ml),
+    (m.used_mb != null ? m.used_mb + '/' + m.total_mb + 'M' : '--') +
+    (t != null ? ' · ' + t.toFixed(0) + '°C' : ''));
+
+  // ---- 4) SD 卡 ----
+  // ⚠️ 用户指出"SD 卡使用情况没有" —— 之前只在页脚提了根分区, 没显示 SD。
+  // SD 卡上有录像/模型, 写满会让部署静默失败 (踩过), 所以值得单独一块。
+  const sd = (s.disk || {}).sd;
+  if(sd){
+    // SD 越满越危险: 90% 红, 75% 黄
+    const sl = useCls(sd.used_pct, 75, 90);
+    // 大字显示"可用空间"更好用 (我们关心的是还剩多少)
+    const freeTxt = sd.free_mb >= 1024
+      ? (sd.free_mb / 1024).toFixed(1) + 'G'
+      : sd.free_mb.toFixed(0) + 'M';
+    fillCard('sdDot','sdV','sdBar','sdS',
+      sl === 'bad' ? 'off' : (sl === 'warn' ? 'mid' : 'on'),
+      freeTxt, sd.used_pct, lvlColor(sl),
+      '已用 ' + sd.used_pct.toFixed(0) + '% · 共 ' +
+      (sd.total_mb >= 1024 ? (sd.total_mb / 1024).toFixed(0) + 'G'
+                           : sd.total_mb.toFixed(0) + 'M'));
+  }else{
+    // SD 没插 / 没挂载 —— 明确说出来, 不要留 "--"
+    fillCard('sdDot','sdV','sdBar','sdS','', '未挂载', 0, C_DIM, '没插卡或挂载失败');
   }
 }
 

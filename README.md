@@ -95,39 +95,48 @@ Browser client (same page for PC and phone, responsive):
 
 ### System status
 
-A single **compact chip strip** (measured **21px** tall — 86% smaller than the first
-version's card):
+Four **ordinary status cards**, visually identical in size to 电池 / GPS / WiFi / 4G / 状态
+(all nine measured at exactly `161x75`, equal width within every row):
 
-```
-[ CPU 43% ] [ MEM 47M ] [ NPU in use ] [ DET 15fps ]   temp 47° · load 11.8 · disk 108.7M · up 8m
-```
+| Card | Value | Sub-label |
+|---|---|---|
+| **系统** (system) | CPU usage % | load · uptime |
+| **NPU 检测** | detection fps | NPU in use / idle · holder |
+| **内存 / 温度** | memory usage % | used/total · SoC temperature |
+| **SD 卡** | **free space** | used % · capacity |
 
 The page reads a `sys` snapshot that the board collects inside its **existing 1Hz
-telemetry loop** — the browser never triggers collection itself, so this adds
+telemetry loop** — the browser never triggers collection itself, so these cards add
 **zero** load to the board (and ~570 bytes to the response).
 
-Design trade-offs:
+Design choices:
 
-* **No progress bars** — pressure is expressed by **value colour** instead. Colour is
-  enough to answer "is anything wrong?", and dropping four bars saves real height.
-* **No heading** — the chips carry their own labels.
-* **Missing processes only appear when missing** — normally the strip stays short;
-  if a service dies the secondary line appends `missing: streaming,web` and turns red.
+* **CPU/memory/SD use progress bars** (utilisation); **NPU/detection use a dot + value**
+  (on/off state).
+* **The SD card shows *free* space, not used** — what matters is how much is left, and
+  filling it makes deployment fail silently (see `docs/USERDATA_SPACE.md`).
+* With no card inserted it says `未挂载 / 没插卡或挂载失败` rather than `--`.
 
-⚠️ Two opposite meanings — the thresholds must stay separate (sharing them caused a bug):
+⚠️ Two opposite meanings — thresholds must stay separate (sharing them caused a bug):
 
 | Kind | Meaning | Colours |
 |---|---|---|
-| CPU / memory | **Utilisation** | more = worse (≥70% yellow, ≥90% red) |
+| CPU / memory / SD | **Utilisation** | more = worse (CPU ≥70% yellow, ≥90% red; SD ≥75% yellow, ≥90% red) |
 | NPU / detection | **On/off state** | healthy green / unconfirmed yellow / fault red |
 
-> The first version shared the utilisation colouring across all four rows, so "NPU in
-> use" was marked red — it looked like a fault. Caught by pixel-analysing a screenshot.
-
-> Another pitfall: `web_server.py`'s `/proc/<pid>/comm` is **`python3`** (comm is the
-> thread name, not the script name), so matching on comm made the "web" service look
-> permanently missing and the strip warned red forever. It now re-reads `cmdline`
-> for `python*` processes to get the script name.
+> **Three pitfalls, all reproduced on hardware**:
+>
+> 1. **`repeat(4, 1fr)` is not strictly equal-width.** A grid item's `min-width`
+>    defaults to `auto` (no smaller than the content's minimum), so the WiFi card's long
+>    sub-label (`C5 192.168.3.69 · 堆 109KB · 在线 4304s`) stretched that column to
+>    193px — 44px wider than its neighbours in the same row. Fixed with
+>    `repeat(4, minmax(0, 1fr))`, letting `.s`'s existing `ellipsis` handle overflow.
+> 2. **`web_server.py`'s `/proc/<pid>/comm` is `python3`** (comm is the thread name,
+>    not the script name), so matching on comm made the "web" service look permanently
+>    missing. It now re-reads `cmdline` for `python*` processes.
+> 3. **A stray hardcoded `font-size:13px`** among otherwise-unified sizes made some
+>    cards' values and bars sit 1px higher than their row neighbours. All values now
+>    use the stylesheet's unified size.
 
 
 ### On-screen controls (OSD)
