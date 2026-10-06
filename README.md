@@ -93,35 +93,42 @@ Browser client (same page for PC and phone, responsive):
 |---|---|
 | ![Control UI - mobile](docs/images/ui-mobile.png) | ![Debug panels](docs/images/ui-debug-panels.jpg) |
 
-### System status panel
+### System status
+
+A single **compact chip strip** (measured **21px** tall — 86% smaller than the first
+version's card):
+
+```
+[ CPU 43% ] [ MEM 47M ] [ NPU in use ] [ DET 15fps ]   temp 47° · load 11.8 · disk 108.7M · up 8m
+```
 
 The page reads a `sys` snapshot that the board collects inside its **existing 1Hz
-telemetry loop** — the browser never triggers collection itself, so the panel adds
+telemetry loop** — the browser never triggers collection itself, so this adds
 **zero** load to the board (and ~570 bytes to the response).
 
-```
-System status                     uptime 1h2m
-┌─────────────────┬─────────────────┐
-│ CPU      27%    │ MEM  56.1/180.2M│
-│ ████░░░░░░░░░░  │ █████░░░░░░░░░  │
-├─────────────────┼─────────────────┤
-│ NPU    in use   │ DET 15fps·rkipc │
-│ ██████████████  │ ██████████████  │
-└─────────────────┴─────────────────┘
-temp 50.0°C   load 11.5   root 108M free
-procs video✓ · streaming✓ · web✓ · python✓
-```
+Design trade-offs:
 
-Bar colours carry **two different meanings**, and mixing them is a real bug:
+* **No progress bars** — pressure is expressed by **value colour** instead. Colour is
+  enough to answer "is anything wrong?", and dropping four bars saves real height.
+* **No heading** — the chips carry their own labels.
+* **Missing processes only appear when missing** — normally the strip stays short;
+  if a service dies the secondary line appends `missing: streaming,web` and turns red.
 
-| Row | Meaning | Colours |
+⚠️ Two opposite meanings — the thresholds must stay separate (sharing them caused a bug):
+
+| Kind | Meaning | Colours |
 |---|---|---|
-| CPU / memory | **Utilisation** | more = worse (green <70%, yellow <90%, red above) |
-| NPU / detection | **On/off state** | full = healthy (green), not running = red |
+| CPU / memory | **Utilisation** | more = worse (≥70% yellow, ≥90% red) |
+| NPU / detection | **On/off state** | healthy green / unconfirmed yellow / fault red |
 
-> A first version reused the utilisation colouring for all four rows, so "NPU in use"
-> rendered as a **full red bar** next to green text — it looked like a fault.
-> Caught by pixel-analysing a screenshot.
+> The first version shared the utilisation colouring across all four rows, so "NPU in
+> use" was marked red — it looked like a fault. Caught by pixel-analysing a screenshot.
+
+> Another pitfall: `web_server.py`'s `/proc/<pid>/comm` is **`python3`** (comm is the
+> thread name, not the script name), so matching on comm made the "web" service look
+> permanently missing and the strip warned red forever. It now re-reads `cmdline`
+> for `python*` processes to get the script name.
+
 
 ### On-screen controls (OSD)
 

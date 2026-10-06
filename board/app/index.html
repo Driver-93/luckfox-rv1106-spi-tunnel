@@ -347,43 +347,43 @@ kbd{background:#21262d;border:1px solid var(--line);border-bottom-width:2px;
  * 采好放进缓存的, 网页只是读快照。所以这个面板**不增加板子任何开销**,
  * 也不会像"在网页里直接调接口"那样把单核打满。
  *
- * 用 bar 而不是数字饼图: 一眼看出"哪个快满了"比精确读数重要。
+ * ---- 为什么是"胶囊条"而不是卡片 ----
+ * 第一版做成了带标题 + 2x2 网格 + 进度条 + 两行页脚的大卡片, 用户反馈
+ * "太大了"。确实: 那是一整块 panel, 高度 ~150px, 而它承载的信息只是
+ * 4 个数字 + 几个次要指标。
+ *
+ * 改成一行胶囊:
+ *   * 没有标题 (胶囊自带标签)
+ *   * 没有进度条 —— 用**数值颜色**表达压力 (绿/黄/红), 省掉 4 条 bar 的高度
+ *   * 只有一个次要信息行 (温度/负载/磁盘/运行), 用 · 分隔
+ *   * 整条高度 ~26px, 不到原来的 1/5
+ * 代价: 看不到"渐进的占用率"。但这个面板的用途是"有没有异常",
+ * 而不是"精确读负载"—— 颜色足够回答前者。
  */
-#sysPanel .sysgrid{display:grid;grid-template-columns:1fr 1fr;gap:8px 12px}
-#sysPanel .sysitem{min-width:0}
-#sysPanel .sysrow{display:flex;align-items:baseline;justify-content:space-between;
-  gap:6px;margin-bottom:3px}
-#sysPanel .sysrow .k{font-size:var(--fs-sm);color:var(--dim);flex:none}
-#sysPanel .sysrow .v{font-size:var(--fs-md);font-weight:700;color:var(--fg);
-  font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;
-  text-overflow:ellipsis}
-#sysPanel .bar{height:4px;border-radius:2px;background:#252b33;overflow:hidden}
-#sysPanel .bar i{display:block;height:100%;width:0;border-radius:2px;
-  background:var(--ok);transition:width .3s,background .3s}
-/* 占用率上色 (CPU/内存): <70% 绿 / <90% 黄 / 更高红 */
-#sysPanel .bar i.warn{background:var(--warn)}
-#sysPanel .bar i.bad{background:var(--err)}
-/* 状态上色 (NPU/检测): 满=正常(绿), 半=待确认(黄), 满而异常=红。
-   注意和占用率的区别 —— "100% 红"是故障, "100% 绿"是正常。 */
-#sysPanel .bar i.st-ok{background:var(--ok)}
-#sysPanel .bar i.st-warn{background:var(--warn)}
-#sysPanel .bar i.st-off{background:var(--err)}
-#sysPanel .sysfoot{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:8px;
-  font-size:var(--fs-sm);color:var(--dim);font-variant-numeric:tabular-nums}
-#sysPanel .v.bad{color:var(--err)}
-#sysPanel .v.warn{color:var(--warn)}
-#sysPanel .v.ok{color:var(--ok)}
-/* 手机上单列更清楚 */
+#sysPanel{margin-top:7px}
+#sysPanel .syschips{display:flex;align-items:center;gap:5px;flex-wrap:wrap;
+  font-variant-numeric:tabular-nums}
+#sysPanel .sp{flex:1}
+#sysPanel .chip{display:inline-flex;align-items:center;gap:4px;flex:none;
+  padding:2px 8px;border-radius:10px;    /* 更接近胶囊形 (高 21px, 半径 10 就够圆) */
+  background:var(--card2);border:1px solid var(--line);
+  font-size:var(--fs-sm);line-height:1.5;white-space:nowrap}
+#sysPanel .chip b{font-weight:500;color:var(--dim)}
+#sysPanel .chip i{font-style:normal;font-weight:700;color:var(--fg)}
+/* 压力上色: 数值变色即可, 不需要 bar */
+#sysPanel .chip.ok  i{color:var(--ok)}
+#sysPanel .chip.warn i{color:var(--warn)}
+#sysPanel .chip.bad  i{color:var(--err)}
+/* 整条告警时连边框也变 —— 扫一眼就知道哪块不对 */
+#sysPanel .chip.bad{border-color:rgba(248,81,73,.5);background:rgba(248,81,73,.1)}
+#sysPanel .chip.warn{border-color:rgba(210,153,34,.45)}
+#sysPanel .sysmini{font-size:var(--fs-sm);color:#5a6472;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+/* 手机上让"次要信息"换到第二行, 不要挤掉胶囊 */
 @media(max-width:600px){
-  #sysPanel .sysgrid{grid-template-columns:1fr 1fr}
-  #sysPanel .sysrow .v{font-size:11px}
-}
-/* 宽屏时: 标签和数值之间的空隙太大 (实测 456~546px 的空洞),
-   而两列之间只有 24px —— 远处看像"标签飘在左边、数值飘在右边"。
-   给每列设上限宽度, 让内容聚拢。 */
-@media(min-width:900px){
-  #sysPanel .sysgrid{grid-template-columns:1fr 1fr;gap:8px 28px}
-  #sysPanel .sysitem{max-width:240px}
+  #sysPanel .sp{display:none}
+  #sysPanel .sysmini{flex-basis:100%;font-size:9.5px}
+  #sysPanel .chip{padding:1px 6px}
 }
 </style>
 </head>
@@ -462,35 +462,20 @@ kbd{background:#21262d;border:1px solid var(--line);border-bottom-width:2px;
       </div>
     </div>
 
-    <!-- 系统状态 (板子自身): CPU / 内存 / NPU / 检测 / 温度 / 磁盘
-         数据来自 /api/status 的 sys 字段 (板子 1Hz 采集的缓存快照)。 -->
-    <div class="panel" id="sysPanel">
-      <h3>系统状态 <span id="sysUp" style="float:right;font-weight:400;color:#5a6472;text-transform:none;letter-spacing:0"></span></h3>
-      <div class="sysgrid">
-        <div class="sysitem">
-          <div class="sysrow"><span class="k">CPU</span><span class="v" id="sysCpu">--</span></div>
-          <div class="bar"><i id="sysCpuBar"></i></div>
-        </div>
-        <div class="sysitem">
-          <div class="sysrow"><span class="k">内存</span><span class="v" id="sysMem">--</span></div>
-          <div class="bar"><i id="sysMemBar"></i></div>
-        </div>
-        <div class="sysitem">
-          <div class="sysrow"><span class="k">NPU</span><span class="v" id="sysNpu">--</span></div>
-          <div class="bar"><i id="sysNpuBar"></i></div>
-        </div>
-        <div class="sysitem">
-          <div class="sysrow"><span class="k">检测</span><span class="v" id="sysDet">--</span></div>
-          <div class="bar"><i id="sysDetBar"></i></div>
-        </div>
-      </div>
-      <div class="sysfoot">
-        <span id="sysTemp">温度 --</span>
-        <span id="sysLoad">负载 --</span>
-        <span id="sysDisk">磁盘 --</span>
-      </div>
-      <div class="sysfoot">
-        <span id="sysProc">进程 --</span>
+    <!-- 系统状态 (板子自身) —— **紧凑单行**, 不是一个大卡片。
+         数据来自 /api/status 的 sys 字段 (板子 1Hz 采集的缓存快照)。
+         设计目标: 占最小面积, 但一眼能看出"哪个不正常"。
+           * 常态只显示: CPU / 内存 / NPU / 检测 四个小胶囊 + 一行次要信息
+           * 数值用颜色表达压力 (绿/黄/红), 所以不需要进度条占高度
+           * 没有大标题 —— 胶囊本身自带标签 -->
+    <div id="sysPanel">
+      <div class="syschips">
+        <span class="chip" id="chipCpu"><b>CPU</b><i>--</i></span>
+        <span class="chip" id="chipMem"><b>内存</b><i>--</i></span>
+        <span class="chip" id="chipNpu"><b>NPU</b><i>--</i></span>
+        <span class="chip" id="chipDet"><b>检测</b><i>--</i></span>
+        <span class="sp"></span>
+        <span class="sysmini" id="sysMini">--</span>
       </div>
     </div>
   </div>
@@ -1516,110 +1501,81 @@ function render(st){
   renderSys(st.sys);
 }
 
-/* ---- 系统状态面板 ----
+/* ---- 系统状态 (紧凑胶囊条) ----
  * st.sys 是板子 1Hz 采集缓存下来的快照, 这里只做展示 —— 不在网页里另调接口,
  * 否则会变成"每次轮询都让板子重新算一遍", 那是把单核打满的老路。
  *
- * ⚠️ 两套"进度条"语义不同, 别混:
- *   CPU/内存 = **占用率** -> 越满越糟 (>=90% 红, >=70% 黄)
- *   NPU/检测 = **开/关状态** -> 满 = 正常 (绿), 没跑 = 红
- * 一开始我让它们共用 barCls(), 结果 NPU"在用"被画成 100% 红色,
- * 看起来像故障 (实测截图发现的)。所以状态条单独一套配色。
+ * 只用**数值颜色**表达状态, 不画进度条 —— 省掉 4 条 bar 的高度。
+ *   占用类 (CPU/内存): <70% 绿, <90% 黄, 更高红
+ *   状态类 (NPU/检测): 正常绿, 待确认黄, 异常红
+ * ⚠️ 这两类语义相反 (占用 100% = 糟, 状态满 = 好), 所以判定阈值分开写,
+ *    不要共用一个函数 (第一版共用过, 结果"NPU 在用"被标成红)。
  */
-function barCls(pct){
-  return pct >= 90 ? 'bad' : (pct >= 70 ? 'warn' : '');
-}
-/* 状态条: 传 "ok" / "off" / "warn" 三种语义, 不用占用率阈值 */
-function stateBar(barId, txtId, state, text){
-  const b = $(barId), t = $(txtId);
-  if(!b || !t) return;
-  t.textContent = text;
-  t.className = 'v' + (state === 'ok' ? ' ok' : state === 'off' ? ' bad'
-                     : state === 'warn' ? ' warn' : '');
-  b.style.width = (state === 'ok' || state === 'warn') ? '100%'
-                : state === 'off' ? '100%' : '0%';
-  // 状态条的颜色直接用语义色, 不走占用率那套
-  b.className = state === 'ok' ? 'st-ok'
-              : state === 'warn' ? 'st-warn'
-              : state === 'off' ? 'st-off' : '';
-}
-function setBar(barId, txtId, pct, text, cls){
-  const b = $(barId), t = $(txtId);
-  if(!b || !t) return;
-  t.textContent = text;
-  t.className = 'v' + (cls ? ' '+cls : '');
-  b.style.width = Math.max(0, Math.min(100, pct || 0)) + '%';
-  b.className = barCls(pct);
-}
 function fmtUptime(s){
   if(s == null) return '--';
   const d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
   if(d) return d+'天'+h+'小时';
   if(h) return h+'小时'+m+'分';
-  return m+'分'+(s%60)+'秒';
+  return m+'分';
+}
+/* 设置一个胶囊: 值和压力等级 */
+function chip(id, text, level){
+  const e = $(id);
+  if(!e) return;
+  const i = e.querySelector('i');
+  if(i) i.textContent = text;
+  e.className = 'chip' + (level ? ' ' + level : '');
 }
 function renderSys(s){
   if(!s){
     // 板子还没采到 (刚开机) 或老版本没这个字段
-    ['sysCpu','sysMem','sysNpu','sysDet'].forEach(id => {
-      const e = $(id); if(e) e.textContent = '--';
-    });
-    const u = $('sysUp'); if(u) u.textContent = '';
+    ['chipCpu','chipMem','chipNpu','chipDet'].forEach(id => chip(id, '--', ''));
+    const m = $('sysMini'); if(m) m.textContent = '--';
     return;
   }
-  const u = $('sysUp'); if(u) u.textContent = '运行 ' + fmtUptime(s.uptime_s);
+  // CPU (占用率)
+  const cpu = s.cpu || {}, p = cpu.pct;
+  chip('chipCpu',
+    p == null ? '--' : p.toFixed(0)+'%',
+    p == null ? '' : (p >= 90 ? 'bad' : (p >= 70 ? 'warn' : 'ok')));
 
-  // CPU
-  const cpu = s.cpu || {};
-  const p = cpu.pct;
-  setBar('sysCpuBar','sysCpu', p,
-    p == null ? '--' : p.toFixed(0)+'%' + (cpu.cores>1 ? ' · '+cpu.cores+'核' : ''),
-    p != null && p >= 90 ? 'bad' : (p != null && p >= 70 ? 'warn' : ''));
-
-  // 内存
+  // 内存 (占用率) —— 显示已用/总量, 比百分比更有信息量
   const m = s.mem || {};
-  setBar('sysMemBar','sysMem', m.used_pct,
-    m.used_pct == null ? '--' : m.used_mb+'/'+m.total_mb+'M',
-    m.used_pct >= 90 ? 'bad' : (m.used_pct >= 80 ? 'warn' : ''));
+  chip('chipMem',
+    m.used_pct == null ? '--' : (m.used_mb + 'M'),
+    m.used_pct == null ? '' : (m.used_pct >= 90 ? 'bad' : (m.used_pct >= 80 ? 'warn' : 'ok')));
 
-  // NPU: 硬件在 = 好; 被持有 = 在用
+  // NPU: 硬件在 + 被持有 = 在用
   const npu = s.npu || {}, det = s.detect || {};
   const npuOk = !!(npu.loaded && npu.dev);
-  stateBar('sysNpuBar','sysNpu',
-    npuOk ? (npu.in_use ? 'ok' : 'warn') : 'off',
-    npuOk ? (npu.in_use ? '在用' : '空闲') : '无');
+  chip('chipNpu',
+    npuOk ? (npu.in_use ? '在用' : '空闲') : '无',
+    npuOk ? (npu.in_use ? 'ok' : 'warn') : 'bad');
 
   // 检测: 配置开着 **且** NPU 真被持有 才算"跑着"
   const on = det.enabled === true;
   const running = on && !!det.holder;
-  stateBar('sysDetBar','sysDet',
-    running ? 'ok' : (on ? 'warn' : (det.enabled === false ? 'off' : null)),
-    running ? ((det.fps || '?') + 'fps · ' + det.holder)
-            : (on ? '未生效' : (det.enabled === false ? '关闭' : '--')));
+  chip('chipDet',
+    running ? ((det.fps || '?') + 'fps') : (on ? '未生效' : (det.enabled === false ? '关' : '--')),
+    running ? 'ok' : (on ? 'warn' : (det.enabled === false ? 'bad' : '')));
 
-  // 温度 / 负载 / 磁盘
-  const t = $('sysTemp');
-  if(t){
-    const c = s.temp_c;
-    t.textContent = '温度 ' + (c == null ? '--' : c.toFixed(1)+'°C');
-    t.className = c != null && c >= 80 ? 'bad' : (c != null && c >= 70 ? 'warn' : '');
-  }
-  const l = $('sysLoad');
-  if(l && s.load) l.textContent = '负载 ' + s.load.l1.toFixed(1);
-  const d = $('sysDisk');
-  if(d && s.disk){
-    const r = s.disk.root;
-    d.textContent = r ? ('根分区 ' + r.free_mb + 'M 可用') : '磁盘 --';
-    d.className = r && r.free_mb < 5 ? 'bad' : '';
-  }
-  const pr = $('sysProc');
-  if(pr && s.proc){
-    const names = {rkipc:'图传', mediamtx:'流媒体', web_server:'网页', python3:'python'};
-    const parts = [];
-    for(const k in names){
-      if(s.proc[k]) parts.push(names[k]+'✓');
-    }
-    pr.textContent = '进程 ' + (parts.length ? parts.join(' · ') : '--');
+  // 次要信息拼成一行: 温度 · 负载 · 磁盘 · 运行时长
+  const bits = [];
+  const c = s.temp_c;
+  if(c != null) bits.push('温 ' + c.toFixed(0) + '°');
+  if(s.load) bits.push('载 ' + s.load.l1.toFixed(1));
+  if(s.disk && s.disk.root) bits.push('盘 ' + s.disk.root.free_mb + 'M');
+  if(s.uptime_s != null) bits.push('运行 ' + fmtUptime(s.uptime_s));
+  // 进程掉线才提 —— 正常时不占地方
+  const NAMES = {rkipc:'图传', mediamtx:'流媒体', 'web_server.py':'网页'};
+  const miss = [];
+  for(const k in NAMES){ if(!(s.proc || {})[k]) miss.push(NAMES[k]); }
+  if(miss.length) bits.push('缺失: ' + miss.join(','));
+  const mn = $('sysMini');
+  if(mn){
+    mn.textContent = bits.join(' · ');
+    // 有进程掉了就把这行标红 (只有异常时才显眼)
+    mn.style.color = miss.length ? 'var(--err)' : '#5a6472';
   }
 }
 
