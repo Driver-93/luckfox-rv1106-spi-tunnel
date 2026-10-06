@@ -37,6 +37,14 @@ TPL = "/oem/usr/share/rkipc-300w.ini"
 LOG = "/userdata/video_profile.log"
 
 # 档位表。所有档位都是 [video.0] 主码流的设置。
+#
+# ⚠️ 开机默认档位 = **流畅 720p** (用户指定)。
+#    做法: 把 ini 和模板都写成 720p, 这样即使 rkipc 被固件重启、
+#    或板子断电重启, 起来就是 720p, 不会悄悄回到 1296p 把隧道打满。
+DEFAULT_PROFILE = "smooth"
+# 开机默认曝光档位 = **1/1000 极快** (用户指定, 防拖影)。
+DEFAULT_EXPOSURE = "t1000"
+
 PROFILES = {
     "smooth": {
         "label": "流畅 720p",
@@ -147,6 +155,232 @@ def _log(msg):
             f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
     except Exception:
         pass
+
+
+# ============================================================================
+# 画面质量: 亮度 / 对比度 / 饱和度 / 锐度 + 过曝抑制
+# ============================================================================
+# 为什么这些**能**做, 而之前的"实时曝光滑块"不能:
+#
+#   strings /oem/usr/bin/rkipc 里能直接看到:
+#       rk_isp_set_brightness / rk_isp_get_brightness
+#       rk_isp_set_contrast   / rk_isp_get_contrast
+#       isp.%d.adjustment:brightness
+#       isp.%d.adjustment:contrast
+#   也就是说**亮度和对比度是 rkipc 官方支持的参数**, 它自己会写进 ISP。
+#   而 V4L2 那条路 (/dev/v4l-subdev2 的 exposure 寄存器) 才是死路 ——
+#   写进去 800ms 就被 rkaiq 的 AE 覆盖。
+#
+# 代价与曝光档位一样: 参数在 rkipc 启动时读进 ISP, **运行中改不了**,
+# 所以必须改 ini + 重启 rkipc (画面断约 20 秒)。这不是偷懒, 是硬件限制。
+#
+# ---- 过曝到底是怎么来的 (实测) ----
+#   用户选 "1/1000 极快" 时, ini 变成:
+#       exposure_mode = manual, auto_exposure_enabled = 0, exposure_time = 1/1000
+#       gain_mode = auto            <-- 关键
+#   曝光被钉死在 1/1000, 但**增益还是自动**: ISP 为了让画面"够亮", 把增益
+#   往上猛推 (实测 gain 从 197 一路到 7000+, 上限 99614)。
+#   高增益 = 亮部溢出 = 过曝。
+#
+#   所以治过曝有三个旋钮, 按见效顺序:
+#     1) gain 也切成 manual 并压低 (最直接, 砍掉那个失控的补偿)
+#     2) 开 WDR (宽动态): 大光比场景压暗亮部、提亮暗部
+#     3) over_exposure_suppress 已经是 open, 保持
+QUALITY_KEYS = ("brightness", "contrast", "saturation", "sharpness")
+
+# ---- 增益档位: **实测无效, 已弃用** (保留定义只为兼容旧请求) ----
+#
+# ⚠️ 2026-10-06 实测结论 (花了四组对照实验才搞清, 别再走这条路):
+#
+#   | 配置                        | ISP exposure | ISP analogue_gain |
+#   |-----------------------------|--------------|-------------------|
+#   | exposure_gain=1   (manual)  | 41           | 384               |
+#   | exposure_gain=100 (manual)  | 41           | 384  <- 没变!     |
+#   | gain_mode=auto              | 41           | 384  <- 没变!     |
+#   | exposure=auto + gain=auto   | 408          | 128  <- 变了      |
+#
+#   也就是说:
+#     1) ini 里的 `exposure_gain` (1..100) 在 exposure_mode=manual 时
+#        **完全不起作用** —— 写 1 和写 100, ISP 的 analogue_gain 都是 384。
+#        (rkipc 的能力元数据说它范围 1..100, 但实际不生效。)
+#     2) 只要 exposure_mode=manual, 增益就固定在 384, gain_mode 怎么设都没用。
+#     3) **只有把曝光切回 auto, AE 才会真正接管**, 增益才会降到 128 (最低)。
+#
+#   所以"过曝"的真正机制不是"增益太高", 而是:
+#       曝光被钉死 (1/1000) -> 画面偏暗 -> 用户为了看清把亮度拉高 ->
+#       而 AE 被禁用、无法自动降低曝光 -> 亮部溢出成一片白
+#   治它只有一条路: **让 AE 工作** (曝光档位选「自动」), 或者接受手动曝光时
+#   画面就是那个亮度、不要再用亮度硬拉。
+GAIN_LEVELS = {
+    "auto": {"label": "增益 自动", "desc": "交给 ISP (注意: 曝光为手动时此项无效)",
+             "gain_mode": "auto", "audo_gain_enabled": 1, "exposure_gain": 1},
+}
+
+# 宽动态 (WDR): 大光比场景的关键。关着的时候逆光/强日照必然过曝。
+WDR_LEVELS = {
+    "off":  {"label": "WDR 关", "desc": "不做动态范围压缩 · 逆光会全白", "wdr": "close", "wdr_level": 0},
+    "low":  {"label": "WDR 低", "desc": "轻度过曝抑制", "wdr": "open", "wdr_level": 1},
+    "mid":  {"label": "WDR 中", "desc": "白天逆光推荐", "wdr": "open", "wdr_level": 3},
+    "high": {"label": "WDR 高", "desc": "极强光比 · 画面会稍平", "wdr": "open", "wdr_level": 5},
+}
+
+
+def _ini_read():
+    try:
+        return io.open(INI, encoding="utf-8", errors="ignore").read()
+    except Exception:
+        return ""
+
+
+def _ini_seg(text, section):
+    """取出 [section] 那一段 (到下一个 [ 为止)。"""
+    m = re.search(r"\[%s\]([^\[]*)" % re.escape(section), text)
+    return m.group(1) if m else None
+
+
+def _ini_set(section, key, value, path=INI):
+    """把 [section] 段里的 key 设成 value (不存在就追加)。返回是否改动。"""
+    try:
+        text = io.open(path, encoding="utf-8", errors="ignore").read()
+    except Exception:
+        return False
+    seg = _ini_seg(text, section)
+    if seg is None:
+        return False
+    new_seg, n = re.subn(r"(?m)^(\s*%s\s*=\s*)[^\s;]+" % re.escape(key),
+                         lambda m: m.group(1) + str(value), seg, count=1)
+    if n == 0:
+        new_seg = seg.rstrip("\n") + "\n%s = %s\n" % (key, value)
+    if new_seg == seg:
+        return False
+    io.open(path, "w", encoding="utf-8", newline="\n").write(
+        text.replace(seg, new_seg, 1))
+    return True
+
+
+def read_quality():
+    """读当前画面参数 (isp.0 段)。"""
+    text = _ini_read()
+    adj = _ini_seg(text, "isp.0.adjustment") or ""
+    exp = _ini_seg(text, "isp.0.exposure") or ""
+    blc = _ini_seg(text, "isp.0.blc") or ""
+    ntd = _ini_seg(text, "isp.0.night_to_day") or ""
+
+    def num(seg, key, d=None):
+        m = re.search(r"(?m)^\s*%s\s*=\s*(\d+)" % key, seg)
+        return int(m.group(1)) if m else d
+
+    def word(seg, key, d=None):
+        m = re.search(r"(?m)^\s*%s\s*=\s*(\S+)" % key, seg)
+        return m.group(1) if m else d
+
+    gain_mode = word(exp, "gain_mode", "auto")
+    ex_gain = num(exp, "exposure_gain", 1)
+    gkey = "auto"
+    if gain_mode == "manual":
+        gkey = "high" if ex_gain >= 64 else ("mid" if ex_gain >= 32 else "low")
+
+    wdr = word(blc, "wdr", "close")
+    wlvl = num(blc, "wdr_level", 0)
+    wkey = "off"
+    if wdr == "open":
+        wkey = "high" if wlvl >= 5 else ("mid" if wlvl >= 3 else "low")
+
+    return {
+        "brightness": num(adj, "brightness", 50),
+        "contrast": num(adj, "contrast", 50),
+        "saturation": num(adj, "saturation", 50),
+        "sharpness": num(adj, "sharpness", 50),
+        "gain": gkey,
+        "wdr": wkey,
+        "over_exposure_suppress": word(ntd, "over_exposure_suppress", "open"),
+        "dark_boost_level": num(blc, "dark_boost_level", 0),
+    }
+
+
+def quality_info():
+    q = read_quality()
+    return {
+        "ok": True,
+        "current": q,
+        "ranges": {k: {"min": 0, "max": 100} for k in QUALITY_KEYS},
+        "gain_levels": [{"key": k, "label": v["label"], "desc": v["desc"]}
+                        for k, v in GAIN_LEVELS.items()],
+        "wdr_levels": [{"key": k, "label": v["label"], "desc": v["desc"]}
+                       for k, v in WDR_LEVELS.items()],
+        "hint": "改这些要重启视频服务 (画面断约 20 秒)。过曝先调「增益」再调「WDR」。",
+    }
+
+
+def quality_set(brightness=None, contrast=None, saturation=None, sharpness=None,
+                gain=None, wdr=None, over_exposure_suppress=None):
+    """改画面参数。同步执行, 约 20-30 秒 (要重启 rkipc)。"""
+    with _LOCK:
+        if STATE["switching"]:
+            return False, "正在切换中, 请稍候"
+        STATE["switching"] = True
+    try:
+        changed = []
+
+        # 1) 亮度/对比度/饱和度/锐度 -> [isp.0.adjustment] (+ isp.1 同步)
+        vals = {"brightness": brightness, "contrast": contrast,
+                "saturation": saturation, "sharpness": sharpness}
+        for k, v in vals.items():
+            if v is None:
+                continue
+            try:
+                iv = max(0, min(100, int(v)))
+            except Exception:
+                continue
+            for path in (INI, TPL):
+                for sec in ("isp.0.adjustment", "isp.1.adjustment"):
+                    _ini_set(sec, k, iv, path)
+            changed.append("%s=%d" % (k, iv))
+
+        # 2) 增益 (治过曝的关键)
+        if gain is not None:
+            g = GAIN_LEVELS.get(str(gain))
+            if not g:
+                return False, "未知增益档位: %s" % gain
+            for path in (INI, TPL):
+                for sec in ("isp.0.exposure", "isp.1.exposure"):
+                    _ini_set(sec, "gain_mode", g["gain_mode"], path)
+                    _ini_set(sec, "audo_gain_enabled", g["audo_gain_enabled"], path)
+                    _ini_set(sec, "exposure_gain", g["exposure_gain"], path)
+            changed.append("增益=%s" % g["label"])
+
+        # 3) WDR
+        if wdr is not None:
+            w = WDR_LEVELS.get(str(wdr))
+            if not w:
+                return False, "未知 WDR 档位: %s" % wdr
+            for path in (INI, TPL):
+                for sec in ("isp.0.blc", "isp.1.blc"):
+                    _ini_set(sec, "wdr", w["wdr"], path)
+                    _ini_set(sec, "wdr_level", w["wdr_level"], path)
+            changed.append("%s" % w["label"])
+
+        # 4) 过曝抑制开关
+        if over_exposure_suppress is not None:
+            v = "open" if str(over_exposure_suppress) in ("1", "true", "open", "on") else "close"
+            for path in (INI, TPL):
+                for sec in ("isp.0.night_to_day", "isp.1.night_to_day"):
+                    _ini_set(sec, "over_exposure_suppress", v, path)
+            changed.append("过曝抑制=%s" % v)
+
+        if not changed:
+            return False, "没有要改的参数"
+
+        ok, msg = _restart_rkipc()
+        if not ok:
+            STATE["last_err"] = msg
+            _log("画面参数切换失败: %s (%s)" % (msg, ", ".join(changed)))
+            return False, msg
+        _log("画面参数已改: %s" % ", ".join(changed))
+        return True, "已应用: " + ", ".join(changed)
+    finally:
+        with _LOCK:
+            STATE["switching"] = False
 
 
 def read_current():

@@ -29,7 +29,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from car_motor import FourMotor
 from cam_ctl import cam_read, cam_set, cam_loop
 from video_ctl import (video_info, video_switch,
-                       exposure_info, exposure_switch)
+                       exposure_info, exposure_switch,
+                       quality_info, quality_set)
 
 CONF_PATH = "/userdata/car/car_config.json"
 INDEX = "/userdata/car/index.html"
@@ -982,6 +983,12 @@ class H(BaseHTTPRequestHandler):
             # raw V4L2 exposure 在这块板子上调不动 (AE 在 rkaiq 里, V4L2
             # 层关不掉), 真正有效的是 rkipc 的 exposure_time 档位。
             self._json(200, exposure_info())
+        elif p == "/api/quality":
+            # 画面质量: 亮度/对比度/饱和度/锐度 + 增益上限 + WDR。
+            # 治过曝的关键是"增益"和"WDR"两项 —— 实测选 1/1000 快档时
+            # 曝光被钉死但增益还是 auto, ISP 为了补亮把增益推到 7000+,
+            # 亮部直接溢出。见 video_ctl.py 的 QUALITY 说明。
+            self._json(200, quality_info())
         else:
             self._send(404, "not found", "text/plain; charset=utf-8")
 
@@ -1061,6 +1068,28 @@ class H(BaseHTTPRequestHandler):
                 ok, msg = exposure_switch(key)
                 self._json(200, {"ok": ok, "msg": msg,
                                  "exposure": exposure_info()})
+            except Exception as e:
+                self._json(500, {"ok": False, "err": str(e)})
+            return
+
+        if p == "/api/quality":
+            # 改画面参数 (亮度/对比度/饱和度/锐度/增益/WDR)。
+            # **同步执行, 约 20-30 秒** —— 要重启 rkipc 才生效。
+            # 请求体只传要改的字段, 例如:
+            #   {"gain":"low"}                 仅压低增益上限 (治过曝)
+            #   {"wdr":"mid"}                  仅开 WDR
+            #   {"brightness":60,"contrast":55}  同时调亮度和对比度
+            try:
+                ok, msg = quality_set(
+                    brightness=d.get("brightness"),
+                    contrast=d.get("contrast"),
+                    saturation=d.get("saturation"),
+                    sharpness=d.get("sharpness"),
+                    gain=d.get("gain"),
+                    wdr=d.get("wdr"),
+                    over_exposure_suppress=d.get("over_exposure_suppress"),
+                )
+                self._json(200, {"ok": ok, "msg": msg, "quality": quality_info()})
             except Exception as e:
                 self._json(500, {"ok": False, "err": str(e)})
             return

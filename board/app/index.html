@@ -17,18 +17,28 @@ body{
   --card:#161b22;--card2:#1c2128;--line:#30363d;
   --fg:#e6edf3;--dim:#8b949e;--accent:#2f81f7;
   --ok:#3fb950;--warn:#d29922;--err:#f85149;
+
+  /* ---- 统一刻度 (别再各处写死字号/圆角) ----
+   * 之前审计发现字号有 6 种 (9/9.5/10/11/12/13.5)、圆角 3 种 (6/8/9),
+   * 控件高度也各不相同, 看起来"不统一"。现在收敛成:
+   *   字号: sm=说明 | md=控件 | lg=数值
+   *   圆角: sm=小控件/OSD | md=卡片/菜单
+   *   控件高: 主按钮 34 | 菜单项 30 | 控制条 26 (层级递减)
+   */
+  --fs-sm:10px;--fs-md:11px;--fs-lg:14px;
+  --r-sm:5px;--r-md:8px;
 }
 header{
-  position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:10px;
-  padding:10px 14px;background:rgba(13,17,23,.92);backdrop-filter:blur(12px);
+  position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:8px;
+  padding:8px 12px;background:rgba(13,17,23,.92);backdrop-filter:blur(12px);
   border-bottom:1px solid var(--line);
 }
-header .logo{font-size:17px;font-weight:700}
-header .sub{font-size:11px;color:var(--dim);margin-top:1px}
+header .logo{font-size:14px;font-weight:700}
+header .sub{font-size:var(--fs-sm);color:var(--dim);margin-top:1px}
 .spacer{flex:1}
-.pill{display:flex;align-items:center;gap:6px;font-size:11px;padding:5px 10px;
-      border-radius:20px;background:var(--card2);border:1px solid var(--line)}
-.pill .d{width:7px;height:7px;border-radius:50%;background:#484f58;flex:none}
+.pill{display:flex;align-items:center;gap:5px;font-size:10px;padding:3px 8px;
+      border-radius:14px;background:var(--card2);border:1px solid var(--line)}
+.pill .d{width:6px;height:6px;border-radius:50%;background:#484f58;flex:none}
 .pill.ok .d{background:var(--ok);box-shadow:0 0 6px var(--ok)}
 .pill.bad .d{background:var(--err);box-shadow:0 0 6px var(--err)}
 .pill.warn .d{background:var(--warn);box-shadow:0 0 6px var(--warn)}
@@ -50,20 +60,39 @@ main{max-width:1100px;margin:0 auto;padding:10px 12px 24px}
 
   /* 摇杆区固定在底部, 单手可及 —— 这是遥控车最关键的手感改进 */
   #videoWrap{aspect-ratio:4/3}
-  .stats{grid-template-columns:repeat(2,1fr);gap:6px;margin-top:6px}
-  .stat{padding:7px 9px}
-  .stat .v{font-size:15px;margin-top:1px}
+  .stats{grid-template-columns:repeat(2,1fr);gap:5px;margin-top:5px}
+  .stat{padding:6px 8px}
+  .stat .v{font-size:13px;margin-top:1px}
   .stat .s{display:none}          /* 副标题在小屏上太挤, 隐藏 */
-  .panel{padding:11px;margin-top:8px}
+  .panel{padding:10px;margin-top:7px}
   #stick{max-width:230px}
+  /* 手机上的 OSD 控件: **依然保持精致**, 只靠"触摸热区"保证好点,
+   * 不靠放大字号/padding (以前这里写 padding:4px 10px + line-height:20px,
+   * 直接盖掉了 26px 定高, 控制条被撑粗 —— 就是"粗"的来源)。
+   * 做法: 视觉尺寸不变, 用透明热区向外扩 4px。 */
+  #vmenu button{padding:0 7px;min-height:28px}
+  .vcbtn{height:24px;padding:0 8px}
+  /* 触摸热区补偿: 视觉 24/28px, 实际可点 ~32/36px */
+  .vcbtn::before,#vmenu button::before{
+    content:"";position:absolute;inset:-4px;border-radius:inherit}
+  .vcbtn,#vmenu button{position:relative}
 }
 
 #videoWrap{position:relative;width:100%;aspect-ratio:16/9;background:#000;
-  border-radius:14px;overflow:hidden;border:1px solid var(--line)}
+  border-radius:12px;overflow:hidden;border:1px solid var(--line)}
 #video{width:100%;height:100%;object-fit:contain;display:block;background:#000}
-#vhud{position:absolute;left:10px;top:10px;font-size:11px;color:#fff;
-  background:rgba(0,0,0,.55);padding:4px 9px;border-radius:7px;
-  backdrop-filter:blur(6px);display:none;font-variant-numeric:tabular-nums}
+
+/* HUD (RTT + 图传指标) —— **左上角** (用户指定位置)
+ *
+ * 与摄像头 OSD 的共存: 摄像头会把日期时间水印也烧在左上角
+ * (rkipc 的 [osd.1]), 两者需要错开 —— 用 top 偏移把 HUD 放在
+ * "全屏按钮/OSD 文字"下方的另一行, 不重叠。
+ * 同时下面把摄像头 OSD 挪回左上原位 x=16,y=16 (见 move_osd_time 的说明)。
+ */
+#vhud{position:absolute;left:10px;top:34px;font-size:10px;color:#fff;
+  background:rgba(0,0,0,.5);padding:3px 7px;border-radius:5px;
+  backdrop-filter:blur(8px);display:none;font-variant-numeric:tabular-nums;
+  z-index:5;white-space:nowrap}
 #vfull{position:absolute;right:10px;top:10px;background:rgba(0,0,0,.55);color:#fff;
   border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:5px 11px;
   font-size:12px;cursor:pointer;backdrop-filter:blur(6px)}
@@ -74,23 +103,77 @@ main{max-width:1100px;margin:0 auto;padding:10px 12px 24px}
 #vstate button{background:var(--accent);color:#fff;border:0;border-radius:9px;
   padding:9px 20px;font-size:13px;font-weight:600;cursor:pointer}
 
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:10px}
+/* ============================================================================
+ * 画面上的控制条 (像视频播放器那样浮在画面上)
+ * ============================================================================
+ * 交互: 鼠标移到画面上 -> 底部控制条浮现; 点「曝光 1/1000」「画质 720p」
+ *       各自弹出一个**上弹菜单** (跟播放器选字幕/清晰度一样), 选完即关。
+ *
+ * 尺寸刻意做小: 这是覆盖在画面上的 OSD, 不能喧宾夺主。
+ *   按钮高 26px / 字号 11px / 菜单项 24px —— 比主界面控件小一号。
+ */
+#vctrl{position:absolute;left:0;right:0;bottom:0;display:flex;align-items:center;
+  gap:5px;padding:6px 9px;z-index:6;
+  background:linear-gradient(transparent,rgba(0,0,0,.72));
+  opacity:0;transition:opacity .18s;pointer-events:none}
+#videoWrap:hover #vctrl,#videoWrap.showctrl #vctrl{opacity:1;pointer-events:auto}
+#vctrl .sp{flex:1}
+.vcbtn{background:rgba(255,255,255,.1);color:#fff;
+  border:1px solid rgba(255,255,255,.14);
+  border-radius:var(--r-sm);padding:0 8px;height:23px;font-size:9.5px;
+  cursor:pointer;flex:none;backdrop-filter:blur(8px);
+  display:inline-flex;align-items:center;gap:4px;line-height:1;
+  letter-spacing:.2px}
+.vcbtn b{font-weight:600;color:#fff}
+.vcbtn:hover{background:rgba(255,255,255,.2)}
+.vcbtn:active{background:rgba(47,129,247,.85)}
+.vcbtn.sel::after{content:"▴";font-size:7px;opacity:.6}
+
+/* 上弹菜单: **半透明** (能看到背后的画面) + 紧凑 */
+#vmenu{position:absolute;bottom:40px;left:9px;min-width:142px;max-width:200px;
+  background:rgba(18,22,28,.72);backdrop-filter:blur(18px) saturate(1.2);
+  -webkit-backdrop-filter:blur(18px) saturate(1.2);
+  z-index:8;border:1px solid rgba(255,255,255,.12);border-radius:var(--r-md);
+  padding:3px;display:none;
+  box-shadow:0 6px 22px rgba(0,0,0,.5);
+  max-height:58%;overflow-y:auto}
+#vmenu.open{display:block}
+#vmenu button{display:block;width:100%;text-align:left;background:none;border:0;
+  color:#e6edf3;border-radius:var(--r-sm);font-size:var(--fs-md);cursor:pointer;
+  line-height:1.2;padding:0 7px;min-height:27px;
+  display:flex;flex-direction:column;justify-content:center}
+#vmenu button:hover{background:rgba(255,255,255,.1)}
+#vmenu button.on{background:rgba(47,129,247,.85);color:#fff}
+#vmenu button.on .md{color:rgba(255,255,255,.75)}
+#vmenu .mk{display:block;font-weight:600}
+#vmenu .md{display:block;font-size:9.5px;color:#8b949e;margin-top:0;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#vbusy{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
+  flex-direction:column;gap:6px;background:rgba(0,0,0,.6);color:#fff;font-size:var(--fs-md);
+  z-index:8;text-align:center;padding:16px;backdrop-filter:blur(2px)}
+#vbusy.on{display:flex}
+
+/* ---- 状态卡片: 收紧内边距与字号, 别占太大地方 ---- */
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:8px}
 @media(max-width:560px){.stats{grid-template-columns:repeat(2,1fr)}}
-.stat{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:9px 11px}
-.stat .k{font-size:10px;color:var(--dim);display:flex;align-items:center;gap:5px;
-  text-transform:uppercase;letter-spacing:.4px}
-.stat .v{font-size:16px;font-weight:700;margin-top:3px;font-variant-numeric:tabular-nums}
-.stat .s{font-size:10px;color:var(--dim);margin-top:2px;white-space:nowrap;
+.stat{background:var(--card);border:1px solid var(--line);border-radius:var(--r-md);
+  padding:7px 9px}
+.stat .k{font-size:var(--fs-sm);color:var(--dim);display:flex;align-items:center;gap:4px;
+  text-transform:uppercase;letter-spacing:.3px}
+.stat .v{font-size:var(--fs-lg);font-weight:700;margin-top:2px;
+  font-variant-numeric:tabular-nums}
+.stat .s{font-size:var(--fs-sm);color:var(--dim);margin-top:1px;white-space:nowrap;
   overflow:hidden;text-overflow:ellipsis}
-.dot{width:7px;height:7px;border-radius:50%;background:#484f58;flex:none}
+.dot{width:6px;height:6px;border-radius:50%;background:#484f58;flex:none}
 .dot.on{background:var(--ok)}.dot.mid{background:var(--warn)}.dot.off{background:var(--err)}
-.bar{height:5px;border-radius:3px;background:#21262d;margin-top:6px;overflow:hidden}
+.bar{height:4px;border-radius:2px;background:#21262d;margin-top:5px;overflow:hidden}
 .bar>i{display:block;height:100%;width:0;background:var(--ok);transition:width .4s,background .4s}
 
-.panel{background:var(--card);border:1px solid var(--line);border-radius:16px;
-  padding:14px;margin-top:12px}
-.panel h3{margin:0 0 10px;font-size:12px;color:var(--dim);font-weight:600;
-  text-transform:uppercase;letter-spacing:.6px}
+/* ---- 面板: 收紧 ---- */
+.panel{background:var(--card);border:1px solid var(--line);border-radius:var(--r-md);
+  padding:11px;margin-top:9px}
+.panel h3{margin:0 0 8px;font-size:10.5px;color:var(--dim);font-weight:600;
+  text-transform:uppercase;letter-spacing:.5px}
 
 #stick{position:relative;width:100%;max-width:300px;aspect-ratio:1;margin:0 auto;
   border-radius:50%;
@@ -120,45 +203,58 @@ main{max-width:1100px;margin:0 auto;padding:10px 12px 24px}
 #stick .lbl.l{left:7%;top:50%;transform:translateY(-50%)}
 #stick .lbl.r{right:7%;top:50%;transform:translateY(-50%)}
 
-.row{display:flex;align-items:center;gap:10px;margin-top:12px}
-.row .t{font-size:12px;color:var(--dim);width:44px;flex:none}
-.row .n{font-size:13px;font-weight:700;width:44px;text-align:right;
-  font-variant-numeric:tabular-nums;flex:none}
-input[type=range]{-webkit-appearance:none;appearance:none;flex:1;height:26px;background:transparent}
-input[type=range]::-webkit-slider-runnable-track{height:6px;border-radius:3px;background:#21262d}
-input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;
-  border-radius:50%;background:linear-gradient(160deg,#4a9eff,#2f81f7);margin-top:-8px;
-  box-shadow:0 2px 8px rgba(47,129,247,.5);border:0}
-input[type=range]::-moz-range-track{height:6px;border-radius:3px;background:#21262d}
-input[type=range]::-moz-range-thumb{width:22px;height:22px;border:0;border-radius:50%;
+/* ---- 滑条统一 ---- 
+ * 速度/旋转共用一套样式 (原来 .row 和 .qrow 各写一份, 视觉不一致)。
+ * 尺寸也收紧: 轨道 4px, 滑块 16px (原来 6px/22px 显得笨重)。
+ * 触摸设备上由下面的 @media 放大回 20px 保证好按。 */
+input[type=range]{-webkit-appearance:none;appearance:none;flex:1;height:20px;
+  background:transparent;outline:none}
+input[type=range]::-webkit-slider-runnable-track{height:4px;border-radius:2px;
+  background:#252b33}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:15px;height:15px;
+  border-radius:50%;background:linear-gradient(160deg,#4a9eff,#2f81f7);margin-top:-5.5px;
+  box-shadow:0 1px 5px rgba(47,129,247,.45);border:0}
+input[type=range]::-moz-range-track{height:4px;border-radius:2px;background:#252b33}
+input[type=range]::-moz-range-thumb{width:15px;height:15px;border:0;border-radius:50%;
   background:linear-gradient(160deg,#4a9eff,#2f81f7)}
 
-.btns{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
+.btns{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}
 .b{border:1px solid var(--line);background:var(--card2);color:var(--fg);
-  border-radius:11px;padding:13px 8px;font-size:13px;font-weight:600;
-  cursor:pointer;text-align:center;transition:background .12s,transform .06s}
+  border-radius:var(--r-sm);height:34px;padding:0 8px;font-size:var(--fs-md);
+  font-weight:600;cursor:pointer;text-align:center;line-height:1;
+  display:flex;align-items:center;justify-content:center;
+  transition:background .12s,transform .06s}
 .b:active{transform:scale(.97);background:#262d36}
 .b.stop{background:linear-gradient(160deg,#f85149,#da3633);border-color:#f85149;color:#fff}
 .b.stop:active{background:#da3633}
 .b.wide{grid-column:1/-1}
 .b.ghost{background:transparent}
 
-/* 手机上按钮要够大才好按 (Apple/Google 建议最小 44px 触控目标) */
+/* 速度/旋转行 (与滑条样式统一) */
+.row{display:flex;align-items:center;gap:8px;margin-top:9px}
+.row .t{font-size:11px;color:var(--dim);width:34px;flex:none}
+.row .n{font-size:11.5px;font-weight:700;width:36px;text-align:right;
+  font-variant-numeric:tabular-nums;flex:none}
+
+/* 手机上按钮/滑条要够大才好按 (触控目标建议 ≥44px) */
 @media(max-width:600px){
-  .btns{gap:7px;margin-top:9px}
-  .b{padding:15px 8px;font-size:14px}
-  .row{margin-top:9px}
-  input[type=range]::-webkit-slider-thumb{width:26px;height:26px;margin-top:-10px}
+  .btns{gap:6px;margin-top:8px}
+  .b{padding:12px 8px;font-size:13px}
+  .row{margin-top:8px}
+  input[type=range]{height:24px}
+  input[type=range]::-webkit-slider-thumb{width:20px;height:20px;margin-top:-8px}
 }
 
-#dirbar{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:12px;color:var(--dim)}
-#dirbar .tag{padding:4px 10px;border-radius:7px;background:var(--card2);
-  border:1px solid var(--line);color:var(--fg);font-weight:600;font-variant-numeric:tabular-nums}
-.hint{font-size:10.5px;color:#5a6472;line-height:1.7;margin-top:10px}
+#dirbar{display:flex;align-items:center;gap:6px;margin-top:9px;font-size:11px;
+  color:var(--dim);flex-wrap:wrap}
+#dirbar .tag{padding:2px 8px;border-radius:var(--r-sm);background:var(--card2);
+  border:1px solid var(--line);color:var(--fg);font-weight:600;
+  font-variant-numeric:tabular-nums;font-size:11px}
+.hint{font-size:var(--fs-sm);color:#5a6472;line-height:1.6;margin-top:8px}
 /* 手机上隐藏长说明 —— 开车时没人看, 而且占垂直空间 */
 @media(max-width:600px){.hint{display:none}}
 kbd{background:#21262d;border:1px solid var(--line);border-bottom-width:2px;
-  border-radius:4px;padding:1px 5px;font-size:10px;font-family:inherit}
+  border-radius:3px;padding:0 4px;font-size:9px;font-family:inherit}
 </style>
 </head>
 <body>
@@ -182,6 +278,26 @@ kbd{background:#21262d;border:1px solid var(--line);border-bottom-width:2px;
       <div id="vstate">
         <span id="vtext">图传连接中…</span>
         <button id="vretry">重试</button>
+      </div>
+
+      <!-- 画面下方控制条 (悬停/点击画面时出现) -->
+      <div id="vctrl">
+        <button class="vcbtn sel" id="vcExp" title="点一下弹出曝光档位">
+          曝光 <b>--</b>
+        </button>
+        <button class="vcbtn sel" id="vcProf" title="点一下弹出画质档位">
+          画质 <b>--</b>
+        </button>
+        <span class="sp"></span>
+      </div>
+
+      <!-- 上弹菜单 (播放器风格: 点哪一项弹哪一项) -->
+      <div id="vmenu"></div>
+
+      <!-- 切换中的遮罩 -->
+      <div id="vbusy">
+        <span id="vbusyTxt">切换中…</span>
+        <span style="font-size:10.5px;color:#8b949e">视频会中断约 20 秒, 请稍候</span>
       </div>
     </div>
 
@@ -249,29 +365,15 @@ kbd{background:#21262d;border:1px solid var(--line);border-bottom-width:2px;
         输出 <span class="tag" id="vxTxt">0.00</span>
         <span class="tag" id="vyTxt">0.00</span>
         <span class="tag" id="wTxt">0.00</span>
-        <span class="tag" id="hbTxt" title="控制心跳: 页面每 100ms 给板子发一次当前向量。板子 1 秒收不到就自动停车(失控保护)。">心跳 --</span>
+        <!-- 正常时隐藏; 只有板子报"失控超时过短"才显示 (见 updHb) -->
+        <span class="tag" id="hbTxt" style="display:none"></span>
       </div>
 
       <div class="hint">
         摇杆拖动 = 前后/左右/斜向 · 旋转滑块 = 原地转<br>
         松开自动停 · 键盘 <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> 移动，
-        <kbd>Q</kbd><kbd>E</kbd> 转，<kbd>空格</kbd> 停
-      </div>
-    </div>
-
-    <div class="panel">
-      <h3>摄像头曝光</h3>
-      <div class="btns" id="expBtns"></div>
-      <div class="hint" id="expHint">
-        切换会重启视频服务, <b>画面中断约 20 秒</b>。<br>
-        有拖影/过曝选快档, 夜里想看清选慢档; 增益自动补偿亮度。
-      </div>
-
-      <h3 style="margin-top:14px">画质档位</h3>
-      <div class="btns" id="profBtns"></div>
-      <div class="hint" id="profHint">
-        切换会重启视频服务, <b>画面中断约 20 秒</b>。<br>
-        隧道吃紧时选「流畅」, 控制延迟最低。
+        <kbd>Q</kbd><kbd>E</kbd> 转，<kbd>空格</kbd> 停<br>
+        曝光 / 画质档位在<b>画面右下角「⚙ 设置」</b>里 (鼠标移到画面上就能看到)
       </div>
     </div>
   </div>
@@ -306,10 +408,98 @@ const WHEP_URLS = [
 const $ = id => document.getElementById(id);
 let pc=null, retry=null, statsT=null, lastBytes=0, activeUrl='';
 
+/* 控制往返时间 (RTT), 由控制循环每次成功请求更新。
+ *
+ * ⚠️ 必须**在这里**声明 (不能放到下面控制循环那一段):
+ *    startStats() -> updHud() 会读它, 而 startStats 在图传连上时就跑,
+ *    那时脚本可能还没执行到控制循环的 `let ctlRtt` —— 对 `let` 变量的
+ *    提前访问会抛 TDZ ReferenceError, 而且是在定时器回调里抛, 页面毫无迹象。
+ *    (这个坑今天已经踩过一次: sendPageInfo 引用后面的 const 导致信标发不出去。)
+ */
+let ctlRtt = -1;
+
+/* 当前档位 (供上弹菜单标出"选中项")。必须在使用它们的函数之前声明 —— 同 ctlRtt。 */
+let curExp = {}, curProf = {};
+let expList = [], profList = [];
+
 function vShow(t, b){ $('vstate').classList.remove('hide'); $('vtext').textContent=t;
   $('vretry').style.display = b?'':'none'; }
 function vHide(){ $('vstate').classList.add('hide'); }
 function setVid(cls,txt){ $('pillVid').className='pill '+cls; $('vidTxt').textContent=txt; }
+
+/* ============================================================================
+ * 画面上的控制条 (像视频播放器那样浮在画面上)
+ * ============================================================================
+ * 交互: 鼠标移到画面上 -> 底部控制条浮现; 点「曝光 1/1000」「画质 720p」
+ *       各自弹出一个**上弹菜单** (跟播放器选字幕/清晰度一样), 选完即关。
+ *
+ * 为什么不做成"一个设置抽屉": 那是设置页的交互, 不是播放器的。
+ * 播放器都是点哪一项就弹哪一项的候选列表 —— 一眼看到全部选项, 少一层跳转。
+ * 菜单向上弹 (bottom:100%), 不遮挡画面主体。
+ */
+let ctrlTimer = null;
+function showCtrl(){
+  $('videoWrap').classList.add('showctrl');
+  if(ctrlTimer) clearTimeout(ctrlTimer);
+  ctrlTimer = setTimeout(() => {
+    if(!document.querySelector('.vmenu.open'))
+      $('videoWrap').classList.remove('showctrl');
+  }, 5000);
+}
+
+/* 上弹菜单: 同一个容器复用, 内容按需生成 */
+function closeMenu(){
+  const m = $('vmenu');
+  m.classList.remove('open');
+  m.innerHTML = '';
+  showCtrl();
+}
+
+function openMenu(anchor, items, curKey, onPick){
+  const m = $('vmenu');
+  m.innerHTML = items.map(it =>
+    '<button data-k="'+it.key+'" title="'+(it.desc||'')+'"'+
+    (it.key === curKey ? ' class="on"' : '')+'>'+
+    '<span class="mk">'+it.label+'</span>'+
+    (it.desc ? '<span class="md">'+it.desc+'</span>' : '')+
+    '</button>').join('');
+  m.querySelectorAll('button').forEach(b => {
+    b.onclick = e => { e.stopPropagation(); closeMenu(); onPick(b.dataset.k); };
+  });
+  // 对齐到被点的按钮左边
+  const wrap = $('videoWrap').getBoundingClientRect();
+  const r = anchor.getBoundingClientRect();
+  m.style.left = Math.max(6, Math.min(r.left - wrap.left, wrap.width - 250)) + 'px';
+  m.classList.add('open');
+  if(ctrlTimer) clearTimeout(ctrlTimer);
+  $('videoWrap').classList.add('showctrl');
+}
+
+$('vcExp').onclick = e => {
+  e.stopPropagation();
+  if($('vmenu').classList.contains('open') && $('vmenu').dataset.for === 'exp') { closeMenu(); return; }
+  $('vmenu').dataset.for = 'exp';
+  openMenu(e.currentTarget, expList, (curExp||{}).key, k => switchExp(k));
+};
+$('vcProf').onclick = e => {
+  e.stopPropagation();
+  if($('vmenu').classList.contains('open') && $('vmenu').dataset.for === 'prof') { closeMenu(); return; }
+  $('vmenu').dataset.for = 'prof';
+  openMenu(e.currentTarget, profList, (curProf||{}).key, k => switchProf(k));
+};
+$('videoWrap').addEventListener('pointerdown', () => showCtrl());
+$('videoWrap').addEventListener('pointermove', () => showCtrl());
+// 点画面空白处: 关菜单 (或唤出控制条)
+$('videoWrap').addEventListener('click', e => {
+  if(e.target.closest('#vctrl') || e.target.closest('#vmenu')) return;
+  if($('vmenu').classList.contains('open')) { closeMenu(); return; }
+  showCtrl();
+});
+
+function vBusy(on, txt){
+  $('vbusyTxt').textContent = txt || '切换中…';
+  $('vbusy').classList.toggle('on', !!on);
+}
 
 async function playWHEP(){
   stopWHEP(); vShow('图传连接中…', false); setVid('warn','连接中');
@@ -381,14 +571,57 @@ function startStats(p){
           jb = x.jitterBufferDelay / x.jitterBufferEmittedCount * 1000;
       });
       const rate = lastBytes ? (by-lastBytes)/2 : 0; lastBytes = by;
-      /* 单位自适应 (见 fmtRate): 低码率显示 KB/s 而不是 0.04MB/s */
-      $('vhud').textContent = fmtRate(rate)+' · '+Math.round(jb)+'ms'+
-        (fps?' · '+Math.round(fps)+'fps':'')+(lost?' · 丢'+lost:'');
-      $('vhud').style.display='block';
+      updHud(rate, jb, fps, lost);
     }catch(e){}
   }, 2000);
+  updHud(0, 0, 0, 0);
+}
+
+/* 左上角 HUD: 显示**控制 RTT + 图传指标**
+ *
+ * 为什么把 RTT 放这里: RTT 是"手感"的唯一客观来源 —— 手指动到车响应之间的
+ * 往返时间。放在画面上, 一眼就能同时看到"画面流不流畅"和"控制跟不跟手",
+ * 不用去别处找。
+ *
+ * RTT 的来源: /api/move 的往返 (由控制循环的 ctlRtt 记录, 每次成功请求更新)。
+ * 延迟等级用颜色区分: <80ms 绿 / <200ms 黄 / 更高 红。
+ */
+function updHud(rate, jb, fps, lost){
+  const el = $('vhud');
+  if(!el) return;
+  const rtt = (typeof ctlRtt === 'number' && ctlRtt >= 0) ? Math.round(ctlRtt) : null;
+  const rttColor = rtt === null ? '#8b949e'
+                 : (rtt < 80 ? '#3fb950' : (rtt < 200 ? '#d29922' : '#f85149'));
+  let html = '';
+  if(rtt !== null)
+    html += `<span style="color:${rttColor};font-weight:700">RTT ${rtt}ms</span> · `;
+  html += `<span style="color:#8b949e">图传</span> ${fmtRate(rate)} · ${Math.round(jb)}ms`;
+  if(fps) html += ` · ${Math.round(fps)}fps`;
+  if(lost) html += ` · <span style="color:#f85149">丢${lost}</span>`;
+  el.innerHTML = html;
+  el.style.display = 'block';
 }
 function stopStats(){ clearInterval(statsT); $('vhud').style.display='none'; }
+
+/* 只刷新 HUD 里的 RTT 部分 (被控制循环每次成功请求后调用)
+ * 图传指标由 startStats 每 2 秒更新, 这里只动 RTT, 两者互不覆盖。 */
+function hudRtt(){
+  const el = $('vhud');
+  if(!el || el.style.display === 'none') return;
+  const rtt = (typeof ctlRtt === 'number' && ctlRtt >= 0) ? Math.round(ctlRtt) : null;
+  if(rtt === null) return;
+  const color = rtt < 80 ? '#3fb950' : (rtt < 200 ? '#d29922' : '#f85149');
+  let span = el.querySelector('#hudRtt');
+  if(!span){
+    span = document.createElement('span');
+    span.id = 'hudRtt';
+    el.insertBefore(span, el.firstChild);
+    el.insertBefore(document.createTextNode(' · '), span.nextSibling);
+  }
+  span.style.color = color;
+  span.style.fontWeight = '700';
+  span.textContent = 'RTT ' + rtt + 'ms';
+}
 $('vretry').onclick = playWHEP;
 $('vfull').onclick = () => {
   const w = $('videoWrap');
@@ -592,39 +825,27 @@ let ctlLastHb  = 0;            // 上次**心跳**发出的时刻 (心跳节拍�
 let ctlLastKey = null;         // 上次发出的向量指纹
 let ctlSent = 0, ctlFail = 0;
 
-/* 页面上的心跳指示灯 —— 用户能自己看到"页面到底有没有在发指令"
+/* 失效保护告警 (板子报的"失控超时过短"警告) —— 只在真有问题时才占位
  *
- * 显示"距上次**发出**多久"和"当前往返 RTT"两个数:
- *   * age 一直涨 = 心跳断了 (该查链路)
- *   * rtt 一直涨 = 单条指令越来越慢 (该查排队)
- * 这两个数分开显示, 才能一眼区分"没发出去"和"发出去回不来"。 */
-let ctlRtt = -1;
-let fsWarn = null;          // 板子报的"失控超时过短"警告
-/* 心跳条的文字要**自解释**, 不能让人猜:
- *   心跳 N          = 本次页面加载后成功发出的控制指令总数
- *   · xxms          = 距**上一次发出**过了多久 (按住摇杆时应一直 <150ms;
- *                     这个数一直变大 = 页面没在发指令 = 车会被失控保护停掉)
- *   · RTT xxms      = 最近一条指令的往返时间
- *   · ⚠ ...         = 板子侧判定"失控超时太短, 正在误停"
- * 之前只写数字没写单位含义, 用户看到 "心跳 1 · 23975ms" 完全不知道是什么。
+ * 原来这里还有个心跳指示条, 显示 "已发 N 条 · 距上次发出 xxms · RTT xxms"。
+ * 用户要求删掉: 那些数字属于诊断信息, 平时没人看, 反而占空间且要人去理解。
+ * RTT 已经在画面右下角的 HUD 上了 (updHud), 这里不再重复。
+ * 只保留"板子说超时过短, 正在误停"这种**必须让用户知道**的告警。
  */
+let fsWarn = null;
+
 function updHb(){
   const el = document.getElementById('hbTxt');
   if(!el) return;
-  const age = ctlLastAt ? Math.round(performance.now() - ctlLastAt) : -1;
-  const stale = (age > 500);
-  el.textContent = `已发 ${ctlSent} 条${ctlFail ? (' · 失败 ' + ctlFail) : ''}`
-                 + ` · 距上次发出 ${age < 0 ? '--' : age + 'ms'}`
-                 + (ctlRtt >= 0 ? ` · RTT ${Math.round(ctlRtt)}ms` : '')
-                 + (stale && ctlSent > 0 ? ' · 已停发!' : '')
-                 + (fsWarn ? ` · ⚠ ${fsWarn}` : '');
-  el.title = '第 1 个数=页面累计成功发出的控制指令数; 第 2 个=距上次发出多久'
-           + ' (按住摇杆时应 <150ms, 一直变大就是页面没在发指令了);'
-           + ' 第 3 个=最近一条指令的往返时间。';
-  const bad = (ctlFail > 0 && ctlSent > 0 && ctlFail > ctlSent * 0.3) || ctlRtt > 300 || fsWarn;
-  el.style.color = bad ? '#f85149' : ((ctlRtt > 150 || stale) ? '#d29922' : '');
+  if(fsWarn){
+    el.style.display = '';
+    el.textContent = '⚠ ' + fsWarn;
+    el.style.color = '#f85149';
+  }else{
+    el.style.display = 'none';    // 正常时完全不占位
+  }
 }
-setInterval(updHb, 200);
+setInterval(updHb, 1000);
 
 function ctlTarget(){
   const w = rot/100;
@@ -652,6 +873,7 @@ async function ctlSend(cmd){
     apiOk = true; failCount = 0; setApi('ok','板载直连');
     ctlSent++;
     ctlRtt = performance.now() - t0;
+    hudRtt();                            // 左上角立刻刷新 RTT
     try{ await r.json(); }catch(e){}     // 读掉响应体, 否则 keep-alive 半读卡住
   }catch(e){
     apiOk = false; failCount++; ctlFail++;
@@ -819,50 +1041,44 @@ $('spd').addEventListener('input', e => { speed = +e.target.value; $('spdN').tex
  * 增益保持 auto: 曝光固定后由增益补偿亮度, 选快档画面也不会整体变黑。
  */
 let expBusy = false;
-let expList = [];
 
 function renderExps(v){
-  const box = $('expBtns');
-  if(!box) return;
   const cur = v.current || {};
+  curExp = cur;
   expList = v.profiles || [];
-  box.innerHTML = expList.map(p =>
-    '<button class="b ghost" data-e="'+p.key+'" title="'+p.desc+'">'+
-    p.label+'</button>').join('');
-  box.querySelectorAll('button').forEach(b => {
-    const on = (b.dataset.e === cur.key);
-    b.style.background = on ? '#1f6feb' : '';
-    b.style.color = on ? '#fff' : '';
-    b.onclick = () => switchExp(b.dataset.e);
-  });
-  if(cur.key === null){
-    $('expHint').textContent = '当前非预设档位 (手动 '+(cur.exposure_time||'?')+')';
+  // 控制条上显示当前档位 (菜单点开后在里面选)
+  const t = $('vcExp');
+  if(t) t.innerHTML = '曝光 <b>' +
+    (cur.label || (cur.exposure_time ? ('手动 ' + cur.exposure_time) : '--')) + '</b>';
+  // 菜单正开着就实时更新高亮
+  const m = $('vmenu');
+  if(m.classList.contains('open') && m.dataset.for === 'exp'){
+    m.querySelectorAll('button').forEach(b =>
+      b.classList.toggle('on', b.dataset.k === cur.key));
   }
 }
 
 async function switchExp(key){
   if(expBusy) return;
   expBusy = true;
-  const btns = $('expBtns').querySelectorAll('button');
-  btns.forEach(b => b.disabled = true);
-  $('expHint').textContent = '切换中… 视频会中断约 20 秒, 请稍候';
+  vBusy(true, '切换曝光…');
   try{
     const r = await api('/api/exposure', {profile: key});
     if(r && r.ok){
-      $('expHint').textContent = r.msg || '已切换';
       renderExps(r.exposure || {});
       // rkipc 重启后 WebRTC 会话会断, 主动重连一次
       setTimeout(() => { try{ playWHEP(); }catch(e){} }, 1500);
     }else{
-      $('expHint').textContent = '切换失败: ' + ((r && (r.msg||r.err)) || '未知错误');
+      alert('切换失败: ' + ((r && (r.msg||r.err)) || '未知错误'));
     }
   }catch(e){
-    $('expHint').textContent = '切换失败: ' + e;
+    alert('切换失败: ' + e);
   }finally{
+    vBusy(false);
     expBusy = false;
-    btns.forEach(b => b.disabled = false);
   }
 }
+
 
 async function pollExposure(){
   const v = await api('/api/exposure');
@@ -881,48 +1097,39 @@ setInterval(pollExposure, 5000);
  * socket 残留的已知问题), 所以失败时能给出明确原因而不是静默黑屏。
  */
 let profBusy = false;
-let profList = [];
 
 function renderProfs(v){
-  const box = $('profBtns');
-  if(!box) return;
   const cur = v.current || {};
+  curProf = cur;
   profList = v.profiles || [];
-  box.innerHTML = profList.map(p =>
-    '<button class="b ghost" data-p="'+p.key+'" title="'+p.desc+'">'+
-    p.label+'</button>').join('');
-  box.querySelectorAll('button').forEach(b => {
-    const on = (b.dataset.p === cur.key);
-    b.style.background = on ? '#1f6feb' : '';
-    b.style.color = on ? '#fff' : '';
-    b.onclick = () => switchProf(b.dataset.p);
-  });
-  if(cur.width && !cur.key){
-    $('profHint').textContent = '当前 '+cur.width+'px (非预设档位)';
+  const t = $('vcProf');
+  if(t) t.innerHTML = '画质 <b>' +
+    (cur.label || (cur.width ? (cur.width + 'px') : '--')) + '</b>';
+  const m = $('vmenu');
+  if(m.classList.contains('open') && m.dataset.for === 'prof'){
+    m.querySelectorAll('button').forEach(b =>
+      b.classList.toggle('on', b.dataset.k === cur.key));
   }
 }
 
 async function switchProf(key){
   if(profBusy) return;
   profBusy = true;
-  const btns = $('profBtns').querySelectorAll('button');
-  btns.forEach(b => b.disabled = true);
-  $('profHint').textContent = '切换中… 视频会中断约 20 秒, 请稍候';
+  vBusy(true, '切换画质…');
   try{
     const r = await api('/api/video', {profile: key});
     if(r && r.ok){
-      $('profHint').textContent = r.msg || '已切换';
       renderProfs(r.video || {});
       // rkipc 重启后 WebRTC 会话会断, 主动重连一次
       setTimeout(() => { try{ playWHEP(); }catch(e){} }, 1500);
     }else{
-      $('profHint').textContent = '切换失败: ' + ((r && (r.msg||r.err)) || '未知错误');
+      alert('切换失败: ' + ((r && (r.msg||r.err)) || '未知错误'));
     }
   }catch(e){
-    $('profHint').textContent = '切换失败: ' + e;
+    alert('切换失败: ' + e);
   }finally{
+    vBusy(false);
     profBusy = false;
-    btns.forEach(b => b.disabled = false);
   }
 }
 
