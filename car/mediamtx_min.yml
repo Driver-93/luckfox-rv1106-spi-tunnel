@@ -1,0 +1,49 @@
+###############################################
+# mediamtx 配置 — 小车图传 (v1.11.3)
+#
+# 为什么这么短:
+#   上游的完整模板 (878 行) 针对更新的版本, 含 v1.11.3 **不认识**的字段
+#   (例如 apiAllowOrigins)。直接用它启动会报
+#       ERR: json: unknown field "apiAllowOrigins"
+#   然后进程退出 —— 表现为"mediamtx 起不来", 但日志只有一行 JSON 错误,
+#   很容易以为是别的问题。
+#
+#   所以这里只写真正需要的项, 其余全部走内置默认值。
+###############################################
+
+logLevel: info
+logDestinations: [stdout]
+
+# ---- 视频源: 读 rkipc 的 RTSP ----
+paths:
+  car:
+    source: rtsp://127.0.0.1:554/live/0
+    # 低延迟优先: 不等完整 GOP, 来一帧发一帧
+    sourceOnDemand: no
+    # 走 TCP 而不是 UDP: 本机回环上 TCP 更稳, 且 SPI 隧道只转发 TCP
+    rtspTransport: tcp
+
+# ---- WebRTC: 唯一的实时视频出口 ----
+webrtc: yes
+webrtcAddress: :8889
+
+# ICE candidate 要写成**浏览器能到达的地址**。
+# 板子自己看到的是 eth0 的 192.168.3.x, 但浏览器实际连的是 C5 的
+# 192.168.3.69 (经 SPI 隧道 + C5 的 NAPT 端口映射转发)。
+webrtcAdditionalHosts: [192.168.3.69]
+
+# 只留 TCP 候选。
+# WebRTC 媒体默认走 UDP, 而 SPI 隧道只转发 TCP —— 浏览器如果拿到
+# UDP 候选就永远连不上, 表现为"视频一直转圈"。
+webrtcLocalUDPAddress: ""
+webrtcLocalTCPAddress: :8189
+
+# ---- HLS 兜底 (延迟大, 只在 WebRTC 不通时用) ----
+hls: yes
+hlsAddress: :8888
+hlsVariant: lowLatency
+hlsAlwaysRemux: yes
+
+# ---- RTSP 服务 (调试用) ----
+rtsp: yes
+rtspAddress: :8554

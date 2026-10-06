@@ -1,0 +1,45 @@
+logLevel: info
+api: no
+metrics: no
+pprof: no
+playback: no
+rtsp: no
+rtmp: no
+srt: no
+
+# ---- HLS: DISABLED ----
+# HLS was only ever a fallback for the tunnel, but it costs 3-6 seconds of
+# latency, which is useless for driving a car. WebRTC over ICE-TCP traverses
+# the SPI tunnel fine, so HLS is gone -- and turning it off also frees CPU on
+# this single-core board (HLS remuxing is not free).
+hls: no
+
+# ---- WebRTC: the ONLY video path (real-time) ----
+webrtc: yes
+webrtcAddress: :8889
+
+# Advertise both ways to reach the board, so the browser always gets a usable
+# ICE candidate whichever address it used:
+#   192.168.3.69 -> the ESP32-C3 WiFi tunnel (wireless: the normal case)
+#   192.168.3.68 -> the board's own ethernet address (cable attached)
+webrtcAdditionalHosts: [192.168.3.69, 192.168.3.68]
+
+# ---- CRITICAL for wireless: TCP-only ICE ----
+# WebRTC media defaults to UDP, and the SPI tunnel carries TCP only, so a
+# browser reached through the tunnel would be handed UDP candidates that can
+# never work, and would hang waiting for them.
+#
+# Disabling UDP ICE leaves only the TCP candidate 192.168.3.69:8189 -- and 8189
+# IS in the tunnel's forwarded port list -- so the browser is forced onto
+# ICE-TCP and WebRTC's sub-second latency makes it across the tunnel.
+webrtcLocalUDPAddress: ""
+webrtcLocalTCPAddress: :8189
+
+paths:
+  car:
+    source: rtsp://127.0.0.1:554/live/0
+    sourceOnDemand: no
+    # rkipc and mediamtx share this board, so this goes over 127.0.0.1.
+    # UDP beats TCP here: TCP head-of-line blocking makes one lost packet stall
+    # everything behind it, which shows up as visible latency spikes.
+    rtspTransport: udp

@@ -1,0 +1,495 @@
+﻿/*
+ * main.c — ESP32-C3 SPI<->WiFi 应用层转发网关
+ *
+ * 角色: WiFi station + 把 SPI 过来的"连接请求"用 WiFi socket 转发出去
+ *
+ * 数据流:
+ *   板子本地代理 --SPI--> C3 --WiFi socket--> 目标服务器
+ *
+ * 不需要 NAPT: 我们在应用层做转发, 每条连接一个 C3 socket。
+ */
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
+#include "lwip/inet.h"      /* IP4_ADDR */
+#include "tunnel.h"
+#include "spi_slave.h"
+#include "spinet.h"
+#include "netlog.h"
+
+static const char *TAG = "main";
+
+/*
+ * Ports reverse-proxied from the C3 to the board.
+ *
+ * NOTE: this whole mechanism is now a FALLBACK. With tun.ko loaded the board
+ * has a real interface (10.77.0.2) behind the C3 and inbound traffic arrives
+ * as ordinary IP packets through the port mappings registered in spinet.c --
+ * no userspace reconstruction, no slot table, and UDP works.
+ * The reverse proxy is kept running only until the TUN path is proven, then
+ * this list goes away.
+ *
+ * 8888 (HLS) was removed: HLS is buffer-based and was rejected for latency.
+ */
+/*
+ * NOTE: the reverse proxy that used to live here has been deleted.
+ *
+ * It existed only because the board's kernel had no CONFIG_TUN, so the board
+ * could not own an IP address and every browser connection had to be rebuilt in
+ * userspace: the C3 accepted the connection, told the board to dial
+ * 127.0.0.1:<port>, and both ends shovelled bytes. That brought a slot table
+ * capped at 8 concurrent connections, no UDP, no retransmission, worker-task
+ * leaks and REVOK timing bugs.
+ *
+ * With tun.ko loaded the board is a normal LAN host and inbound traffic arrives
+ * as ordinary IP packets through the port mappings registered in spinet.c. The
+ * port map covers exactly the same ports the reverse proxy did (80, 22, 8889,
+ * 8189) and measurement confirmed it shadows the proxy completely: connecting
+ * to :80 no longer produces a single REVOPEN on the C3.
+ *
+ * Deleting it frees roughly 49KB of the chip's 150KB heap (8 x 4096B tx buffers
+ * + 8 x 2048B rx buffers), one listener task and one worker task per connection.
+ */
+#define HEAP_LOW        30000
+#define HEAP_CRITICAL   12000
+
+/* 2.4GHz network name.
+ *
+ * "ABC" IS NOT ON 2.4GHz ANY MORE. A scan from a dual-band PC shows:
+ *     ABC            -> channel 177   (5 GHz -- the C3's radio cannot see it)
+ *     ABC_Wi-Fi5     -> channel 6     (2.4 GHz)
+ *     HUAWEI-ER15NM_5G -> channel 149 (5 GHz)
+ *     midea_da_0758  -> channel 1     (2.4 GHz)
+ *
+ * The C3 has a 2.4GHz-only radio, so it reported
+ *     W wifi:Haven't to connect to a suitable AP now!
+ * forever -- which looks like dead hardware but is only a wrong SSID. The
+ * message means "no suitable AP found in the scan", not an auth failure.
+ */
+#define WIFI_SSID  WIFI_SSID_LIST[0]
+#define WIFI_PASS  "YOUR_WIFI_PASSWORD"
+
+/* 候选 SSID 列表, 按顺序尝试。
+ *
+ * 为什么要多个: 原来只写死一个 SSID, 而"连不上"的原因可能是 AP 关了、改了名、
+ * 或者在另一个频段 -- 这几种情况在日志里长得一模一样, 每次都要人肉排查。
+ * 现在固件自己轮着试, 并且把每次失败的原因 (reason code) 打出来。
+ *
+ * 2026-10-04 更新: 原来的 HUAWEI-ER15NM 系列已经不在空中 (实测扫描
+ * 扫不到), 现在这台路由器叫 'ABC'。C5 实测能看到它两个频段:
+ *     [01] 'ABC'  rssi -53  ch 44   <- 5G, 信号强, 优先
+ *     [03] 'ABC'  rssi -70  ch 1    <- 2.4G
+ * 同名两个频段, ESP-IDF 会自动挑信号好的那个, 所以列表里只写一次。
+ *
+ * 密码与旧 AP 相同 (都是 YOUR_WIFI_PASSWORD)。 */
+static const char *const WIFI_SSID_LIST[] = {
+    "YOUR_WIFI_SSID",      /* 改成你自己的 AP */
+    "YOUR_WIFI_SSID_5G",   /* 备用 AP */
+};
+#define WIFI_SSID_COUNT (sizeof(WIFI_SSID_LIST) / sizeof(WIFI_SSID_LIST[0]))
+static int s_ssid_idx = 0;
+
+static EventGroupHandle_t s_wifi_eg;
+#define BIT_CONNECTED  BIT0
+static int s_retry = 0;
+/* 扫描期间置位, 阻止断开事件处理函数立刻重连。
+ *
+ * wifi_scan_report() 会先 disconnect 再 scan, 但 STA_DISCONNECTED 事件
+ * 处理函数原来无条件调用 esp_wifi_connect(), 把状态机瞬间拉回 connecting,
+ * 驱动随即拒绝扫描:
+ *     W wifi:sta_scan: STA is connecting, scan are not allowed!
+ * 扫描返回 ESP_ERR_WIFI_STATE, 报告提前 return, 于是永远看不到射频实际
+ * 能听到什么。串口实测 t=123819ms 复现, 每 30 秒重复一次。 */
+static volatile bool s_scanning = false;
+static esp_netif_ip_info_t s_ipinfo;
+
+static void on_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        /* Deliberately do NOT connect here.
+         *
+         * app_main runs a scan first to report what the 2.4GHz radio can
+         * actually hear, and the driver refuses a scan while the station is
+         * connecting:
+         *     W wifi:sta_scan: STA is connecting, scan are not allowed!
+         * which silently turned the diagnostic into a no-op. app_main calls
+         * esp_wifi_connect() as soon as the scan is done. */
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        xEventGroupClearBits(s_wifi_eg, BIT_CONNECTED);
+        /* 打印 reason: 否则"密码错""找不到 AP""认证超时"三种情况完全无法区分。 */
+        wifi_event_sta_disconnected_t *dd =
+            (wifi_event_sta_disconnected_t *)data;
+        ESP_LOGW(TAG, "WiFi 断开, reason=%d, 重试 %d",
+                 dd ? dd->reason : -1, s_retry);
+        /* 扫描期间不要重连 -- 见 s_scanning 的说明。 */
+        if (s_scanning) {
+            ESP_LOGI(TAG, "扫描中, 暂不重连");
+            return;
+        }
+        if (s_retry++ < 20) {
+            esp_wifi_connect();
+        } else {
+            /* 20 次都连不上 -> 换下一个候选 SSID 再试。
+             *
+             * 这是关键: 只重连同一个 SSID, 如果它根本不在空中 (改名/关了/
+             * 换频段), 就会永远空转。换一个试才能自愈。改完配置立刻
+             * esp_wifi_connect(), 不要等下一次事件。 */
+            s_retry = 0;
+            s_ssid_idx = (s_ssid_idx + 1) % (int)WIFI_SSID_COUNT;
+            ESP_LOGE(TAG, "连不上, 换成候选 SSID [%d/%d]: '%s'",
+                     s_ssid_idx + 1, (int)WIFI_SSID_COUNT,
+                     WIFI_SSID_LIST[s_ssid_idx]);
+            wifi_config_t wc2 = { 0 };
+            strncpy((char *)wc2.sta.ssid, WIFI_SSID_LIST[s_ssid_idx],
+                    sizeof(wc2.sta.ssid) - 1);
+            strncpy((char *)wc2.sta.password, WIFI_PASS,
+                    sizeof(wc2.sta.password) - 1);
+            wc2.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+            wc2.sta.pmf_cfg.capable  = true;
+            wc2.sta.pmf_cfg.required = false;
+            esp_wifi_set_config(WIFI_IF_STA, &wc2);
+            esp_wifi_connect();
+        }
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
+        s_ipinfo = e->ip_info;
+        ESP_LOGI(TAG, "got ip: " IPSTR " gw " IPSTR,
+                 IP2STR(&s_ipinfo.ip), IP2STR(&s_ipinfo.gw));
+        s_retry = 0;
+        xEventGroupSetBits(s_wifi_eg, BIT_CONNECTED);
+        /* 让 UDP 状态应答能报出真实 IP */
+        char ipbuf[16];
+        snprintf(ipbuf, sizeof(ipbuf), IPSTR, IP2STR(&s_ipinfo.ip));
+        netlog_set_ip(ipbuf);
+    }
+}
+
+static void wifi_init(void)
+{
+    s_wifi_eg = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_t *sta = esp_netif_create_default_wifi_sta();
+
+    /* This router's DHCP intermittently never answers: the C3 completes
+     * association ("assoc -> run") but stays on 0.0.0.0, and the AP then
+     * deauths it after ~10s ("run -> init cc00"), forever. Observed live.
+     * A static address removes the C3's dependence on DHCP entirely, which is
+     * also what we want for a fixed-address appliance like this car. */
+    if (sta) {
+        esp_netif_dhcpc_stop(sta);          /* ignore error: may be off already */
+
+        esp_netif_ip_info_t ip;
+        memset(&ip, 0, sizeof(ip));
+        IP4_ADDR(&ip.ip,      192, 168, 3, 69);
+        IP4_ADDR(&ip.gw,      192, 168, 3, 1);
+        IP4_ADDR(&ip.netmask, 255, 255, 255, 0);
+        esp_err_t e = esp_netif_set_ip_info(sta, &ip);
+        if (e != ESP_OK) ESP_LOGW(TAG, "静态 IP 设置失败: %s", esp_err_to_name(e));
+        else             ESP_LOGI(TAG, "静态 IP 192.168.3.69/24 gw 192.168.3.1");
+    }
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, on_evt, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, on_evt, NULL, NULL));
+
+    wifi_config_t wc = { 0 };
+    strncpy((char *)wc.sta.ssid, WIFI_SSID, sizeof(wc.sta.ssid) - 1);
+    strncpy((char *)wc.sta.password, WIFI_PASS, sizeof(wc.sta.password) - 1);
+    wc.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    /* The AP advertises WPA2-Personal only; requiring PMF made some
+     * associations fail outright. Keep it capable but not required. */
+    wc.sta.pmf_cfg.capable  = true;
+    wc.sta.pmf_cfg.required = false;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));   /* 关省电, 保延迟 */
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_LOGI(TAG, "wifi sta started, ssid=%s", WIFI_SSID);
+}
+
+static bool wifi_wait(int ms)
+{
+    EventBits_t b = xEventGroupWaitBits(s_wifi_eg, BIT_CONNECTED,
+                                        pdFALSE, pdTRUE, pdMS_TO_TICKS(ms));
+    return (b & BIT_CONNECTED) != 0;
+}
+
+/* List every AP the 2.4GHz radio can actually hear, once, at boot.
+ *
+ * WHY: "Haven't to connect to a suitable AP now!" only means the scan found no
+ * AP matching the configured SSID and auth mode. That is reported both when the
+ * SSID is wrong AND when the receiver is deaf, so it cannot tell the two apart.
+ * This dump can: if it lists nothing at all while a dual-band PC in the same
+ * room sees four networks, the antenna/RF path is dead. If it lists the AP but
+ * association still fails, the problem is configuration.
+ */
+static void wifi_scan_report(void)
+{
+    wifi_scan_config_t sc = { 0 };
+    sc.show_hidden = true;
+    /* 扫全部信道, 不限频段。
+     *
+     * 原来是 sc = {0}, 即不指定 channel/scan_time, ESP-IDF 默认只扫 2.4GHz。
+     * 结果是: 如果目标 AP 其实在 5GHz, 扫描永远看不到它, 打印出来就是
+     * "没扫到目标 SSID", 和"天线坏了"完全无法区分 -- 这正是之前一直误判的
+     * 地方。C5 是双频芯片 (band mode 0x3), 扫全频段才能给出真实答案。
+     *
+     * 时间参数说明: 全频段 = 2.4G 的 14 个信道 + 5G 的二十多个信道。主动扫描
+     * 每个信道要等 max 毫秒, 取 200 就会拖到 10 秒以上 (实测 11.6s)。
+     * 这里降到 90ms: 目标 AP 就在附近, 90ms 足够收到 beacon/probe response,
+     * 而总时长缩到 ~3 秒。扫描只是诊断用, 不值得为它让开机慢十几秒。 */
+    sc.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+    sc.scan_time.active.min = 40;
+    sc.scan_time.active.max = 90;
+
+    /* The driver refuses a scan while the station is connecting:
+     *     W wifi:sta_scan: STA is connecting, scan are not allowed!
+     * so stop the attempt, scan, then resume. Without this the whole report is
+     * a silent no-op -- which is exactly what happened the first time. */
+    s_scanning = true;
+    esp_wifi_disconnect();
+
+    /* 轮询等待断开真正生效, 而不是死等 250ms。
+     * esp_wifi_disconnect() 是异步的: 固定睡眠在拆链快时纯属浪费, 在拆链慢时
+     * 又不够长 -- 扫描返回 ESP_ERR_WIFI_STATE 正是后者。 */
+    bool gone = false;
+    for (int i = 0; i < 20; i++) {                 /* 最多 2 秒 */
+        wifi_ap_record_t tmp;
+        if (esp_wifi_sta_get_ap_info(&tmp) != ESP_OK) { gone = true; break; }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));                /* 让状态机落定 */
+
+    esp_err_t e = esp_wifi_scan_start(&sc, true);  /* blocking */
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "SCAN: 启动失败 %s (disconnected=%d)",
+                 esp_err_to_name(e), (int)gone);
+        s_scanning = false;                        /* 先放权, 再重连 */
+        esp_wifi_connect();
+        return;
+    }
+
+    uint16_t n = 0;
+    esp_wifi_scan_get_ap_num(&n);
+    ESP_LOGW(TAG, "SCAN: 全频段扫到 %u 个 AP", (unsigned)n);
+
+    if (n == 0) {
+        ESP_LOGE(TAG, "SCAN: 一个都没有 -- 接收通路基本是聋的");
+    } else {
+        if (n > 20) n = 20;
+        wifi_ap_record_t *recs = calloc(n, sizeof(wifi_ap_record_t));
+        if (recs) {
+            uint16_t got = n;
+            if (esp_wifi_scan_get_ap_records(&got, recs) == ESP_OK) {
+                /* 先把看到的 AP 全列出来 (排查射频通路用) */
+                for (int i = 0; i < got; i++) {
+                    ESP_LOGW(TAG, "SCAN: [%02d] '%s'  rssi %d  ch %d  auth %d",
+                             i, (const char *)recs[i].ssid, recs[i].rssi,
+                             recs[i].primary, recs[i].authmode);
+                }
+                /* 再逐个检查候选 SSID 在不在空中。
+                 * 这样一眼就能看出"哪个候选能用", 不用来回改代码重烧。 */
+                for (int c = 0; c < (int)WIFI_SSID_COUNT; c++) {
+                    int found = -1, frssi = 0, fch = 0;
+                    for (int i = 0; i < got; i++) {
+                        if (strcmp((const char *)recs[i].ssid,
+                                   WIFI_SSID_LIST[c]) == 0) {
+                            found = i; frssi = recs[i].rssi;
+                            fch = recs[i].primary;
+                            break;
+                        }
+                    }
+                    if (found >= 0) {
+                        ESP_LOGW(TAG, "SCAN: 候选[%d] '%s' 可见! rssi=%d ch=%d (%sGHz)%s",
+                                 c, WIFI_SSID_LIST[c], frssi, fch,
+                                 fch > 14 ? "5" : "2.4",
+                                 c == s_ssid_idx ? "  <== 正在连这个" : "");
+                    } else {
+                        ESP_LOGW(TAG, "SCAN: 候选[%d] '%s' 不在空中",
+                                 c, WIFI_SSID_LIST[c]);
+                    }
+                }
+            }
+            free(recs);
+        }
+    }
+
+    s_scanning = false;          /* 先把射频还回去, 再重连 */
+    esp_wifi_connect();
+}
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "==============================================");
+    ESP_LOGI(TAG, " ESP32-C5 SPI<->WiFi 转发网关 (TUN+NAPT, 移植自 C3)");
+    ESP_LOGI(TAG, "==============================================");
+
+    esp_err_t r = nvs_flash_init();
+    if (r == ESP_ERR_NVS_NO_FREE_PAGES || r == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        r = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(r);
+
+    wifi_init();
+    /* 冷启动速度的关键: 开机**不要**先扫描。
+     *
+     * 原来的顺序是 wifi_scan_report() -> esp_wifi_connect()。扫描是同步阻塞的,
+     * 而且为了能看见 5GHz 的 AP, 现在扫全频段, 实测耗时 11.6 秒:
+     *     t=1.0s   wifi sta started
+     *     t=12.6s  扫描结束        <-- 11.6 秒全耗在这里
+     *     t=15.6s  关联成功
+     *     t=15.8s  拿到 IP
+     * 也就是说, 开机后有近 12 秒射频根本没在连网, 只是在"看周围有什么"。
+     *
+     * 扫描只是诊断手段, 不是连网的必要步骤。改成:
+     *   1. 立刻 esp_wifi_connect() 开始关联 (最快路径)
+     *   2. 连不上时 (见 app_main 主循环) 再扫描并打印诊断
+     * 这样正常开机比原来快约 12 秒, 而排查能力一点没少 —— 因为只有
+     * 出问题时才需要看扫描结果。
+     */
+    esp_wifi_connect();
+    /* Do NOT block on association here.
+     *
+     * This used to be `if (wifi_wait(20000)) ...` BEFORE spi_slave_init(),
+     * which meant the SPI slave was not armed until WiFi had associated. The
+     * board powers up with the C3 and immediately starts polling for it over
+     * SPI; while the C3 was waiting for WiFi, every HELLO went unanswered, so
+     * the board could not create tun0 and the car's control page was
+     * unreachable for the first ~20 seconds after power-on.
+     *
+     * The SPI link and WiFi are independent: the tunnel can carry IP packets
+     * the moment the slave is armed. Anything that needs WiFi (forwarding,
+     * NAPT, the port map) simply starts working once association completes,
+     * a few seconds later and entirely in the background.
+     */
+
+    /* Debug convenience: mirror all logs + a periodic status line to UDP so the
+     * C3 can be inspected over WiFi without a Type-C cable. Best-effort only --
+     * a failure here must never stop the tunnel from coming up. */
+    if (netlog_start(0) != ESP_OK) {
+        ESP_LOGW(TAG, "netlog 启动失败, 仅串口可用");
+    } else {
+        ESP_LOGI(TAG, "netlog ready: UDP 广播 %d 端口", NETLOG_DEFAULT_PORT);
+    }
+
+    ESP_ERROR_CHECK(spi_slave_init());
+
+    r = tunnel_init();
+    if (r != ESP_OK) {
+        ESP_LOGE(TAG, "tunnel_init 失败: %s", esp_err_to_name(r));
+    }
+
+    /* The board's side of this link is tun0, created by tun.ko. Before
+     * spinet_start() the board has no IP at all behind the C3; after it,
+     * 10.77.0.2 is a first-class LAN host via NAPT + port mappings.
+     * Best-effort: if it fails we still have the reverse proxy. */
+    if (spinet_start() != ESP_OK) {
+        ESP_LOGW(TAG, "spinet_start 失败, 只有反向代理可用");
+    }
+
+    ESP_LOGI(TAG, "setup done, starting tunnel task");
+    /* ESP32-C5 是单核 RISC-V @240MHz (比 C3 的 160MHz 快 50%),
+     * 隧道任务只能钉核 0。CPU 余量靠主频提升。 */
+    xTaskCreatePinnedToCore(tunnel_task, "tunnel", 6144, NULL, 10, NULL, 0);
+
+    /* NOW wait for WiFi -- only for reporting. The tunnel above is already
+     * serving the board, which is what its boot is waiting on. */
+    if (wifi_wait(20000)) ESP_LOGI(TAG, "WiFi connected");
+    else ESP_LOGW(TAG, "WiFi 未连上, 后台继续重试");
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+
+        /* WiFi 一直没连上时才做诊断扫描。
+         *
+         * 三个要点:
+         *  1. 只有**连续**连不上才扫。wifi_scan_report() 内部会先
+         *     esp_wifi_disconnect() —— 如果 WiFi 只是短暂重连, 这个扫描会
+         *     把正在恢复的连接又拆掉, 越帮越忙。所以要求连续 3 次
+         *     (约 30 秒) 都处于断开状态, 才认定是真有问题。
+         *  2. 诊断扫描本身耗时长 (全频段), 开机时绝不能挡在连网前面 ——
+         *     所以它只出现在这条失败路径上, 正常开机不会走到这里。
+         *  3. 一旦连上就把计数清零, 避免下次偶发断开时立刻触发扫描。 */
+        {
+            static int down_tick = 0;
+            EventBits_t wb = xEventGroupGetBits(s_wifi_eg);
+            if (wb & BIT_CONNECTED) {
+                down_tick = 0;
+            } else if (++down_tick >= 3 && (down_tick % 3) == 0) {
+                ESP_LOGW(TAG, "WiFi 已断开约 %d 秒, 扫描诊断",
+                         down_tick * 10);
+                wifi_scan_report();
+            }
+        }
+
+        uint32_t up, down, drop, err;
+        tunnel_stats(&up, &down, &drop, &err);
+        EventBits_t b = xEventGroupGetBits(s_wifi_eg);
+        wifi_ap_record_t ap;
+        int rssi = 0;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) rssi = ap.rssi;
+
+        uint32_t free_heap = esp_get_free_heap_size();
+        uint32_t min_heap  = esp_get_minimum_free_heap_size();
+        /* Task count is the key leak indicator here: every reverse connection
+         * spawns a worker, so if the count keeps climbing after connections end,
+         * the workers are not being reclaimed. */
+        UBaseType_t ntasks = uxTaskGetNumberOfTasks();
+
+        uint32_t iptx, ipdrop, iprx, maps;
+        uint32_t sptx, spdrop;
+        tunnel_ip_stats(&iptx, &ipdrop);
+        spinet_stats(&sptx, &iprx, &spdrop, &maps);
+
+        /* sp tx is the count of times lwIP handed us a packet to transmit on
+         * spi0. It is the single most useful number for this link: if lwIP
+         * never calls the output function, the drop happened upstream in
+         * ip4_forward, not in our queue. That distinction was missing before
+         * and cost a lot of guessing. */
+        ESP_LOGI(TAG, "[stat] wifi=%s rssi=%d ip=" IPSTR
+                 " | up=%lu down=%lu drop=%lu err=%lu | free=%lu minfree=%lu tasks=%u"
+                 " | ip tx=%lu rx=%lu drop=%lu maps=%lu | sp tx=%lu rx=%lu drop=%lu",
+                 (b & BIT_CONNECTED) ? "UP" : "DOWN", rssi,
+                 IP2STR(&s_ipinfo.ip),
+                 (unsigned long)up, (unsigned long)down,
+                 (unsigned long)drop, (unsigned long)err,
+                 (unsigned long)free_heap, (unsigned long)min_heap,
+                 (unsigned)ntasks,
+                 (unsigned long)iptx, (unsigned long)iprx,
+                 (unsigned long)ipdrop, (unsigned long)maps,
+                 (unsigned long)sptx, (unsigned long)iprx, (unsigned long)spdrop);
+
+        /* ---- 分级内存保护 ----
+         *
+         * The slot table that used to leak is gone with the reverse proxy, so
+         * this is now purely a backstop: if the heap still collapses, restart
+         * rather than wedge silently. The board re-handshakes with a fresh C3
+         * by itself (verified by resetting the C3 over USB). */
+        if (free_heap < HEAP_CRITICAL) {
+            ESP_LOGE(TAG, "堆仅剩 %lu 字节 (<%d), 重启以恢复",
+                     (unsigned long)free_heap, HEAP_CRITICAL);
+            vTaskDelay(pdMS_TO_TICKS(300));   /* let the log go out first */
+            esp_restart();
+        } else if (free_heap < HEAP_LOW) {
+            ESP_LOGW(TAG, "堆偏低 %lu 字节 (<%d)",
+                     (unsigned long)free_heap, HEAP_LOW);
+        }
+    }
+}
+

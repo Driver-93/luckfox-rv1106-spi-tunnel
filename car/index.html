@@ -1,0 +1,1062 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#0d1117">
+<title>Luckfox 遥控车</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  background:#0d1117;color:#e6edf3;overscroll-behavior:none;user-select:none;
+  padding-bottom:env(safe-area-inset-bottom);
+}
+:root{
+  --card:#161b22;--card2:#1c2128;--line:#30363d;
+  --fg:#e6edf3;--dim:#8b949e;--accent:#2f81f7;
+  --ok:#3fb950;--warn:#d29922;--err:#f85149;
+}
+header{
+  position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:10px;
+  padding:10px 14px;background:rgba(13,17,23,.92);backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--line);
+}
+header .logo{font-size:17px;font-weight:700}
+header .sub{font-size:11px;color:var(--dim);margin-top:1px}
+.spacer{flex:1}
+.pill{display:flex;align-items:center;gap:6px;font-size:11px;padding:5px 10px;
+      border-radius:20px;background:var(--card2);border:1px solid var(--line)}
+.pill .d{width:7px;height:7px;border-radius:50%;background:#484f58;flex:none}
+.pill.ok .d{background:var(--ok);box-shadow:0 0 6px var(--ok)}
+.pill.bad .d{background:var(--err);box-shadow:0 0 6px var(--err)}
+.pill.warn .d{background:var(--warn);box-shadow:0 0 6px var(--warn)}
+
+main{max-width:1100px;margin:0 auto;padding:10px 12px 24px}
+@media(min-width:900px){
+  main{display:grid;grid-template-columns:1fr 400px;gap:14px;align-items:start}
+}
+
+/* ---- 手机竖屏优化 ----
+ * 实际开车时是单手拿手机, 所以要:
+ *   1. 视频尽量大 (它是主要信息)  -> 竖屏时占满宽度, 4:3 而不是 16:9
+ *   2. 摇杆贴近拇指             -> 竖屏时面板顺序调到视频下面
+ *   3. 状态卡片压扁             -> 一行显示, 不占垂直空间
+ *   4. 去掉多余的说明文字       -> 开车时没人看
+ */
+@media(max-width:600px){
+  main{padding:6px 8px 90px}      /* 底部留出摇杆的空间 */
+
+  /* 摇杆区固定在底部, 单手可及 —— 这是遥控车最关键的手感改进 */
+  #videoWrap{aspect-ratio:4/3}
+  .stats{grid-template-columns:repeat(2,1fr);gap:6px;margin-top:6px}
+  .stat{padding:7px 9px}
+  .stat .v{font-size:15px;margin-top:1px}
+  .stat .s{display:none}          /* 副标题在小屏上太挤, 隐藏 */
+  .panel{padding:11px;margin-top:8px}
+  #stick{max-width:230px}
+}
+
+#videoWrap{position:relative;width:100%;aspect-ratio:16/9;background:#000;
+  border-radius:14px;overflow:hidden;border:1px solid var(--line)}
+#video{width:100%;height:100%;object-fit:contain;display:block;background:#000}
+#vhud{position:absolute;left:10px;top:10px;font-size:11px;color:#fff;
+  background:rgba(0,0,0,.55);padding:4px 9px;border-radius:7px;
+  backdrop-filter:blur(6px);display:none;font-variant-numeric:tabular-nums}
+#vfull{position:absolute;right:10px;top:10px;background:rgba(0,0,0,.55);color:#fff;
+  border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:5px 11px;
+  font-size:12px;cursor:pointer;backdrop-filter:blur(6px)}
+#vstate{position:absolute;inset:0;display:flex;flex-direction:column;gap:12px;
+  align-items:center;justify-content:center;background:rgba(0,0,0,.6);
+  color:var(--dim);font-size:13px}
+#vstate.hide{display:none}
+#vstate button{background:var(--accent);color:#fff;border:0;border-radius:9px;
+  padding:9px 20px;font-size:13px;font-weight:600;cursor:pointer}
+
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:10px}
+@media(max-width:560px){.stats{grid-template-columns:repeat(2,1fr)}}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:9px 11px}
+.stat .k{font-size:10px;color:var(--dim);display:flex;align-items:center;gap:5px;
+  text-transform:uppercase;letter-spacing:.4px}
+.stat .v{font-size:16px;font-weight:700;margin-top:3px;font-variant-numeric:tabular-nums}
+.stat .s{font-size:10px;color:var(--dim);margin-top:2px;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.dot{width:7px;height:7px;border-radius:50%;background:#484f58;flex:none}
+.dot.on{background:var(--ok)}.dot.mid{background:var(--warn)}.dot.off{background:var(--err)}
+.bar{height:5px;border-radius:3px;background:#21262d;margin-top:6px;overflow:hidden}
+.bar>i{display:block;height:100%;width:0;background:var(--ok);transition:width .4s,background .4s}
+
+.panel{background:var(--card);border:1px solid var(--line);border-radius:16px;
+  padding:14px;margin-top:12px}
+.panel h3{margin:0 0 10px;font-size:12px;color:var(--dim);font-weight:600;
+  text-transform:uppercase;letter-spacing:.6px}
+
+#stick{position:relative;width:100%;max-width:300px;aspect-ratio:1;margin:0 auto;
+  border-radius:50%;
+  background:radial-gradient(circle at 50% 50%,#1c2128 0%,#141a21 70%,#0f141a 100%);
+  border:1px solid var(--line);touch-action:none;cursor:grab;
+  /* 摇杆是开车时唯一持续操作的东西, 放大一点更好按 */
+  -webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+#stick:active{cursor:grabbing}
+#stick .ring{position:absolute;inset:14%;border-radius:50%;
+  border:1px dashed rgba(139,148,158,.22)}
+#stick .cross{position:absolute;inset:0;pointer-events:none}
+#stick .cross:before,#stick .cross:after{content:"";position:absolute;
+  background:rgba(139,148,158,.13)}
+#stick .cross:before{left:50%;top:12%;bottom:12%;width:1px;transform:translateX(-.5px)}
+#stick .cross:after{top:50%;left:12%;right:12%;height:1px;transform:translateY(-.5px)}
+#knob{position:absolute;left:50%;top:50%;width:38%;aspect-ratio:1;border-radius:50%;
+  transform:translate(-50%,-50%);
+  background:linear-gradient(160deg,#4a9eff,#2f81f7 60%,#1f6feb);
+  box-shadow:0 6px 18px rgba(47,129,247,.45),inset 0 1px 0 rgba(255,255,255,.3);
+  /* 拖动时不加过渡, 否则跟手有延迟感 */
+  transition:none}
+#stick:not(.active) #knob{transition:transform .12s ease-out}
+#stick.active #knob{box-shadow:0 8px 26px rgba(47,129,247,.7),inset 0 1px 0 rgba(255,255,255,.4)}
+#stick .lbl{position:absolute;font-size:10px;color:#5a6472;font-weight:600;pointer-events:none}
+#stick .lbl.t{top:6%;left:50%;transform:translateX(-50%)}
+#stick .lbl.b{bottom:6%;left:50%;transform:translateX(-50%)}
+#stick .lbl.l{left:7%;top:50%;transform:translateY(-50%)}
+#stick .lbl.r{right:7%;top:50%;transform:translateY(-50%)}
+
+.row{display:flex;align-items:center;gap:10px;margin-top:12px}
+.row .t{font-size:12px;color:var(--dim);width:44px;flex:none}
+.row .n{font-size:13px;font-weight:700;width:44px;text-align:right;
+  font-variant-numeric:tabular-nums;flex:none}
+input[type=range]{-webkit-appearance:none;appearance:none;flex:1;height:26px;background:transparent}
+input[type=range]::-webkit-slider-runnable-track{height:6px;border-radius:3px;background:#21262d}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;
+  border-radius:50%;background:linear-gradient(160deg,#4a9eff,#2f81f7);margin-top:-8px;
+  box-shadow:0 2px 8px rgba(47,129,247,.5);border:0}
+input[type=range]::-moz-range-track{height:6px;border-radius:3px;background:#21262d}
+input[type=range]::-moz-range-thumb{width:22px;height:22px;border:0;border-radius:50%;
+  background:linear-gradient(160deg,#4a9eff,#2f81f7)}
+
+.btns{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
+.b{border:1px solid var(--line);background:var(--card2);color:var(--fg);
+  border-radius:11px;padding:13px 8px;font-size:13px;font-weight:600;
+  cursor:pointer;text-align:center;transition:background .12s,transform .06s}
+.b:active{transform:scale(.97);background:#262d36}
+.b.stop{background:linear-gradient(160deg,#f85149,#da3633);border-color:#f85149;color:#fff}
+.b.stop:active{background:#da3633}
+.b.wide{grid-column:1/-1}
+.b.ghost{background:transparent}
+
+/* 手机上按钮要够大才好按 (Apple/Google 建议最小 44px 触控目标) */
+@media(max-width:600px){
+  .btns{gap:7px;margin-top:9px}
+  .b{padding:15px 8px;font-size:14px}
+  .row{margin-top:9px}
+  input[type=range]::-webkit-slider-thumb{width:26px;height:26px;margin-top:-10px}
+}
+
+#dirbar{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:12px;color:var(--dim)}
+#dirbar .tag{padding:4px 10px;border-radius:7px;background:var(--card2);
+  border:1px solid var(--line);color:var(--fg);font-weight:600;font-variant-numeric:tabular-nums}
+.hint{font-size:10.5px;color:#5a6472;line-height:1.7;margin-top:10px}
+/* 手机上隐藏长说明 —— 开车时没人看, 而且占垂直空间 */
+@media(max-width:600px){.hint{display:none}}
+kbd{background:#21262d;border:1px solid var(--line);border-bottom-width:2px;
+  border-radius:4px;padding:1px 5px;font-size:10px;font-family:inherit}
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <div class="logo">🚗 Luckfox 遥控车</div>
+    <div class="sub">板载直连 · 麦轮 4WD</div>
+  </div>
+  <div class="spacer"></div>
+  <div class="pill warn" id="pillApi"><span class="d"></span><span id="apiTxt">连接中</span></div>
+  <div class="pill" id="pillVid"><span class="d"></span><span id="vidTxt">图传</span></div>
+</header>
+
+<main>
+  <div>
+    <div id="videoWrap">
+      <video id="video" autoplay playsinline muted></video>
+      <div id="vhud">--</div>
+      <button id="vfull">全屏</button>
+      <div id="vstate">
+        <span id="vtext">图传连接中…</span>
+        <button id="vretry">重试</button>
+      </div>
+    </div>
+
+    <div class="stats">
+      <div class="stat">
+        <div class="k"><span class="dot" id="batDot"></span>电池</div>
+        <div class="v" id="batV">--</div>
+        <div class="bar"><i id="batBar"></i></div>
+        <div class="s" id="batS">ADC --</div>
+      </div>
+      <div class="stat">
+        <div class="k"><span class="dot" id="gpsDot"></span>GPS</div>
+        <div class="v" style="font-size:13px" id="gpsV">--</div>
+        <div class="s" id="gpsS">卫星 --</div>
+        <div class="s" id="gpsA"></div>
+      </div>
+      <div class="stat">
+        <div class="k"><span class="dot" id="wifiDot"></span>WiFi 信号</div>
+        <div class="v" id="wifiV">--</div>
+        <div class="bar"><i id="wifiBar"></i></div>
+        <div class="s" id="wifiS">C5 桥接 --</div>
+      </div>
+      <div class="stat">
+        <div class="k"><span class="dot" id="netDot"></span>4G</div>
+        <div class="v" style="font-size:13px" id="netV">--</div>
+        <div class="s" id="netS">--</div>
+      </div>
+      <div class="stat">
+        <div class="k"><span class="dot" id="carDot"></span>状态</div>
+        <div class="v" style="font-size:13px" id="carV">--</div>
+        <div class="s" id="carS">--</div>
+      </div>
+    </div>
+  </div>
+
+  <div>
+    <div class="panel">
+      <h3>方向摇杆</h3>
+      <div id="stick">
+        <div class="ring"></div>
+        <div class="cross"></div>
+        <div class="lbl t">前</div><div class="lbl b">后</div>
+        <div class="lbl l">左</div><div class="lbl r">右</div>
+        <div id="knob"></div>
+      </div>
+
+      <div class="row">
+        <div class="t">旋转</div>
+        <input type="range" id="rot" min="-100" max="100" value="0">
+        <div class="n" id="rotN">0</div>
+      </div>
+      <div class="row">
+        <div class="t">速度</div>
+        <input type="range" id="spd" min="10" max="100" value="30">
+        <div class="n" id="spdN">30</div>
+      </div>
+
+      <div class="btns">
+        <button class="b stop wide" id="btnStop">■ 停止</button>
+        <button class="b ghost" id="btnCenter">回正摇杆</button>
+        <button class="b ghost" id="btnBrake">刹车</button>
+      </div>
+
+      <div id="dirbar">
+        输出 <span class="tag" id="vxTxt">0.00</span>
+        <span class="tag" id="vyTxt">0.00</span>
+        <span class="tag" id="wTxt">0.00</span>
+        <span class="tag" id="hbTxt" title="控制心跳: 页面每 100ms 给板子发一次当前向量。板子 1 秒收不到就自动停车(失控保护)。">心跳 --</span>
+      </div>
+
+      <div class="hint">
+        摇杆拖动 = 前后/左右/斜向 · 旋转滑块 = 原地转<br>
+        松开自动停 · 键盘 <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> 移动，
+        <kbd>Q</kbd><kbd>E</kbd> 转，<kbd>空格</kbd> 停
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>摄像头曝光</h3>
+      <div class="btns" id="expBtns"></div>
+      <div class="hint" id="expHint">
+        切换会重启视频服务, <b>画面中断约 20 秒</b>。<br>
+        有拖影/过曝选快档, 夜里想看清选慢档; 增益自动补偿亮度。
+      </div>
+
+      <h3 style="margin-top:14px">画质档位</h3>
+      <div class="btns" id="profBtns"></div>
+      <div class="hint" id="profHint">
+        切换会重启视频服务, <b>画面中断约 20 秒</b>。<br>
+        隧道吃紧时选「流畅」, 控制延迟最低。
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+/* ============ 图传: 板载 mediamtx WebRTC (实时) ============
+ * 只用 WebRTC/WHEP。HLS 已彻底移除 —— 它虽然能穿过隧道, 但有 3-6 秒延迟,
+ * 对遥控车没有意义。
+ *
+ * 无线时靠什么穿隧道:
+ *   WebRTC 媒体默认走 UDP, 而 SPI 隧道只能承载 TCP。mediamtx 已关掉 UDP ICE
+ *   (webrtcLocalUDPAddress: ""), 应答里只留 TCP 候选 192.168.3.69:8189 ——
+ *   而 8189 正在隧道转发列表里。浏览器"只能"用 ICE-TCP, 于是 WebRTC 的
+ *   亚秒级延迟就能穿过隧道。
+ *
+ * 这里曾有个错误的捷径: 判断主机名含 .69 就直接跳去 HLS, 理由是"隧道下
+ * WebRTC 必败"。实际相反 —— 正是 ICE-TCP 让 WebRTC 可以走隧道, 那个捷径
+ * 反而把实时性丢了。
+ */
+const WHEP_URLS = [
+  /* Build the URL from location.hostname, NOT from location.origin.
+   *
+   * origin omits the port when it is the scheme default, so visiting
+   * http://192.168.3.69/ gives origin "http://192.168.3.69" -- and
+   * origin.replace(/:\d+$/, ':8889') then has no port to replace, silently
+   * producing "http://192.168.3.69/car/whep" (port 80, wrong service).
+   * The old fallback URLs in this array hid the bug; hostname is correct
+   * whether or not a port was typed. */
+  location.protocol + '//' + location.hostname + ':8889/car/whep'
+];
+const $ = id => document.getElementById(id);
+let pc=null, retry=null, statsT=null, lastBytes=0, activeUrl='';
+
+function vShow(t, b){ $('vstate').classList.remove('hide'); $('vtext').textContent=t;
+  $('vretry').style.display = b?'':'none'; }
+function vHide(){ $('vstate').classList.add('hide'); }
+function setVid(cls,txt){ $('pillVid').className='pill '+cls; $('vidTxt').textContent=txt; }
+
+async function playWHEP(){
+  stopWHEP(); vShow('图传连接中…', false); setVid('warn','连接中');
+  try{
+    const p = new RTCPeerConnection(); pc = p;
+    p.addTransceiver('video', {direction:'recvonly'});
+    p.ontrack = e => {
+      const v = $('video');
+      if(e.streams[0]) v.srcObject = e.streams[0];
+      else { let s = v.srcObject || new MediaStream(); s.addTrack(e.track); v.srcObject = s; }
+      v.play().catch(()=>{});
+    };
+    p.onconnectionstatechange = () => {
+      const s = p.connectionState;
+      if(s==='connected'){ vHide(); setVid('ok','图传'); startStats(p); }
+      else if(s==='failed'||s==='disconnected'||s==='closed'){
+        stopStats(); setVid('bad','断开'); vShow('图传断开', true); schedule();
+      }
+    };
+    const off = await p.createOffer(); await p.setLocalDescription(off);
+    await new Promise(r => {
+      if(p.iceGatheringState==='complete') return r();
+      // ICE 收集给足时间: 拔网线时只有 TCP 候选可用, 收集比 UDP 慢
+      const t = setTimeout(r, 4000);
+      p.addEventListener('icegatheringstatechange', () => {
+        if(p.iceGatheringState==='complete'){ clearTimeout(t); r(); }
+      });
+    });
+    let resp=null;
+    for(const u of WHEP_URLS){
+      try{
+        const c = new AbortController();
+        // TCP ICE 的握手比 UDP 慢 (要等 TCP 连接建立), 3 秒不够
+        const t = setTimeout(()=>c.abort(), 10000);
+        resp = await fetch(u, {method:'POST', headers:{'Content-Type':'application/sdp'},
+          body: p.localDescription.sdp, signal: c.signal});
+        clearTimeout(t);
+        if(resp.ok){ activeUrl = u; break; }
+      }catch(e){ resp = null; }
+    }
+    if(!resp || !resp.ok) throw new Error('WHEP 不可达');
+    await p.setRemoteDescription({type:'answer', sdp: await resp.text()});
+  }catch(e){
+    /* 没有 HLS 兜底 —— 重试 WebRTC。
+       隧道下 WHEP 偶尔会在 C5 会话建立慢时超时, 重试即可恢复;
+       之前这里切到 HLS, 延迟立刻变成 3-6 秒, 对遥控没有意义。 */
+    stopWHEP(true);
+    setVid('bad','重连中'); vShow('图传重连中…', true);
+    schedule();
+  }
+}
+function schedule(){ clearTimeout(retry); retry = setTimeout(playWHEP, 2000); }
+function stopWHEP(keepVideo){
+  clearTimeout(retry); stopStats();
+  if(pc){ try{pc.close()}catch(e){} pc=null; }
+  if(!keepVideo){
+    const v = $('video'); v.srcObject = null; v.removeAttribute('src'); v.load();
+  }
+}
+function startStats(p){
+  clearInterval(statsT); lastBytes = 0;
+  statsT = setInterval(async () => {
+    try{
+      const r = await p.getStats(); let by=0,fps=0,jb=0,lost=0;
+      r.forEach(x => {
+        if(x.type==='inbound-rtp' && x.kind==='video'){
+          by = x.bytesReceived; fps = x.framesPerSecond||0; lost = x.packetsLost||0; }
+        if(x.type==='inbound-rtp' && x.jitterBufferDelay && x.jitterBufferEmittedCount)
+          jb = x.jitterBufferDelay / x.jitterBufferEmittedCount * 1000;
+      });
+      const rate = lastBytes ? (by-lastBytes)/2 : 0; lastBytes = by;
+      /* 单位自适应 (见 fmtRate): 低码率显示 KB/s 而不是 0.04MB/s */
+      $('vhud').textContent = fmtRate(rate)+' · '+Math.round(jb)+'ms'+
+        (fps?' · '+Math.round(fps)+'fps':'')+(lost?' · 丢'+lost:'');
+      $('vhud').style.display='block';
+    }catch(e){}
+  }, 2000);
+}
+function stopStats(){ clearInterval(statsT); $('vhud').style.display='none'; }
+$('vretry').onclick = playWHEP;
+$('vfull').onclick = () => {
+  const w = $('videoWrap');
+  if(document.fullscreenElement) document.exitFullscreen();
+  else (w.requestFullscreen ? w.requestFullscreen() : w.webkitRequestFullscreen());
+};
+document.addEventListener('visibilitychange', () => { if(document.hidden) stopWHEP(); else playWHEP(); });
+if(!document.hidden) playWHEP();
+
+/* ============ 控制: 直连板载 API ============ */
+const API = '';                       // 同源, 直接用相对路径
+
+/* 页面自报家门 (2026-10-05)
+ *
+ * 排查"按了没反应"时最怕的一件事: **浏览器里跑的是哪一版前端?**
+ * 之前真实踩过: 用户页面是上午打开的, 前端傍晚才改, 于是怎么查板子都正常,
+ * 问题却在页面里。这里让页面在加载时报一次身份 + 控制参数, 板子记到
+ * /userdata/pageinfo.log。日志里没有这一条 = 跑的是旧页面。 */
+const PAGE_ID = 'v23a';
+function sendPageInfo(){
+  // ⚠️ 必须在**所有常量定义之后**调用: 这里引用的 CTL_TICK_MS/HB_MS/
+  // SEND_MIN_GAP/REQ_TIMEOUT 都是 const, 提前引用会抛 TDZ ReferenceError,
+  // 被下面的 catch 吞掉 -> 信标永远发不出去 (第一次就踩了这个坑:
+  // pageinfo.log 一直是空的)。所以调用点放在脚本最末尾。
+  try{
+    fetch(API+'/api/pageinfo', {
+      method:'POST', cache:'no-store',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({page: PAGE_ID, tick: CTL_TICK_MS, hb: HB_MS,
+                            gap: SEND_MIN_GAP, to: REQ_TIMEOUT,
+                            ua: navigator.userAgent})
+    }).catch(()=>{});
+  }catch(e){}
+}
+let apiOk = false, failCount = 0;
+
+/* 体积/速率单位自适应。
+ * 原来 HUD 固定除以 1e6 显示 MB/s, 码率低时会显示 "0.04MB/s" —— 数字小得
+ * 读不出来。统一走这个函数: 按量级自动选 B / KB / MB / GB, 并给合适的小数位。
+ *   999        -> "999B"
+ *   41943      -> "41KB"
+ *   1572864    -> "1.5MB"
+ */
+function fmtBytes(n){
+  if(n == null || isNaN(n)) return '--';
+  const u = ['B','KB','MB','GB'];
+  let i = 0, v = Math.abs(n);
+  while(v >= 1024 && i < u.length-1){ v /= 1024; i++; }
+  // B/KB/GB 用整数就够, MB 留一位 (带宽抖动看得更清楚)
+  const t = (i === 2) ? v.toFixed(1) : Math.round(v);
+  return (n < 0 ? '-' : '') + t + u[i];
+}
+
+/* 速率专用: 在上面基础上加 "/s" */
+function fmtRate(n){ return fmtBytes(n) + '/s'; }
+
+
+function setApi(cls, txt){ $('pillApi').className='pill '+cls; $('apiTxt').textContent=txt; }
+
+async function api(path, body){
+  try{
+    const opt = body ? {method:'POST', headers:{'Content-Type':'application/json'},
+                        body: JSON.stringify(body)} : {};
+    const r = await fetch(API+path, Object.assign({cache:'no-store'}, opt));
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    apiOk = true; failCount = 0; setApi('ok','板载直连');
+    return body ? await r.json().catch(()=>({})) : await r.json();
+  }catch(e){
+    apiOk = false; failCount++;
+    if(failCount > 2) setApi('bad','板子离线');
+    return null;
+  }
+}
+
+/* 遥测轮询。同样加在途保护: setInterval 不等异步回调, 状态接口一旦超过 1s
+   就会叠请求, 进一步挤占控制指令的带宽。 */
+let polling = false;
+let pageVer = null;      // 本页面加载时看到的 index.html 版本 (mtime)
+async function poll(){
+  if(polling) return;
+  polling = true;
+  try{
+    const st = await api('/api/status');
+    if(st) { checkPageVer(st); render(st); }
+  } finally { polling = false; }
+}
+setInterval(poll, 1000); poll();
+
+/* 陈旧页面自检 (2026-10-05)
+ *
+ * 踩过的真实故障: 用户浏览器里那个页面是**上午就打开的**, 而前端控制循环是
+ * 傍晚才改的。旧页面继续跑旧 JS ("只在数值变化时才发"), 板子的 1 秒失控保护
+ * 被反复触发 —— 用户看到"车走走停停", 而从板子侧查什么都是好的。
+ * 现在 /api/status 带回 index.html 的 mtime, 页面发现它变了就自动重载一次,
+ * 不用再指望用户手动 Ctrl+F5。 */
+function checkPageVer(st){
+  // 顺便取回"失控超时是否过短"的警告 (板子侧统计出来的误停率)
+  if(st && st.failsafe_cfg){
+    fsWarn = st.failsafe_cfg.warning || null;
+  }
+  if(!st || !st.ver) return;
+  if(pageVer === null){ pageVer = st.ver; return; }
+  if(st.ver !== pageVer){
+    pageVer = st.ver;                 // 先记下, 避免重载风暴
+    setApi('warn','页面已更新, 正在重载…');
+    setTimeout(() => location.reload(), 300);
+  }
+}
+
+/* 控制: 5Hz 心跳 + 只保留最新一帧
+   每条请求都会在 C5 上开关一个反代会话 (18KB 缓冲), 20Hz 连发曾把 C5 堆打爆
+   导致图传掉线; keep-alive 复用 + 降频后只剩一条常驻连接。
+
+   2026-10-02 修复: 原来直接 setInterval(...,100) 里裸调 api(), 既不 await 也
+   没有在途标记。setInterval 不会等异步回调结束, 所以只要一次往返超过 100ms
+   (过隧道时很常见), 就会不断往同一条 keep-alive 连接上叠加新请求, 排队的
+   指令越积越多 —— 表现就是"越用越卡、松手后车还在动"。
+   改为: 只保留最新一帧目标状态(pending), 且同一时刻最多一个请求在途。
+
+   ⚠️ 2026-10-05 修复 (安全关键): 原来还看 `if(m !== lastMove)` —— **只在数值
+   变化时才发**。按住摇杆不动时一条都不发, 板子就永远保持最后那组向量。
+   而板子端现在有**失控保护** (1 秒收不到指令就停车), 所以那种写法会变成
+   "按住不动 -> 被误判失联 -> 车走走停停"。
+
+   现在只要在动就**每 100ms 发一次当前向量**, 这才是真正的遥控链路语义:
+     * 按住不动  -> 心跳持续, 车正常走
+     * 松手/断网/页面崩/锁屏 -> 1 秒内板子自动停车
+   仍然只保留最新一帧, 旧指令直接丢弃 (摇杆控制想要的正是这个语义)。
+
+   为什么是 100ms 而不是我刚改成过的 200ms:
+     轮询间隔会**直接叠加**到人的感知延迟上 —— 最坏情况要等一整个周期
+     才把指令发出去。100ms 周期 + 约 18ms 往返 = 最坏 ~118ms;
+     200ms 周期就是最坏 ~218ms, 手感明显发木。
+     1 秒的失控超时对 100ms 心跳仍有 **10 次**机会, 安全性完全不受影响。 */
+/* ⚠️ 2026-10-05 第 23 轮 (延迟专项): 改成"变化即发 + 超时保护"
+ *
+ * 上一版是**固定 100ms 周期无条件发**, 有两个硬伤:
+ *
+ *  1) 人的操作最坏要等一整个周期才被送出去 (0~100ms, 平均 50ms),
+ *     这一段纯粹是白送的延迟 —— 摇杆一动就该立刻发。
+ *
+ *  2) `sending` 标记把下一次发送**卡在响应回来之前**: 单连接上一条响应
+ *     慢多久, 心跳就断多久。实测隧道在**图传负载**下控制往返会从
+ *     23ms 涨到 95ms (p90 121 / max 151), 丢包重传时能到 1 秒以上 ——
+ *     于是板子的 1 秒失控保护被**误判触发**, 车一抖就停, 表现为
+ *     "走走停停 / 手感发木"。实测 /userdata/failsafe.log 里 9 分钟内
+ *     触发了 20 次, 全部集中在用户驾驶时段。
+ *
+ * 现在:
+ *   * 25ms 巡检, **目标向量一变就立刻发**(前导沿), 最短间隔 SEND_MIN_GAP
+ *   * 值没变时按 HB_MS 发心跳, 维持失控保护 (不动就不发, 省隧道)
+ *   * 单次请求 REQ_TIMEOUT 超时即 abort, 立刻恢复发送 —— 卡住的响应
+ *     再也不可能拖掉心跳链路 (最坏心跳间隔 ≈ REQ_TIMEOUT < 1s)
+ *   * 仍然只保留最新一帧 (旧指令直接丢), 这是摇杆该有的语义
+ */
+/* ⚠️ 2026-10-05 第 26 轮: 修"延迟一直累计" (用户报的)
+ *
+ * 症状 (我自己的测试复现出来了): 按住摇杆不放, 页面上的数字一路涨 ——
+ *     "心跳 1 · 23975ms"     ← 20 秒里**只发出 1 条指令**, 之后再也不发
+ * 同时车被失控保护反复停车, 手感就是"延迟一直累计、越用越不动"。
+ *
+ * 根因在**两条时间线的混淆**:
+ *   * 心跳的判据 `now - ctlLastAt >= HB_MS` 用的是"上次**发出**的时刻"
+ *   * 而 `ctlLastAt` 在**每个新目标**上都会被刷新 (ctlFlush 里赋值)
+ *
+ * 于是一旦输入在动 (摇杆每秒产生几十次新的向量), 每条新指令都把
+ * `ctlLastAt` 推到"现在" —— **心跳永远等不到 100ms 间隔**, 一条都发不出去。
+ * 停手以后输入不再变化, 心跳才开始发。这正是"按住开着开着就不动了"。
+ *
+ * 修法: 把两个节拍**彻底分开**:
+ *   * `ctlLastAt` 只管"连发限速" (SEND_MIN_GAP)
+ *   * `ctlLastHb` 只管"心跳节拍" (HB_MS) —— 只有心跳发出去才刷新它
+ *
+ * 另外: 把巡检 `setInterval(ctlTick, 25)` 换成**自调度 setTimeout**。
+ *   setInterval 在页面被浏览器降频 (后台标签/省电模式/负载高) 时会整体变慢,
+ *   心跳跟着稀掉 -> 板子 1 秒收不到就停车。自调度只看"到点了没有",
+ *   晚到就立刻补发, 不会把延迟累加进去。
+ */
+const SEND_MIN_GAP = 60;   // 连发最短间隔: 最坏 16Hz, 保护 C5 与单核板子
+const HB_MS        = 100;  // 心跳周期
+/* ⚠️ 请求超时必须**小于**失控超时, 否则会自己把自己玩死:
+ *
+ *   失控超时现在是 0.5s, 而请求超时原来是 400ms —— 只剩 100ms 余量。
+ *   只要有一次请求卡满 400ms 被 abort, 板子那边就 400ms 没收到指令,
+ *   离被误停只差一点; 连续两次就直接停车。
+ *
+ *   所以请求超时取**失控超时的一半**, 保证"一次中止 + 立刻重发"之后
+ *   仍然远没到失控超时。这样单次卡顿不会演变成停车。
+ *   (实测链路 p90 RTT = 401ms 的那种卡顿, 正好卡在 400ms 线上,
+ *    这就是之前 31 次发送里 15 次失败的直接原因。)
+ */
+const CTL_TIMEOUT_MS = 250;                                   // 见上, 取失控超时的一半
+const REQ_TIMEOUT  = CTL_TIMEOUT_MS;   // (兼容旧引用)
+const CTL_TICK_MS  = 25;   // 巡检周期: 只影响"发现变化"的粒度
+
+let vx=0, vy=0, rot=0, speed=30;
+let ctlSending = false;        // 有请求在途
+let ctlPending = null;         // 待发送的最新状态
+let ctlLastAt  = 0;            // 上次**发出**的时刻 (限速用)
+let ctlLastHb  = 0;            // 上次**心跳**发出的时刻 (心跳节拍用, 与限速无关)
+let ctlLastKey = null;         // 上次发出的向量指纹
+let ctlSent = 0, ctlFail = 0;
+
+/* 页面上的心跳指示灯 —— 用户能自己看到"页面到底有没有在发指令"
+ *
+ * 显示"距上次**发出**多久"和"当前往返 RTT"两个数:
+ *   * age 一直涨 = 心跳断了 (该查链路)
+ *   * rtt 一直涨 = 单条指令越来越慢 (该查排队)
+ * 这两个数分开显示, 才能一眼区分"没发出去"和"发出去回不来"。 */
+let ctlRtt = -1;
+let fsWarn = null;          // 板子报的"失控超时过短"警告
+/* 心跳条的文字要**自解释**, 不能让人猜:
+ *   心跳 N          = 本次页面加载后成功发出的控制指令总数
+ *   · xxms          = 距**上一次发出**过了多久 (按住摇杆时应一直 <150ms;
+ *                     这个数一直变大 = 页面没在发指令 = 车会被失控保护停掉)
+ *   · RTT xxms      = 最近一条指令的往返时间
+ *   · ⚠ ...         = 板子侧判定"失控超时太短, 正在误停"
+ * 之前只写数字没写单位含义, 用户看到 "心跳 1 · 23975ms" 完全不知道是什么。
+ */
+function updHb(){
+  const el = document.getElementById('hbTxt');
+  if(!el) return;
+  const age = ctlLastAt ? Math.round(performance.now() - ctlLastAt) : -1;
+  const stale = (age > 500);
+  el.textContent = `已发 ${ctlSent} 条${ctlFail ? (' · 失败 ' + ctlFail) : ''}`
+                 + ` · 距上次发出 ${age < 0 ? '--' : age + 'ms'}`
+                 + (ctlRtt >= 0 ? ` · RTT ${Math.round(ctlRtt)}ms` : '')
+                 + (stale && ctlSent > 0 ? ' · 已停发!' : '')
+                 + (fsWarn ? ` · ⚠ ${fsWarn}` : '');
+  el.title = '第 1 个数=页面累计成功发出的控制指令数; 第 2 个=距上次发出多久'
+           + ' (按住摇杆时应 <150ms, 一直变大就是页面没在发指令了);'
+           + ' 第 3 个=最近一条指令的往返时间。';
+  const bad = (ctlFail > 0 && ctlSent > 0 && ctlFail > ctlSent * 0.3) || ctlRtt > 300 || fsWarn;
+  el.style.color = bad ? '#f85149' : ((ctlRtt > 150 || stale) ? '#d29922' : '');
+}
+setInterval(updHb, 200);
+
+function ctlTarget(){
+  const w = rot/100;
+  const still = Math.abs(vx)<0.02 && Math.abs(vy)<0.02 && Math.abs(w)<0.02;
+  if(still) return {path:'/api/cmd', body:{c:'stop'},
+                    key:'stop', still:true, hb:false};
+  const b = {vx:+vx.toFixed(2), vy:+vy.toFixed(2), w:+w.toFixed(2), s:speed};
+  return {path:'/api/move', body:b,
+          key:'m:'+b.vx+','+b.vy+','+b.w+','+b.s, still:false, hb:false};
+}
+
+async function ctlSend(cmd){
+  ctlSending = true;
+  const t0 = performance.now();
+  const ac = new AbortController();
+  const to = setTimeout(() => ac.abort(), REQ_TIMEOUT);
+  try{
+    const r = await fetch(API+cmd.path, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(cmd.body),
+      cache:'no-store',
+      signal: ac.signal
+    });
+    apiOk = true; failCount = 0; setApi('ok','板载直连');
+    ctlSent++;
+    ctlRtt = performance.now() - t0;
+    try{ await r.json(); }catch(e){}     // 读掉响应体, 否则 keep-alive 半读卡住
+  }catch(e){
+    apiOk = false; failCount++; ctlFail++;
+    if(failCount > 2) setApi('bad','板子离线');
+  }finally{
+    clearTimeout(to);
+    ctlSending = false;
+    if(ctlPending) ctlFlush();
+  }
+}
+
+/* ---- 自调度 ------------------------------------------------------------------
+ *
+ * ⚠️ 2026-10-05 第 26 轮: **不要用自调度 (setTimeout 链) 驱动控制循环。**
+ *
+ * 我先按"setInterval 会被浏览器降频"的思路把它改成 `setTimeout` 自调度,
+ * 结果实测 (真 Chromium + CDP 插桩) 是这样的:
+ *
+ *     t=1s  tick=0   ← 循环根本没在跑
+ *     t=2s  tick=1   ← 只有看门狗把它拉起来时才跑一拍
+ *     t=4s  tick=2   ← 又停了一秒
+ *     t=5s  tick=3
+ *     ...
+ *     → 1 秒才 1 拍, 中间全靠 1 秒的看门狗兜底
+ *
+ * 也就是说: **自调度链在我这里变成了 1Hz**, 而心跳判据是 100ms ——
+ * 于是指令发得极稀, 车被失控保护反复停车; 用户看到的"延迟一直累计"
+ * 有一半是这个 (数字是"距上次发出多久", 循环不跑它就一直涨)。
+ *
+ * 原因: `ctlSchedule` 用的是模块级 `ctlTimer` + 每次 tick 重排,
+ * 只要有一次调度没接上 (或被别的东西清掉), 链条就断了, 再也不会自己醒 ——
+ * 而它**看上去**一切正常 (摇杆能动、数字在跳)。
+ *
+ * 结论: 控制循环用 **setInterval** (浏览器保证持续触发, 不会"断链"),
+ * 只把"精确补发"交给 setTimeout。反过来才是对的。
+ * 页面被降频的风险由**心跳判据用时间戳**来吸收: 只要醒来发现已经超过
+ * HB_MS, 立刻补一条, 晚到就晚到, 不会漏。
+ */
+/* 控制循环用 setInterval 驱动 (持续, 不会断链), 25ms 巡检。
+ *
+ * ⚠️ 这个变量必须**在 setInterval 之前**定义: 脚本是顺序执行的,
+ *    定时器在下面注册, 而第一次回调可能在 `let` 初始化之前就触发 ——
+ *    那就出 TDZ ReferenceError, 而且是在定时器回调里抛, **页面毫无迹象**
+ *    (控制循环从此再也不跑, 用户只看到"按了没反应")。所以放最前面。
+ */
+let ctlTimer = null;
+let ctlTimerBusy = false;
+let ctlTickAt = 0;             // 上次巡检的时刻 (看门狗用)
+let ctlTickErr = 0;            // 看门狗重新点火的次数
+let ctlErr = '';               // 最近一次控制循环异常 (诊断用)
+
+function ctlSchedule(delay){
+  if(ctlTimer) return;
+  ctlTimerBusy = true;
+  ctlTimer = setTimeout(() => { ctlTimer = null; ctlTimerBusy = false; ctlFlush(); }, Math.max(0, delay));
+}
+
+function ctlFlush(){
+  if(ctlSending || !ctlPending) return;
+  const now = performance.now();
+  const since = now - ctlLastAt;
+  if(since < SEND_MIN_GAP){
+    ctlSchedule(SEND_MIN_GAP - since);       // 精确等到可以发
+    return;
+  }
+  const cmd = ctlPending; ctlPending = null;
+  ctlLastAt = now;
+  ctlLastKey = cmd.key;
+  if(cmd.hb) ctlLastHb = now;                // 只有心跳才推进心跳节拍
+  ctlSend(cmd);
+}
+
+function ctlTick(){
+  ctlTickAt = performance.now();
+  const cmd = ctlTarget();
+  const now = performance.now();
+  if(cmd.key !== ctlLastKey){
+    // 目标变了 -> 立刻发 (stop 只发一次, 之后靠板子的失控保护)
+    ctlPending = cmd;
+  }else if(!cmd.still && now - ctlLastHb >= HB_MS){
+    // 没变但在动 -> 心跳
+    //
+    // ⚠️ 判据必须是 ctlLastHb, **不能**用 ctlLastAt:
+    //     ctlLastAt 在每条"因变化而发"的指令上都会刷新, 而摇杆每秒产生
+    //     几十次的向量变化 —— 用它当判据, 心跳永远等不到 100ms 间隔,
+    //     一条都发不出去。这就是"按住开着开着就不动了"的机制。
+    ctlPending = {path:cmd.path, body:cmd.body, key:cmd.key, still:false, hb:true};
+  }
+  ctlFlush();
+}
+
+/* 控制循环: setInterval 驱动 (持续, 不会断链), 25ms 巡检 */
+setInterval(ctlTick, CTL_TICK_MS);
+
+/* 看门狗只作为最后一道保险: 万一 interval 真被停了, 1 秒内把它拉回来。
+ * 正常情况下 ctlTickErr 应该长期为 0 —— 它不为 0 就说明巡检没在跑。 */
+setInterval(() => {
+  if(performance.now() - ctlTickAt > 1000){
+    ctlTickErr++;
+    try { ctlTick(); } catch(e) { ctlErr = String((e && e.stack) || e); }
+  }
+}, 1000);
+
+ctlTick();
+
+function updOut(){
+  $('vxTxt').textContent = vx.toFixed(2);
+  $('vyTxt').textContent = vy.toFixed(2);
+  $('wTxt').textContent = (rot/100).toFixed(2);
+}
+
+/* ---- 摇杆 ---- */
+const stick = $('stick'), knob = $('knob');
+let dragId = null;
+function stickMove(cx, cy){
+  const r = stick.getBoundingClientRect();
+  const cx0 = r.left + r.width/2, cy0 = r.top + r.height/2;
+  let dx = (cx-cx0)/(r.width/2), dy = (cy-cy0)/(r.height/2);
+  const len = Math.hypot(dx, dy);
+  if(len > 1){ dx/=len; dy/=len; }
+  vx = dx; vy = -dy;
+  if(Math.abs(vx) < 0.08) vx = 0;
+  if(Math.abs(vy) < 0.08) vy = 0;
+  knob.style.transform = `translate(calc(-50% + ${vx*38}%),calc(-50% + ${-vy*38}%))`;
+  updOut();
+}
+function stickEnd(){
+  dragId = null; stick.classList.remove('active');
+  vx = 0; vy = 0;
+  knob.style.transform = 'translate(-50%,-50%)';
+  updOut();
+}
+stick.addEventListener('pointerdown', e => {
+  dragId = e.pointerId; stick.setPointerCapture(dragId);
+  stick.classList.add('active'); stickMove(e.clientX, e.clientY); e.preventDefault();
+});
+stick.addEventListener('pointermove', e => { if(e.pointerId===dragId) stickMove(e.clientX,e.clientY); });
+stick.addEventListener('pointerup', e => { if(e.pointerId===dragId) stickEnd(); });
+stick.addEventListener('pointercancel', e => { if(e.pointerId===dragId) stickEnd(); });
+
+$('rot').addEventListener('input', e => { rot = +e.target.value; $('rotN').textContent = rot; updOut(); });
+$('spd').addEventListener('input', e => { speed = +e.target.value; $('spdN').textContent = speed;
+  api('/api/speed', {s:speed}); });
+
+/* ============ 摄像头曝光档位 ============
+ * ⚠️ 这里原来是两个"实时"滑块 (曝光/增益), 直接写 /dev/v4l-subdev2。
+ * **那个做法在这块板子上根本无效**, 已删除。实测结论:
+ *
+ *   1) 写 exposure=500 立刻回读是 500, 但 **800ms 后变回 408** ——
+ *      自动曝光跑在 rkaiq 用户态 ISP 里, V4L2 层没有任何开关能关掉它
+ *      (枚举了全部 5 个 subdev, 都没有 auto_exposure/exposure_auto)。
+ *      原来的"锁定"想靠每 0.5 秒重写来压住 AE, 但每秒 25 帧的 AE 根本
+ *      压不住, 而且锁的还总是 AE 自己刚写的值。
+ *   2) 把 rkipc 切成 manual 模式后, 那个寄存器会被 ISP 按 exposure_time
+ *      重新推导 —— 用户写什么仍然不算数。
+ *
+ *   **真正有效的是 rkipc 层的 exposure_time 档位** (干净启动实测):
+ *       1/1000 -> v4l2 exposure=41     gain=7731
+ *       1/100  -> v4l2 exposure=408    gain=771
+ *       1/25   -> v4l2 exposure=1624   gain=197
+ *       auto   -> v4l2 exposure=408    gain=803
+ *   单调、可控。代价是要改 ini + 重启 rkipc (约 20-30 秒), 和画质档位
+ *   是同一个机制, 所以 UI 也做成一样的一排按钮。
+ *
+ * 增益保持 auto: 曝光固定后由增益补偿亮度, 选快档画面也不会整体变黑。
+ */
+let expBusy = false;
+let expList = [];
+
+function renderExps(v){
+  const box = $('expBtns');
+  if(!box) return;
+  const cur = v.current || {};
+  expList = v.profiles || [];
+  box.innerHTML = expList.map(p =>
+    '<button class="b ghost" data-e="'+p.key+'" title="'+p.desc+'">'+
+    p.label+'</button>').join('');
+  box.querySelectorAll('button').forEach(b => {
+    const on = (b.dataset.e === cur.key);
+    b.style.background = on ? '#1f6feb' : '';
+    b.style.color = on ? '#fff' : '';
+    b.onclick = () => switchExp(b.dataset.e);
+  });
+  if(cur.key === null){
+    $('expHint').textContent = '当前非预设档位 (手动 '+(cur.exposure_time||'?')+')';
+  }
+}
+
+async function switchExp(key){
+  if(expBusy) return;
+  expBusy = true;
+  const btns = $('expBtns').querySelectorAll('button');
+  btns.forEach(b => b.disabled = true);
+  $('expHint').textContent = '切换中… 视频会中断约 20 秒, 请稍候';
+  try{
+    const r = await api('/api/exposure', {profile: key});
+    if(r && r.ok){
+      $('expHint').textContent = r.msg || '已切换';
+      renderExps(r.exposure || {});
+      // rkipc 重启后 WebRTC 会话会断, 主动重连一次
+      setTimeout(() => { try{ playWHEP(); }catch(e){} }, 1500);
+    }else{
+      $('expHint').textContent = '切换失败: ' + ((r && (r.msg||r.err)) || '未知错误');
+    }
+  }catch(e){
+    $('expHint').textContent = '切换失败: ' + e;
+  }finally{
+    expBusy = false;
+    btns.forEach(b => b.disabled = false);
+  }
+}
+
+async function pollExposure(){
+  const v = await api('/api/exposure');
+  if(v && v.ok && !expBusy) renderExps(v);
+}
+pollExposure();
+setInterval(pollExposure, 5000);
+
+/* ============ 画质档位切换 ============
+ * 档位 = 分辨率 + 码率的预设组合, 由板子上的 video_ctl.py 管理。
+ *
+ * 切换会重启 rkipc, 画面中断约 20 秒 —— 这是必然代价 (改配置必须重启
+ * 才生效)。所以切换期间要: 禁用按钮 + 明确提示, 并且视频要主动重连。
+ *
+ * 服务端会**验证 RTSP 是否真的起来了**再回成功 (重启 rkipc 有 554
+ * socket 残留的已知问题), 所以失败时能给出明确原因而不是静默黑屏。
+ */
+let profBusy = false;
+let profList = [];
+
+function renderProfs(v){
+  const box = $('profBtns');
+  if(!box) return;
+  const cur = v.current || {};
+  profList = v.profiles || [];
+  box.innerHTML = profList.map(p =>
+    '<button class="b ghost" data-p="'+p.key+'" title="'+p.desc+'">'+
+    p.label+'</button>').join('');
+  box.querySelectorAll('button').forEach(b => {
+    const on = (b.dataset.p === cur.key);
+    b.style.background = on ? '#1f6feb' : '';
+    b.style.color = on ? '#fff' : '';
+    b.onclick = () => switchProf(b.dataset.p);
+  });
+  if(cur.width && !cur.key){
+    $('profHint').textContent = '当前 '+cur.width+'px (非预设档位)';
+  }
+}
+
+async function switchProf(key){
+  if(profBusy) return;
+  profBusy = true;
+  const btns = $('profBtns').querySelectorAll('button');
+  btns.forEach(b => b.disabled = true);
+  $('profHint').textContent = '切换中… 视频会中断约 20 秒, 请稍候';
+  try{
+    const r = await api('/api/video', {profile: key});
+    if(r && r.ok){
+      $('profHint').textContent = r.msg || '已切换';
+      renderProfs(r.video || {});
+      // rkipc 重启后 WebRTC 会话会断, 主动重连一次
+      setTimeout(() => { try{ playWHEP(); }catch(e){} }, 1500);
+    }else{
+      $('profHint').textContent = '切换失败: ' + ((r && (r.msg||r.err)) || '未知错误');
+    }
+  }catch(e){
+    $('profHint').textContent = '切换失败: ' + e;
+  }finally{
+    profBusy = false;
+    btns.forEach(b => b.disabled = false);
+  }
+}
+
+async function pollVideo(){
+  const v = await api('/api/video');
+  if(v && v.ok) renderProfs(v);
+}
+pollVideo();
+setInterval(pollVideo, 5000);
+
+$('btnStop').onclick = () => {
+  vx = vy = 0; rot = 0; $('rot').value = 0; $('rotN').textContent = '0';
+  knob.style.transform = 'translate(-50%,-50%)'; updOut(); api('/api/cmd', {c:'stop'});
+};
+$('btnCenter').onclick = () => { stickEnd(); api('/api/cmd', {c:'stop'}); };
+$('btnBrake').onclick = () => {
+  vx = vy = 0; rot = 0; $('rot').value = 0; $('rotN').textContent = '0';
+  knob.style.transform = 'translate(-50%,-50%)'; updOut(); api('/api/cmd', {c:'brake'});
+};
+
+/* ---- 键盘 ---- */
+const keys = {};
+function keyApply(){
+  let x=0, y=0;
+  if(keys['w']||keys['arrowup']) y += 1;
+  if(keys['s']||keys['arrowdown']) y -= 1;
+  if(keys['a']||keys['arrowleft']) x -= 1;
+  if(keys['d']||keys['arrowright']) x += 1;
+  let r = 0;
+  /* Q = 左转, E = 右转.
+   * The sign convention here is inverted relative to car_motor.drive()'s docs
+   * ("w + = 逆时针/左转"): on this build a positive w turns the car right, so
+   * Q must map to a NEGATIVE w to actually turn left. Verified against the
+   * real car -- Q/E were swapped, which is exactly this inversion. */
+  if(keys['e']) r += 1;   /* E -> w +  -> 右转 */
+  if(keys['q']) r -= 1;   /* Q -> w -  -> 左转 */
+  vx = Math.max(-1,Math.min(1,x)); vy = Math.max(-1,Math.min(1,y)); rot = r*100;
+  $('rot').value = rot; $('rotN').textContent = rot;
+  knob.style.transform = `translate(calc(-50% + ${vx*38}%),calc(-50% + ${-vy*38}%))`;
+  updOut();
+}
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if(k === ' '){ $('btnStop').click(); e.preventDefault(); return; }
+  if('wasdqe'.includes(k) || k.startsWith('arrow')){ keys[k] = 1; keyApply(); e.preventDefault(); }
+});
+addEventListener('keyup', e => { const k = e.key.toLowerCase(); if(keys[k]){ delete keys[k]; keyApply(); } });
+
+/* ---- 渲染遥测 ---- */
+const DIRN = {stop:'停止',brake:'刹车',forward:'前进',backward:'后退',
+  spin_left:'左转',spin_right:'右转',strafe_left:'左移',strafe_right:'右移',move:'摇杆'};
+function render(st){
+  const t = st.tel || {};
+  if(t.bat_v != null){
+    const v = t.bat_v, low = 10.5, high = 12.0;
+    $('batV').textContent = v.toFixed(2)+' V';
+    $('batS').textContent = 'ADC '+Math.round(t.bat_mv||0)+' mV';
+    let cls='mid', col='#d29922';
+    if(v < low){ cls='off'; col='#f85149'; } else if(v >= high){ cls='on'; col='#3fb950'; }
+    $('batDot').className = 'dot '+cls;
+    $('batBar').style.width = Math.max(0,Math.min(100,(v-low)/(12.6-low)*100))+'%';
+    $('batBar').style.background = col;
+  }else{ $('batV').textContent='--'; $('batS').textContent='ADC 未接'; }
+  const g = t.gps || {};
+  if(g.present){
+    $('gpsDot').className = 'dot '+(g.fix?'on':'mid');
+    if(g.fix && g.lat!=null){
+      $('gpsV').textContent = g.lat.toFixed(5)+', '+g.lon.toFixed(5);
+      /* 地图链接必须用转换后的坐标, 不能用 GPS 原始值。
+       *
+       * GPS 给的是 WGS-84, 而百度用 BD-09、高德/腾讯用 GCJ-02。直接拿原始值
+       * 去百度, 在大连会偏约 1.3 公里 —— 看起来像定位不准, 其实是坐标系没换。
+       * bd_lat/bd_lon 和 gcj_lat/gcj_lon 由板子上的 web_server.py 算好
+       * (转换逻辑只在中国境内有效, 所以那边会判断 in_china)。 */
+      var links='';
+      if(g.bd_lat!=null){
+        links += '<a style="color:#58a6ff;text-decoration:none;margin-right:10px" '+
+          'target="_blank" href="https://map.baidu.com/?latlng='+
+          g.bd_lat+','+g.bd_lon+'">百度 ↗</a>';
+      }
+      if(g.gcj_lat!=null){
+        links += '<a style="color:#58a6ff;text-decoration:none" '+
+          'target="_blank" href="https://uri.amap.com/marker?position='+
+          g.gcj_lon+','+g.gcj_lat+'">高德 ↗</a>';
+      }
+      if(!links){
+        // 境外: 坐标不做偏移, 直接用原始值查谷歌
+        links = '<a style="color:#58a6ff;text-decoration:none" target="_blank" '+
+          'href="https://maps.google.com/?q='+g.lat+','+g.lon+'">地图 ↗</a>';
+      }
+      $('gpsA').innerHTML = links;
+    }else{ $('gpsV').textContent='搜星中…'; $('gpsA').textContent=''; }
+    $('gpsS').textContent = '卫星 '+(g.sats??'--')+(g.speed_kmh!=null?' · '+g.speed_kmh+'km/h':'');
+  }else{
+    $('gpsDot').className='dot off'; $('gpsV').textContent='未接';
+    $('gpsS').textContent='uart4 (6/7脚)'; $('gpsA').textContent='';
+  }
+  const n = t.net4g || {};
+  $('netDot').className = 'dot '+(n.present?'on':'off');
+  $('netV').textContent = n.present ? '在线' : '未接';
+  $('netS').textContent = n.module || '--';
+
+  /* ---- WiFi 信号 (来自 C5 桥接) ---- */
+  const w = t.c3 || {};
+  if(w.online && w.rssi != null && w.rssi !== 0){
+    const r = w.rssi;
+    // dBm -> 0..100% 直观刻度: -50 以上算满, -90 算 0
+    const pct = Math.max(0, Math.min(100, (r + 90) * (100/40)));
+    let col = '#3fb950', cls = 'on';
+    if(r <= -80){ col = '#f85149'; cls = 'off'; }
+    else if(r <= -70){ col = '#d29922'; cls = 'mid'; }
+    $('wifiDot').className = 'dot ' + cls;
+    $('wifiV').textContent = r + ' dBm · ' + (w.quality || '');
+    $('wifiBar').style.width = pct + '%';
+    $('wifiBar').style.background = col;
+    let extra = [];
+    if(w.heap_free != null) extra.push('堆 ' + fmtBytes(w.heap_free));
+    if(w.uptime_s != null) extra.push('在线 ' + Math.round(w.uptime_s) + 's');
+    $('wifiS').textContent = 'C5 ' + (w.ip || '') + (extra.length ? ' · ' + extra.join(' · ') : '');
+  }else{
+    $('wifiDot').className = 'dot off';
+    $('wifiV').textContent = '掉线';
+    $('wifiBar').style.width = '0%';
+    $('wifiS').textContent = 'C5 桥接无响应';
+  }
+
+  const live = st.mode === 'live';
+  $('carDot').className = 'dot '+(live?'on':'off');
+  $('carV').textContent = DIRN[st.dir] || st.dir || '--';
+  $('carS').textContent = '速度 '+st.speed+'%'+(live?'':' · 模拟');
+}
+
+/* 脚本末尾再报一次身份 —— 这里所有常量都已定义 (见 sendPageInfo 的说明) */
+sendPageInfo();
+</script>
+</body>
+</html>

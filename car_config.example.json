@@ -1,0 +1,32 @@
+{
+  "_说明": [
+    "这是 sanitized 模板, 真实凭据不在仓库里。",
+    "部署时把它拷成 car/car_config.json 并填入你的实际值:",
+    "  cp car_config.example.json car/car_config.json  然后改 broker/password/token",
+    "pin 段按你的实际接线改 (默认是与 MD240A + TB6612 对应的 GPIO 号)。"
+  ],
+  "mqtt": {
+    "broker": "YOUR_MQTT_BROKER",
+    "port": 1883,
+    "topic_cmd": "luckfox/car/cmd",
+    "topic_status": "luckfox/car/status",
+    "heartbeat": 5,
+    "username": "car",
+    "password": "YOUR_MQTT_PASSWORD",
+    "token": "YOUR_API_TOKEN"
+  },
+  "pin": {
+    "STBY": 7,
+    "FL": { "IN1": 65, "IN2": 64, "PWM": 67 },
+    "FR": { "IN1": 54, "IN2": 55, "PWM": 58 },
+    "BL": { "IN1": 56, "IN2": 57, "PWM": 68 },
+    "BR": { "IN1": 59, "IN2": 69, "PWM": 70 }
+  },
+  "failsafe_s": 0.5,
+  "telemetry": {
+    "adc_channel": 1,
+    "adc_ratio": 8.71,
+    "gps_enabled": true,
+    "check_4g": true
+  }
+}

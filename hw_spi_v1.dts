@@ -1,0 +1,73 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * Luckfox Pico Pro Max — 硬件配置 overlay (SPI 版)
+ *
+ * ⚠️ 本内核 DTB 无 __symbols__, overlay 里不能有 phandle 引用
+ *    => 只用纯字符串/数字属性
+ *
+ * 内容:
+ *  1) uart4 — GPS
+ *  2) uart2 — ESP32 PPP 网桥
+ *  3) USB host — 4G 模组
+ *  4) spi0  — ESP32 SPI 高速桥 (sclk/mosi/miso/cs)
+ *
+ * spi0m0 引脚 (已由 DTS 的 pinctrl-0 指定, 无需 overlay 再配):
+ *   clk  = GPIO1_C1 (49) 物理14
+ *   mosi = GPIO1_C2 (50) 物理15
+ *   miso = GPIO1_C3 (51) 物理16
+ *   cs0  = GPIO1_C0 (48) 物理12
+ *
+ * spidev@0 子节点已存在于板级 DTS, 只要 spi0 status=okay 就会注册
+ *   -> 会生成 /dev/spidev0.0
+ */
+
+/ {
+	/* ---------- uart4: GPS ---------- */
+	fragment@0 {
+		target-path = "/serial@ff4e0000";
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	/* ---------- uart2: ESP32 (备用/调试) ---------- */
+	fragment@1 {
+		target-path = "/serial@ff4c0000";
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	/* ---------- USB host ---------- */
+	fragment@2 {
+		target-path = "/usbdrd/usb@ffb00000";
+		__overlay__ {
+			dr_mode = "host";
+			status = "okay";
+		};
+	};
+
+	fragment@3 {
+		target-path = "/usb2-phy@ff3e0000/otg-port";
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@4 {
+		target-path = "/usbdrd";
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	/* ---------- spi0: ESP32 SPI 桥 ---------- */
+	fragment@5 {
+		target-path = "/spi@ff500000";
+		__overlay__ {
+			status = "okay";
+		};
+	};
+};
