@@ -1,277 +1,356 @@
-# Luckfox Pico Pro Max 遥控小车
+# Luckfox Pico Pro Max RC Car
 
-一台**单核 Linux 小车**的完整实现：摄像头图传、网页遥控、失控保护，
-以及本项目最核心的部分 —— **用 ESP32-C5 当 SPI 从机做的内核态网络隧道**。
+**English** · [中文](README.zh-CN.md)
+
+A complete implementation on a **single-core Linux board**: camera streaming, browser-based
+remote control, failsafe deadman, and the core of this project — a **kernel-mode network
+tunnel that uses an ESP32-C5 as an SPI slave**.
 
 ```
         ┌──────────────┐   WiFi    ┌────────────┐   SPI 20MHz   ┌─────────────────┐
-        │  浏览器/手机  │ ────────► │  ESP32-C5  │ ◄───────────► │  Luckfox RV1106 │
-        │  控制 + 图传  │           │  WiFi 桥   │  4096B 帧     │  单核 Cortex-A7 │
-        └──────────────┘           │ + NAPT     │               │  spitun.ko      │
+        │  Browser /   │ ────────► │  ESP32-C5  │ ◄───────────► │  Luckfox RV1106 │
+        │    Phone     │           │  WiFi br.  │  4096B frames │  single A7 core │
+        └──────────────┘           │  + NAPT    │               │  spitun.ko      │
                                    └────────────┘               └─────────────────┘
 ```
 
-板子本身在 WiFi 网段上**没有 IP** —— 它和外界唯一的通路就是那条 SPI 隧道。
+The board has **no IP address on the WiFi subnet** — the SPI tunnel is its only path
+to the outside world.
 
 ---
 
-## 目录结构
+## Layout
 
 ```
-firmware/c5-tunnel/     ESP32-C5 侧固件 (SPI 从机 + WiFi + NAPT)
-driver/spitun.c         板子侧内核模块: SPI 隧道 (核心)
+firmware/c5-tunnel/     ESP32-C5 firmware (SPI slave + WiFi + NAPT)
+driver/spitun.c         Board-side kernel module: the SPI tunnel (the core)
 board/
-  app/                  板子侧应用 (网页服务 / 电机 / 图传 / 摄像头 / GPS)
-  init.d/               开机启动链 (文件名与板子上**完全一致**, 见下表)
-  config/               配置模板 (car_config / mediamtx)
-  dts/                  SPI0 + spitun 节点的设备树 overlay
+  app/                  Board apps (web server / motors / video / camera / GPS)
+  init.d/               Boot chain (filenames match the device EXACTLY, see below)
+  config/               Config templates (car_config / mediamtx)
+  dts/                  Device-tree overlay for the SPI0 + spitun node
 tools/
-  build/                交叉编译 (内核 / 内核模块)
-  deploy/               部署 (整机部署 / 模块热替换 / 只刷 boot)
-  diagnose/             测量与观测 (控制延迟 / 失控保护 / SPI 丢帧 / TCP 重传)
-docs/                   文档与截图
+  build/                Cross-compilation (kernel / kernel module)
+  deploy/               Deploy (full deploy / module hot-swap / boot-only flash)
+  diagnose/             Measurement (control latency / failsafe / SPI loss / TCP retx)
+  npu/                  NPU person+pet detection (models, patched rkipc, probes)
+docs/                   Documentation and screenshots
 ```
 
-### 启动链（`board/init.d/`）
+### Boot chain (`board/init.d/`)
 
-脚本之间是**按名字互相调用**的（例如 `S24spinet_wd` 会调 `/etc/init.d/S22spinet restart`），
-所以仓库里的文件名和板子上**逐一对应、不做美化** —— 拷过去就能直接用，
-也避免"仓库名 ≠ 设备名"引发静默失效。用途写在每个文件头的 `# 用途:` 注释里：
+The scripts invoke **each other by name** (e.g. `S24spinet_wd` calls
+`/etc/init.d/S22spinet restart`), so the filenames here match the device
+**one-to-one and are deliberately not renamed** — copying them over just works,
+and it avoids silent failures from "repo name ≠ device name". Purpose is documented
+in a `# 用途:` (purpose) comment at the top of each file:
 
-| 文件 | 用途 |
+| File | Purpose |
 |---|---|
-| `S20lo` | `lo` 回环接口（板载服务要访问 127.0.0.1）|
-| `S21wdt` | 硬件看门狗（内核卡死时自动复位）|
-| `S22spinet` | **SPI 隧道接口**：给 `spitun0` 配地址 + 装回程策略路由 |
-| `S23web` | 板载网页控制服务（`web_server.py`，监听 :80）|
-| `S24spinet_wd` | **隧道看门狗**：假死/模块丢失时自动重启并撤/补回程路由 |
-| `S25mediamtx` | 图传服务（拉 rkipc 的 RTSP，出 WebRTC/HLS）|
+| `S20lo` | `lo` loopback (onboard services talk to 127.0.0.1) |
+| `S21wdt` | Hardware watchdog (resets the board if the kernel hangs) |
+| `S22spinet` | **SPI tunnel interface**: address `spitun0` + install the policy route |
+| `S23web` | Onboard web control service (`web_server.py`, listens on :80) |
+| `S24spinet_wd` | **Tunnel watchdog**: restarts on hang/module loss, fixes the route |
+| `S25mediamtx` | Video service (pulls rkipc's RTSP, serves WebRTC/HLS) |
 
-> **时钟**：这台板子**故意不设时区**，也没有任何校时脚本 ——
-> `/etc/TZ`、`/etc/localtime`、`S99rtcinit`、`S49ntp` 都被移除了。
-> `RTC == 系统时钟 == 北京时间读数`，零换算，所以摄像头 OSD 水印直接就是对的。
-> 原因和证据见 [`docs/TIME.md`](docs/TIME.md)（**修了五轮才找到根因，很值得一看**）。
+> **Clock**: this board **deliberately has no timezone** and no time-sync script.
+> `/etc/TZ`, `/etc/localtime`, `S99rtcinit` and `S49ntp` were all removed.
+> `RTC == system clock == Beijing wall-clock reading`, zero conversion, so the
+> camera's burned-in OSD timestamp is simply correct.
+> Root cause and evidence: [`docs/TIME.md`](docs/TIME.md) —
+> **it took five failed attempts to find the real cause; worth a read.**
 
-> 注：`S22spinet` / `S24spinet_wd` 里的 "spinet" 是**历史名字**（隧道曾经是用户态
-> Python 进程 `spinet.py`）。现在隧道在内核里，这两个脚本只负责配接口和看门狗。
-> 名字保留不改，是因为设备上就是这个名字，改了反而对不上。
+> Note: "spinet" in `S22spinet` / `S24spinet_wd` is a **historical name** (the tunnel
+> used to be a userspace Python process, `spinet.py`). The tunnel now lives in the
+> kernel; these two scripts only configure the interface and run the watchdog.
+> The names stay because that is what the device calls them.
 
-| 关心什么 | 看哪里 |
+### Where to look
+
+| Interested in | Read |
 |---|---|
-| 隧道怎么做的、为什么这么做 | `driver/spitun.c` + `docs/SPI_TUNNEL_DESIGN.md` |
-| 延迟瓶颈的实测分析 | `docs/SPI_LATENCY_ANALYSIS.md` |
-| **时钟为什么故意不设时区** | `docs/TIME.md` |
-| **改图传 / 重启 rkipc 的正确姿势** | `docs/VIDEO_RESTART.md`（踩坑换来的操作规程）|
-| **NPU 人/狗检测（已上线）** | `docs/NPU_DETECTION.md`（实测：可用、已持久化、控制延迟 +3ms）|
-| **部署"没生效"先查什么** | `docs/USERDATA_SPACE.md`（`/userdata` 只有 2.2MB）|
-| 完整的开发过程与踩坑记录 | `docs/PROGRESS.md` |
-| 硬件怎么接 | `docs/WIRING.md` |
-| 板上怎么部署 | `board/init.d/` + `tools/deploy/` |
-| 出问题怎么查 | `docs/ISSUES.md` + `tools/diagnose/` |
+| How the tunnel works and why | `driver/spitun.c` + `docs/SPI_TUNNEL_DESIGN.md` |
+| Measured latency-bottleneck analysis | `docs/SPI_LATENCY_ANALYSIS.md` |
+| **Why the clock has no timezone** | `docs/TIME.md` |
+| **The correct way to restart rkipc** | `docs/VIDEO_RESTART.md` (a procedure born from mistakes) |
+| **NPU person+pet detection (live)** | `docs/NPU_DETECTION.md` (measured: works, persistent, +3ms latency) |
+| **Deploy "didn't take effect" — check first** | `docs/USERDATA_SPACE.md` (`/userdata` is only 2.2MB) |
+| Full development log and pitfalls | `docs/PROGRESS.md` |
+| Hardware wiring | `docs/WIRING.md` |
+| Deploying to the board | `board/init.d/` + `tools/deploy/` |
+| Debugging | `docs/ISSUES.md` + `tools/diagnose/` |
 
 ---
 
-## 界面
+## Interface
 
-网页控制端（PC / 手机同一套，自适应）：
+Browser client (same page for PC and phone, responsive):
 
-![控制界面 - PC](docs/images/ui-desktop.png)
+![Control UI - desktop](docs/images/ui-desktop.png)
 
-| 手机端 | 遥测与调试面板 |
+| Mobile | Telemetry / debug panels |
 |---|---|
-| ![控制界面 - 手机](docs/images/ui-mobile.png) | ![调试面板](docs/images/ui-debug-panels.jpg) |
+| ![Control UI - mobile](docs/images/ui-mobile.png) | ![Debug panels](docs/images/ui-debug-panels.jpg) |
 
-画面上的控件做成**视频播放器风格**的 OSD（悬停/点画面才浮现），刻意做得小而精致，
-不喧宾夺主：
+### System status panel
 
-* **左上角 HUD（常驻）**：`RTT xxms · 图传 …`，紧贴在摄像头水印下方（两者错开不重叠）。
-  RTT 是控制指令的真实往返，一眼看出控制链路通不通。
-  **图传没连上时也一直显示**（图传段显示 `0B/s`）——图传断了的时候恰恰最需要看 RTT。
-  RTT 按延迟上色：<80ms 绿 / <200ms 黄 / 更高 红。
-* **底部控制条**：点「曝光 1/1000」「画质 720p」各自弹出**上弹菜单**（半透明，
-  能透出背后的画面），选完即关。
-* **失效保护告警** —— 板子统计"指令到达间隔超过失控超时的比例"（误停率），
-  超过 5% 时页面变红提示"超时过短，正在误停"。
+The page reads a `sys` snapshot that the board collects inside its **existing 1Hz
+telemetry loop** — the browser never triggers collection itself, so the panel adds
+**zero** load to the board (and ~570 bytes to the response).
 
-### 操作件：能按的就不拖
+```
+System status                     uptime 1h2m
+┌─────────────────┬─────────────────┐
+│ CPU      27%    │ MEM  56.1/180.2M│
+│ ████░░░░░░░░░░  │ █████░░░░░░░░░  │
+├─────────────────┼─────────────────┤
+│ NPU    in use   │ DET 15fps·rkipc │
+│ ██████████████  │ ██████████████  │
+└─────────────────┴─────────────────┘
+temp 50.0°C   load 11.5   root 108M free
+procs video✓ · streaming✓ · web✓ · python✓
+```
 
-面板上只留**一个**滑条（速度）和**一个**大按钮：
+Bar colours carry **two different meanings**, and mixing them is a real bug:
 
-* **原地转**：两个**圆角等腰直角三角形**按钮，贴在摇杆转盘的**左上角 / 右上角**。
-  直角在外侧上角、斜边朝内下（左上 `◤`、右上 `◥`，左右严格镜像），
-  三角里写着「左」「右」，文字放在三角形的**重心**上（实测居中偏差 0.0px）。
+| Row | Meaning | Colours |
+|---|---|---|
+| CPU / memory | **Utilisation** | more = worse (green <70%, yellow <90%, red above) |
+| NPU / detection | **On/off state** | full = healthy (green), not running = red |
+
+> A first version reused the utilisation colouring for all four rows, so "NPU in use"
+> rendered as a **full red bar** next to green text — it looked like a fault.
+> Caught by pixel-analysing a screenshot.
+
+### On-screen controls (OSD)
+
+Controls are styled like a **video player's OSD** (they fade in when you hover or tap
+the video) and are deliberately small so they don't cover the picture:
+
+* **Top-left HUD (always visible)**: `RTT xxms · video …`, placed just below the
+  camera's burned-in watermark so the two don't overlap. RTT is the true round-trip of
+  a control command — the fastest way to see whether the control link is healthy.
+  It **stays visible even when video is down** (`0B/s`), because that is exactly when
+  you need to know whether control still works. Colour-coded: <80ms green, <200ms yellow, above red.
+* **Bottom control bar**: tapping "exposure 1/1000" or "quality 720p" opens a
+  **pop-up menu** (semi-transparent, the video shows through), which closes on select.
+* **Failsafe warning** — the board tracks the fraction of command intervals that exceed
+  the deadman timeout ("false-stop rate") and turns the page red above 5%.
+
+### Controls: press, don't drag
+
+The panel has exactly **one** slider (speed) and **one** big button:
+
+* **Spin in place**: two **rounded isosceles right triangles** anchored to the
+  **top-left / top-right corners of the joystick disc**. The right angle is at the
+  outer top corner and the hypotenuse slopes inward-down (left `◤`, right `◥`, strictly
+  mirrored), each containing 左/右 (left/right) text placed on the triangle's
+  **centroid** (measured centring error: 0.0px).
 
   ```
   ╭──────────╮
-   ╲   左    │
+   ╲  left   │
     ╲        │
      ╲       │
       ╲      │
   ```
 
-  放在圆盘上角 + 尺寸够大（手机 86px），左右拇指自然落在那里，手掌不用移动。
-  三角压在圆盘的**方框空角**上（距圆心 222px > 半径 150px，实测），
-  所以完全不挡摇杆 —— 摇杆中心和「前」位置仍然正常可点。
-  原来"旋转"是根滑条 —— 开车时得先拖到某个位置再保持住，单手很难做到。
-  改成**按住就转、一松手立刻回正**，既是手感改进，也是天然的失效保护。
-  转向量在约 700ms 内平滑推到 ±70%，按住期间三角变蓝。
+  Sitting on the disc's corners and sized generously (86px on mobile) means both thumbs
+  land there naturally without moving your palm. The triangles sit over the disc's
+  **empty bounding-box corners** (222px from centre vs a 150px radius, measured), so
+  they never block the joystick — the centre and the "forward" zone remain clickable.
+  This replaced a rotation *slider*: holding a slider position one-handed is awkward,
+  whereas **hold to turn, release to recentre** is both better feel and a natural
+  failsafe. Turn amount ramps smoothly to ±70% over ~700ms and the triangle turns blue
+  while held.
 
-  > 实现用 **`clip-path: path()`**（SVG 路径）而不是 `polygon()`：
-  > `polygon()` 只有尖角、**做不了圆角**，而 `path()` 支持圆弧，可以给三个角
-  > 分别设半径（直角 r=12 圆润、两个锐角 r=4 保持锐利感）。
-  > 也不用 `border` 画三角 —— 那是伪元素，**里面放不了文字**。
-* **「■ 停止 / 回正」是一个按钮，两件事一起做**。原来是"停止 / 回正摇杆 / 刹车"
-  三个按钮，但开车时"停"和"回正"永远是同一个动作（急停之后摇杆当然要回中），
-  分成两个按钮只会让人在慌乱时点错。这一个按钮同时：归零运动矢量 →
-  **清空键盘按键状态** → 把摇杆圆点视觉弹回中心 → 停掉原地转并发 `stop`。
+  > Implemented with **`clip-path: path()`** (SVG path) rather than `polygon()`:
+  > `polygon()` has only sharp corners and **cannot round them**, while `path()`
+  > supports arcs, letting each corner get its own radius (r=12 at the right angle,
+  > r=4 at the two acute corners). `border`-drawn triangles were also ruled out —
+  > they are pseudo-elements and **cannot contain text**.
 
-> **两个踩过的坑（都实测复现过）**：
+* **"■ Stop / recentre" is one button doing both jobs.** It used to be three buttons
+  (stop / recentre stick / brake), but while driving, "stop" and "recentre" are always
+  the same action. Splitting them just invites a mis-tap under pressure. The single
+  button zeroes the motion vector → **clears keyboard state** → visually recentres the
+  knob → stops the spin and sends `stop`.
+
+> **Three pitfalls, all reproduced on hardware**:
 >
-> 1. **`setPointerCapture` 会让 `pointerleave` 永不触发**。三角按钮一开始加了
->    capture，结果"按住后把指针拖到别处，车还在原地转"——对遥控车是危险的。
->    现在不 capture，把 `pointerup/pointercancel` 绑在 window 上，并用
->    `pointerleave` 兜底。
-> 2. **停止按钮必须清空键盘按键状态**。否则"按住 `W` 的同时点停止"，
->    车会**立刻又走起来**（`keys` 里还留着 `w`，下一次 `keyApply` 又把它推回去）。
-> 3. **CSS `border` 画三角形时，两条透明边会得到等腰三角**，而且伪元素里
->    **放不了文字**。所以按钮形状改用 **`clip-path: polygon()`** ——
->    想要三角形的按钮 + 里面有字，就得裁按钮本身，不能靠 border。
->    （中间还走过一次弯路：先用 border 拼出"竖直边贴盘的箭头"，
->    方向对但形状和位置都不是要的，最后按"等腰直角三角 + 贴上角"重做。）
+> 1. **`setPointerCapture` makes `pointerleave` never fire.** The triangle buttons
+>    originally captured the pointer, which broke "hold, then drag the pointer away" —
+>    the car kept spinning. That is dangerous on an RC car. Now there is no capture;
+>    `pointerup/pointercancel` are bound on `window` and `pointerleave` covers the rest.
+> 2. **The stop button must clear keyboard state.** Otherwise "hold `W`, then click stop"
+>    makes the car **immediately drive again** (`w` is still in `keys`, and the next
+>    `keyApply` pushes it back).
+> 3. **`border`-drawn triangles with two transparent sides give an isosceles triangle**,
+>    and pseudo-elements cannot hold text. Shape is therefore cut from the button itself
+>    with `clip-path`. (There was also a detour: assembling "vertical edge against the
+>    disc" arrows out of borders — correct direction, wrong shape and position.)
 
-> **曝光/画质为什么也是"档位"而不是滑条**：ISP 参数在 rkipc 启动时就被固化，
-> 改任何摄像头参数都必须**重启 rkipc（约 20 秒画面中断）**——这是硬限制。
-> 所以做成离散档位，而不是拖一下就发一次的滑条。
-> 曝光档位实测有效（1/1000 → ISP exposure=41，1/25 → 1624，单调可控）；
-> 而直接写 `/dev/v4l-subdev2` 的"实时滑条"在这块板子上**完全无效**，
-> 写进去 800ms 后被 ISP 自动曝光覆盖掉，已删除。
+> **Why exposure/quality are presets, not sliders**: ISP parameters are latched when
+> rkipc starts, so changing any camera parameter requires **restarting rkipc (~20s of
+> video interruption)** — a hard constraint. Hence discrete presets.
+> Exposure presets are measurably effective (1/1000 → ISP exposure=41, 1/25 → 1624,
+> monotonic and controllable), whereas writing `/dev/v4l-subdev2` directly for a "live
+> slider" is **completely ineffective** on this board — the ISP auto-exposure overwrites
+> it within 800ms. That code was removed.
 
 ---
 
-## 为什么值得一看
+## Why it's worth a look
 
-这个项目里大部分代码不是"写出来"的，是**被单核 + 无重传 + 无 IP 通路这三重约束逼出来的**。
-每个非显然的设计决定，代码注释里都记了**实测数据和踩过的坑**。
+Most of this code was not "written" so much as **forced out by three constraints:
+one CPU core, no link-layer retransmission, and no IP path**. Every non-obvious design
+decision has **measured data and the mistakes that led to it** recorded in the comments.
 
-### 1. SPI 隧道做在内核里（`driver/spitun.c`）
+### 1. The SPI tunnel lives in the kernel (`driver/spitun.c`)
 
-原来跑在用户态 Python（`spinet.py`），在单核 A7 上**忙轮询吃掉 25~36% CPU**，
-把视频编码饿死。搬到内核后 CPU 占用降到 ~0%，帧率恢复。
+It used to be userspace Python (`spinet.py`), which **burned 25–36% CPU busy-polling**
+on the single A7 core and starved the video encoder. Moving it into the kernel dropped
+CPU usage to ~0% and restored the frame rate.
 
-- **每帧打包多个 IP 报文**：帧固定 4096B，而一次 exchange 要 3.1ms。
-  只装一个 1350B 报文等于把 2/3 的帧浪费掉 → 打包 3 个，吞吐 ×2.5
-- **小包优先队列**：控制指令/ACK 只有几十字节，不该排在 1350B 的视频包后面
-- **帧级重传**：SPI 从机"武装窗口"撞上主机传输就会丢整帧（实测稳态 0.6~4%，
-  开机阶段突发 **30%**）。隧道层没有重传 → 丢一帧 = 报文永久消失 →
-  只能等 TCP 的 **RTO ≥200ms**。改成在**最底层立刻重发**（代价 ~3ms），
-  开机阶段的失败**全部被补回**（`retry=5, retry_ok=5, fail=0`）
-- **重传预算**：C5 整机不在线时每帧都会失败，无脑重试等于在主循环空转
-  （实测 6183 次白重试）→ 加预算，用完就交给上层
+- **Pack multiple IP packets per frame**: frames are a fixed 4096B and one exchange
+  costs 3.1ms. Carrying a single 1350B packet wastes two thirds of every frame →
+  pack 3, throughput ×2.5
+- **Small-packet priority queue**: control commands/ACKs are tens of bytes and should
+  not queue behind 1350B video packets
+- **Frame-level retransmission**: the SPI slave's "arming window" colliding with a host
+  transfer loses an entire frame (measured 0.6–4% steady state, **30% bursts** during
+  boot). The tunnel has no retransmission → a lost frame = the packet is gone forever →
+  you wait for TCP's **RTO ≥200ms**. Retransmitting at the **lowest layer** (~3ms cost)
+  recovered **all** boot-phase failures (`retry=5, retry_ok=5, fail=0`)
+- **Retry budget**: when the C5 is entirely offline every frame fails, and blind retries
+  just spin the main loop (measured 6183 pointless retries) → a budget hands control
+  back to the upper layer
 
-### 2. 回程路由用**源地址策略路由**，不写死客户端 IP
+### 2. Return routing uses **source-based policy routing**, not a hardcoded client IP
 
-板子有两条路（eth0 网线 / spitun0 隧道），回包走错就彻底失联。
-原来写死 `192.168.3.64`，客户端 DHCP 一变（→ `.65`）控制就**完全没反应**，
-而板子侧看什么都正常（C5 在线、隧道通、CPU 空闲、本地 API 12ms）。
+The board has two paths (eth0 cable / spitun0 tunnel) and a mis-routed reply means total
+loss of contact. It used to hardcode `192.168.3.64`; when the client's DHCP lease changed
+(to `.65`) control went **completely dead** while the board looked perfectly healthy
+(C5 online, tunnel up, CPU idle, local API 12ms).
 
-现在按**源地址**分流，不需要知道客户端是谁：
+Now traffic is split by **source address**, so it never needs to know who the client is:
 
 ```sh
 ip rule add from 10.77.0.2 lookup 100 pref 100
 ip route replace 192.168.3.0/24 dev spitun0 src 10.77.0.2 table 100
 ```
 
-> 走过弯路：想在 web_server 里"每请求自愈"补路由 —— **无效**。
-> SYN-ACK 是内核发的，没路由连握手都完不成，处理器根本不会被调用。
+> A dead end worth recording: "self-healing the route per request" inside web_server —
+> **does not work**. The SYN-ACK is emitted by the kernel; without a route the handshake
+> never completes and the handler is never invoked.
 
-### 3. 失控保护（deadman）+ 前导沿心跳
+### 3. Failsafe deadman + leading-edge heartbeat
 
-网页曾经"只在数值变化时才发指令"，按住不动时板子收不到心跳 → 停车 →
-表现为"车走走停停"。现在**输入一变立刻发 + 100ms 心跳 + 请求超时**，
-并且超时可配置（`board/config/board/config/car_config.example.json` 的 `failsafe_s`）、
-页面能自检版本（改了没生效会自动重载）。
+The page used to send commands **only when a value changed**, so holding the stick still
+meant no heartbeat, the board stopped the car, and the symptom was "the car stutters".
+Now: **send immediately on any input change + a 100ms heartbeat + request timeout**,
+with a configurable timeout (`failsafe_s` in `board/config/car_config.example.json`) and
+page version self-check (a stale page auto-reloads).
 
-### 4. 单核上的每一毫秒都要算
+### 4. On one core, every millisecond counts
 
-注释里能看到大量"这里曾经吃掉多少 CPU"的记录：软件 PWM 从 1kHz 降到 250Hz、
-遥测采集从 5Hz 降回 1Hz（`read_adc_mv` 单次 264ms，5Hz 就是 132% CPU，
-物理上跑不完）、Nagle 关闭省下 36ms/条指令……
+The comments contain many "this used to cost X% CPU" records: software PWM dropped from
+1kHz to 250Hz; telemetry collection dropped from 5Hz back to 1Hz (`read_adc_mv` costs
+264ms per call — at 5Hz that is 132% of one core, physically impossible); disabling
+Nagle saved 36ms per command.
 
 ---
 
-## 关键实测数据
+## Key measured numbers
 
-| 指标 | 数值 |
+| Metric | Value |
 |---|---|
-| SPI 单帧 | 3.10 ms（纯线上 1.64ms @20MHz，**固定开销 1.46ms**）|
-| 隧道吞吐 | 修复前 3.42 Mbps → **9.21 Mbps** |
-| 控制延迟（满载）| p50 95ms → **p50 36ms / p90 61ms / max 78ms** |
-| 控制丢包（满载）| 有长尾 → **200/200 到达，0 丢包** |
-| 帧失败（开机阶段）| 累积上万 → **fail=0**（重传全部补回）|
-| 空载控制 | p50 **24ms**，本地回环 12ms |
+| SPI single frame | 3.10 ms (1.64ms on the wire @20MHz, **1.46ms fixed overhead**) |
+| Tunnel throughput | 3.42 Mbps before → **9.21 Mbps** after |
+| Control latency (loaded) | p50 95ms → **p50 36ms / p90 61ms / max 78ms** |
+| Control packet loss (loaded) | long tail → **200/200 delivered, 0 loss** |
+| Frame failures (boot phase) | tens of thousands → **fail=0** (all recovered by retransmit) |
+| Control latency (idle) | p50 **24ms**, local loopback 12ms |
+| NPU detection (person+pet) | p50 29ms at `npu_fps=15`; **+3ms** vs no detection |
 
 ---
 
-## 硬件
+## Hardware
 
-| 部件 | 型号 |
+| Part | Model |
 |---|---|
-| 主控 | Luckfox Pico Pro Max（RV1106，单核 Cortex-A7，128MB）|
-| WiFi 桥 | ESP32-C5（SPI 从机 + NAPT）|
-| 摄像头 | SC3336 3MP（CSI，H.264 编码由 rkipc 完成）|
-| 底盘 | 4WD 麦克纳姆轮 + TB6612 ×2（MD240A）|
-| 图传 | rkipc（RTSP）→ mediamtx（WebRTC / HLS）|
+| Main SoC | Luckfox Pico Pro Max (RV1106, single Cortex-A7, 128MB) |
+| WiFi bridge | ESP32-C5 (SPI slave + NAPT) |
+| Camera | SC3336 3MP (CSI; H.264 encoding done by rkipc) |
+| Chassis | 4WD mecanum wheels + TB6612 ×2 (MD240A) |
+| Video | rkipc (RTSP) → mediamtx (WebRTC / HLS) |
+| NPU | RV1106 NPU (0.5 TOPS) via rockiva, PFP model (Person/Face/Pet) |
 
-> ⚠️ **电机必须独立供电**。用 USB/调试线带电机 → 启动电流拉垮供电 →
-> 板子/C5 欠压 → 隧道断 2 秒。C5 的串口日志里有确凿证据：
-> `E BOD: Brownout detector was triggered`
+> ⚠️ **Motors must be powered independently.** Running motors off USB/debug power makes
+> inrush current collapse the rail → board/C5 brown out → the tunnel drops for 2 seconds.
+> The C5's serial log has direct evidence: `E BOD: Brownout detector was triggered`.
 
 ---
 
-## 部署
+## Deploy
 
-**1. 配置**（真实凭据不在仓库里，用模板填）：
+**1. Configuration** (real credentials are not in this repo; fill in the templates):
 
 ```sh
-cp board/config/board/config/car_config.example.json /userdata/car/car_config.json
-# 填 MQTT broker / 密码 / 引脚
+cp board/config/car_config.example.json /userdata/car/car_config.json
+# fill in MQTT broker / password / pins
 cp firmware/c5-tunnel/main.c.example firmware/c5-tunnel/main.c
-# 填 WiFi SSID / 密码, 然后用 idf.py build flash
+# fill in WiFi SSID / password, then idf.py build flash
 ```
 
-**2. 板子侧**：
+**2. Board side**:
 
 ```sh
-# 应用
-scp board/app/* root@<板子IP>:/userdata/car/
-# 启动链 (注意: init.d 里的文件名必须与板上一致)
-scp board/init.d/S* root@<板子IP>:/etc/init.d/
-ssh root@<板子IP> "chmod 755 /etc/init.d/S*; reboot"
-# 设备树 overlay
-scp board/dts/spi0-tunnel.dts ...     # 编译成 .dtbo 后由 hwcfg 加载
+# apps
+scp board/app/* root@<board-ip>:/userdata/car/
+# boot chain (init.d filenames must match the device exactly)
+scp board/init.d/S* root@<board-ip>:/etc/init.d/
+ssh root@<board-ip> "chmod 755 /etc/init.d/S*; reboot"
+# device-tree overlay
+scp board/dts/spi0-tunnel.dts ...     # compile to .dtbo, loaded by hwcfg
 ```
 
-**3. 内核模块**（必须与运行内核同源编译）：
+**3. Kernel module** (must be built against a kernel matching the running one):
 
 ```sh
-tools/build/build-spitun.sh        # WSL 里跑, 产物 spitun.ko
-tools/deploy/reload-tunnel.sh      # 热替换 (会断网几秒, 自动回滚)
+tools/build/build-spitun.sh        # run in WSL; produces spitun.ko
+tools/deploy/reload-tunnel.sh      # hot-swap (drops the link for seconds, auto-rollback)
 ```
+
+**4. NPU detection** (optional): see [`docs/NPU_DETECTION.md`](docs/NPU_DETECTION.md).
+Summary: copy `object_detection_pfp.data` to `/usr/lib/`, set `enable_npu = 1` and
+`npu_fps = 15`, and (to also draw pet boxes) install the patched rkipc from
+`tools/npu/rkipc-pet-6/`.
 
 ---
 
-## 诊断工具
+## Diagnostic tools
 
-| 工具 | 用途 |
+| Tool | Purpose |
 |---|---|
-| `tools/diagnose/measure-control-latency.sh` | 控制往返延迟分解测量 |
-| `tools/diagnose/test-failsafe.sh` | 失控保护验证（覆盖"误停"与"漏停"）|
-| `tools/diagnose/watch-failsafe.py` | 板子侧观测失控触发与 C5 复位 |
-| `tools/diagnose/watch-spi-loss.py` | SPI 帧失败率 / 重传观测 |
-| `tools/diagnose/tcp-retransmits.py` | TCP 重传计数（丢包的间接证据）|
+| `tools/diagnose/measure-control-latency.sh` | Control round-trip latency breakdown |
+| `tools/diagnose/check-video-stream.sh` | Verify RTSP really produces a stream (not just a listening port) |
+| `tools/diagnose/test-failsafe.sh` | Failsafe verification (covers both false and missed stops) |
+| `tools/diagnose/watch-failsafe.py` | Board-side observation of failsafe trips and C5 resets |
+| `tools/diagnose/watch-spi-loss.py` | SPI frame failure rate / retransmissions |
+| `tools/diagnose/tcp-retransmits.py` | TCP retransmit counters (indirect evidence of loss) |
+| `tools/diagnose/check-boot-time.py` | Verify the clock is right **at boot** (not just after) |
+| `tools/diagnose/measure-frame-exposure.py` | Objective over/under-exposure measurement |
+| `tools/npu/measure-control-latency.py` | Latency measurement with baseline comparison |
+| `tools/npu/probe-npu-stack.sh` | Check the NPU stack is complete |
+| `tools/npu/watch-crash-log.sh` | Persist dmesg to SD so a crash survives a reboot |
+| `tools/npu/rknn_probe.c` | Cross-compiled RKNN probe (validates the inference path) |
+| `tools/npu/verify-npu-detection.sh` | NPU detection acceptance test |
 
 ---
 
-## 许可
+## Licence
 
-仅供学习参考。涉及真实硬件，请自行评估安全风险 —— **遥控车务必先做好失控保护**。
+For study and reference only. This involves real hardware — assess safety yourself,
+and **always get the failsafe working before running the car**.
