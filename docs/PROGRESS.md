@@ -2090,8 +2090,8 @@ mediamtx 二进制 38MB，放不进 2.2MB 的 `/userdata`，所以一直在
 
 | 文件 | 用途 |
 |---|---|
-| `board/init.d/S20lo-loopback` | 修 `lo` 回环地址 |
-| `board/init.d/S25video-stream` | 图传服务 init 脚本 |
+| `board/init.d/S20lo` | 修 `lo` 回环地址 |
+| `board/init.d/S25mediamtx` | 图传服务 init 脚本 |
 | `tools/deploy/deploy-all.sh` | **刷机后一键重装全部 init 脚本并启动** |
 | `verify_reboot.sh` | 重启后 12 项自动验收 |
 | `verify_all.sh` | 隧道/服务/摄像头/网页综合体检 |
@@ -2344,9 +2344,9 @@ Usage: watchdog [-t N[ms]] [-T N[ms]] [-F] DEV
 
 | 文件 | 说明 |
 |---|---|
-| `board/init.d/S21hardware-watchdog` | **新增** 硬件看门狗喂狗服务 |
-| `board/init.d/S20lo-loopback` | 修 `lo` 回环地址（上轮新增） |
-| `board/init.d/S25video-stream` | 图传 init 脚本（上轮新增，本轮修自杀 bug） |
+| `board/init.d/S21wdt` | **新增** 硬件看门狗喂狗服务 |
+| `board/init.d/S20lo` | 修 `lo` 回环地址（上轮新增） |
+| `board/init.d/S25mediamtx` | 图传 init 脚本（上轮新增，本轮修自杀 bug） |
 | `board/app/video_ctl.py` | **新增曝光档位**（EXPOSURE 表 + exposure_switch/info） |
 | `board/app/index.html` | 曝光滑块 → 曝光档位按钮（删掉无效的实时滑块） |
 | `board/app/web_server.py` | **新增 `/api/exposure`** GET/POST |
@@ -2652,7 +2652,7 @@ ip route replace 192.168.3.0/24 dev spitun0 src 10.77.0.2 table 100
 * 网线侧发出的包源地址是 eth0 的 → 走主表，**完全不受影响**
 * **不需要知道客户端是谁**，DHCP 怎么变都不会失联
 
-写进 `board/init.d/S22spi-tunnel`（开机装）与 `board/init.d/S24tunnel-watchdog`（故障撤掉、恢复补回）。
+写进 `board/init.d/S22spinet`（开机装）与 `board/init.d/S24spinet_wd`（故障撤掉、恢复补回）。
 
 ### D. ❌ 走过的弯路（重要）
 

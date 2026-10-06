@@ -22,7 +22,7 @@ firmware/c5-tunnel/     ESP32-C5 侧固件 (SPI 从机 + WiFi + NAPT)
 driver/spitun.c         板子侧内核模块: SPI 隧道 (核心)
 board/
   app/                  板子侧应用 (网页服务 / 电机 / 图传 / 摄像头 / GPS)
-  init.d/               开机启动链 (按启动顺序编号, 名字即用途)
+  init.d/               开机启动链 (文件名与板子上**完全一致**, 见下表)
   config/               配置模板 (car_config / mediamtx)
   dts/                  SPI0 + spitun 节点的设备树 overlay
 tools/
@@ -31,6 +31,26 @@ tools/
   diagnose/             测量与观测 (控制延迟 / 失控保护 / SPI 丢帧 / TCP 重传)
 docs/                   文档与截图
 ```
+
+### 启动链（`board/init.d/`）
+
+脚本之间是**按名字互相调用**的（例如 `S24spinet_wd` 会调 `/etc/init.d/S22spinet restart`），
+所以仓库里的文件名和板子上**逐一对应、不做美化** —— 拷过去就能直接用，
+也避免"仓库名 ≠ 设备名"引发静默失效。用途写在每个文件头的 `# 用途:` 注释里：
+
+| 文件 | 用途 |
+|---|---|
+| `S20lo` | `lo` 回环接口（板载服务要访问 127.0.0.1）|
+| `S21wdt` | 硬件看门狗（内核卡死时自动复位）|
+| `S22spinet` | **SPI 隧道接口**：给 `spitun0` 配地址 + 装回程策略路由 |
+| `S23web` | 板载网页控制服务（`web_server.py`，监听 :80）|
+| `S24spinet_wd` | **隧道看门狗**：假死/模块丢失时自动重启并撤/补回程路由 |
+| `S25mediamtx` | 图传服务（拉 rkipc 的 RTSP，出 WebRTC/HLS）|
+| `S99rtcinit` | RTC 时钟（让系统时间在重启后仍正确）|
+
+> 注：`S22spinet` / `S24spinet_wd` 里的 "spinet" 是**历史名字**（隧道曾经是用户态
+> Python 进程 `spinet.py`）。现在隧道在内核里，这两个脚本只负责配接口和看门狗。
+> 名字保留不改，是因为设备上就是这个名字，改了反而对不上。
 
 | 关心什么 | 看哪里 |
 |---|---|

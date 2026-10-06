@@ -1,4 +1,5 @@
 #!/bin/sh
+# 用途: 图传服务: 启动 mediamtx (拉 rkipc 的 RTSP, 出 WebRTC/HLS)
 # /etc/init.d/S25mediamtx -- 小车图传 (WebRTC / HLS)
 #
 # ============================================================================

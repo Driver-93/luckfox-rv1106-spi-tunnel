@@ -1,4 +1,5 @@
 #!/bin/sh
+# 用途: RTC 时钟: 让系统时间在重启后仍然正确 (RTC 里存的是 UTC)
 
 case $1 in
 start)

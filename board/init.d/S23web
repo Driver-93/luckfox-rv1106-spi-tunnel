@@ -1,4 +1,5 @@
 #!/bin/sh
+# 用途: 板载网页控制服务: 启动 web_server.py (监听 :80)
 # /etc/init.d/S23web -- onboard web control service
 #
 # Started early so the page is ready as soon as the tunnel is, and with NO
