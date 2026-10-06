@@ -61,6 +61,7 @@ docs/                   文档与截图
 | 隧道怎么做的、为什么这么做 | `driver/spitun.c` + `docs/SPI_TUNNEL_DESIGN.md` |
 | 延迟瓶颈的实测分析 | `docs/SPI_LATENCY_ANALYSIS.md` |
 | **时钟为什么故意不设时区** | `docs/TIME.md` |
+| **NPU 人/狗检测做到哪一步了** | `docs/NPU_DETECTION.md`（实测：NPU 可用，但官方 demo 与图传互斥）|
 | **部署"没生效"先查什么** | `docs/USERDATA_SPACE.md`（`/userdata` 只有 2.2MB）|
 | 完整的开发过程与踩坑记录 | `docs/PROGRESS.md` |
 | 硬件怎么接 | `docs/WIRING.md` |
