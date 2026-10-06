@@ -1,0 +1,18 @@
+diff --git a/video.c.orig b/video.c
+index eb8800c..2a1dddc 100644
+--- a/video.c.orig
++++ b/video.c
+@@ -1985,6 +1985,13 @@ static void *rkipc_get_nn_update_osd(void *arg) {
+ 				draw_rect_2bpp((RK_U8 *)stCanvasInfo.u64VirAddr, stCanvasInfo.u32VirWidth,
+ 				               stCanvasInfo.u32VirHeight, x, y, w, h, line_pixel,
+ 				               RGN_COLOR_LUT_INDEX_1);
++			} else if (object->objInfo.type == ROCKIVA_OBJECT_TYPE_PET) {
++				/* 宠物(猫/狗): 原厂代码没有这个分支, 所以检测到了也不画框。
++				 * 加这个分支后狗会被框出来, 用 LUT_INDEX_1 (红框, 与人/脸的蓝框区分)。
++				 * 注意: 前提是 rockiva 模型是 PFP (Person/Face/Pet)。 */
++				draw_rect_2bpp((RK_U8 *)stCanvasInfo.u64VirAddr, stCanvasInfo.u32VirWidth,
++				               stCanvasInfo.u32VirHeight, x, y, w, h, line_pixel,
++				               RGN_COLOR_LUT_INDEX_1);
+ 			}
+ 			// LOG_INFO("draw rect time-consuming is %lld\n",(rkipc_get_curren_time_ms() -
+ 			// 	last_ba_result_time));
