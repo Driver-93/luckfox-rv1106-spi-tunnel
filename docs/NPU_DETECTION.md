@@ -1,11 +1,20 @@
 # NPU 人/狗检测：可行性实测报告
 
-> **结论先说**：这块板子的 **NPU 是真实可用的**（驱动、运行时、硬件节点都在，
-> 模型能加载，`/dev/rknpu` 能被打开并计入 `lsmod` 的 Used）。
-> 但**官方 demo 与图传互斥**，而 rkipc 自带的 `enable_npu` 开关在**本固件上会
-> 导致重启**且实际不启用 NPU。
+> **结论先说**
 >
-> 因此本文记录的是**做到哪一步、卡在哪、以及为什么**，而不是一个已上线的功能。
+> 1. **NPU 硬件真实可用** —— 驱动、运行时、硬件节点都在；官方 `yolov5.rknn`
+>    能加载，`lsmod` 的 `rknpu Used=1` 证明 NPU 被真正持有。
+> 2. **持有 NPU 不影响控制延迟** —— p50 变化在噪声内（详见 §3.4）。
+> 3. **但本固件没有自带 rockiva 检测模型**，所以 rkipc 的 `enable_npu=1`
+>    这条"零成本集成"路线**走不通**：
+>    `E rockx(load_model+398): object_detection_pfp model data not found!`
+> 4. **官方 demo 与图传互斥**（要独占摄像头）。
+>
+> **修正一个我上一轮的错误结论**：我曾写"`enable_npu=1` 会导致板子重启"。
+> 这是**错的** —— 重启是我自己造成的：我杀掉 rkipc 后用 `nohup ./rkipc`
+> 重启，**漏了 `LD_LIBRARY_PATH`**，rkipc 因找不到 `librockit.so` 秒退；
+> 它是开机链的一部分，死了之后**硬件看门狗**就复位了板子。
+> 用正确环境重启后，`enable_npu=1` 下板子**稳定运行、图传正常**（`uptime` 连续增长）。
 
 ---
 
@@ -100,9 +109,9 @@ demo 打完格式枚举后就**阻塞住了**，CPU 占用 0%（`87% idle`），
 **rkipc 必须一直跑**（推 RTSP 给 mediamtx，才有图传），所以官方 demo 的采集方式
 不能直接用。
 
-### 3.3 `enable_npu` 开关：会导致重启，且不生效
+### 3.3 `enable_npu` 开关：**真正的失败原因是缺模型**（不是崩溃/重启）
 
-`/userdata/rkipc.ini` 里有 `enable_npu = 0`（第 26 行）+ `npu_fps = 10`，
+`/userdata/rkipc.ini` 里有 `enable_npu = 0` + `npu_fps = 10`，
 二进制里也有一整套链路：
 
 ```
@@ -111,20 +120,79 @@ rkipc_rockiva_write_nv12_frame_by_phy_addr   <- 按物理地址零拷贝推帧
 RkipcNpuOsd / ai_get_detect_result           <- 结果直接画到 OSD
 ```
 
-看上去正是我们要的。**但实测把它改成 1 之后**：
+**用正确的环境**（`LD_LIBRARY_PATH=/oem/usr/lib`）重启 rkipc、并开启
+`enable_npu = 1`，抓到的日志是：
 
-| 现象 | 结果 |
-|---|---|
-| 板子重启 | **连续 3 次**（`up 1 min` 反复出现）|
-| NPU 是否被 rkipc 打开 | **没有**（`/proc/<rkipc>/fd` 里没有 `rknpu`）|
-| 温度 | 49.9°C（正常，不是过热）|
-| rkipc 日志 | 被重启清空，抓不到崩溃原因 |
+```
+[rockiva.c][rkipc_rockiva_init]:begin
+[rockiva.c][rkipc_rockiva_init]:ROCKIVA_Init over
+E rockx(load_model+398): object_detection_pfp model data not found!
+ROCKIVA_BA_Init error -3
+```
 
-**已全部回滚**（`ini` 与模板都改回 0，`diff` 确认与备份一致）。
+**根因：固件里没有 rockiva 的检测模型文件。**
 
-> **推测**（未证实）：`rockiva` 需要配套的模型/数据文件，但 `find / -name '*.rknn'`
-> 在 `/oem` 下一个都没找到 —— 缺模型可能导致初始化失败进而崩溃。
-> 要证实需要**串口日志**（重启后 dmesg 会被清空，看不到崩溃现场）。
+同一时刻的状态证明了"板子没崩、图传正常"：
+
+```
+uptime=1004s -> 1038s    (连续增长, 没有重启)
+rkipc: 3006 root ./rkipc -a /oem/usr/share/iqfiles
+554 监听: 1              (RTSP 正常, 图传可用)
+rknpu Used: 0            (NPU 没被用上, 因为模型加载失败)
+```
+
+#### 为什么没有模型
+
+`librockiva.so` 内部只认两件事：
+
+```
+%s.data        <- RockX 的模型数据格式
+%s.rknn
+```
+
+以及一大串模型类型名（`OBJECT_DETECTION_IPC_PFP`、`..._X_PERSON`、
+`..._V6_PFP` 等）。但**全盘扫描确认这些文件一个都不存在**：
+
+```sh
+find / -name '*.data'   # 只返回 /sys/module/*/sections/.data (内核段, 无关)
+find / -name '*.rknn'   # 只有我自己传上去的 yolov5.rknn
+```
+
+`/oem/usr/share` 里只有 iqfiles、字体、ini 模板 —— **没有任何模型**。
+
+> **注意**：rockiva 用的是 RockX `.data` 格式，**不是** `.rknn`，
+> 所以官方 demo 的 `yolov5.rknn` **不能**直接顶替它。
+
+#### 定位过程（可复用）
+
+失败信息只在**内存里的日志**，重启就没了，所以先做了个**落盘采集器**：
+
+```sh
+# /mnt/sdcard/npu/crashwatch.sh —— 每秒把 dmesg 尾部 + 内存 + 进程状态
+# 追加到 SD 卡上的日志, 这样重启后仍能看到崩溃/失败现场
+```
+
+这是不接串口也能拿到现场的实用办法。采集到 TRIGGER 前后的日志后，
+才看到 `object_detection_pfp model data not found!` 这一行。
+
+#### 顺带修正一个错误结论
+
+我上一轮写的是"`enable_npu=1` 会让板子连续重启 3 次"。**那是错的**，
+真实原因是我的启动方式有问题。三组对照试验：
+
+| 试验 | 启动方式 | 结果 |
+|---|---|---|
+| A | 直接 `rkipc`（靠 PATH）| `rkipc: not found`（`/oem/usr/bin` 不在 PATH）|
+| B | `cd /oem/usr/bin && ./rkipc` | **`can't load library 'librockit.so'`** ← 我踩的坑 |
+| C | 加 `LD_LIBRARY_PATH=/oem/usr/lib` | **正常存活** ✓ |
+
+**rkipc 是开机链的一部分**，它被我用错误方式搞死后，硬件看门狗
+（`S21wdt`）就复位了板子 —— 所以看起来像"enable_npu 导致重启"，
+其实是**我杀了 rkipc 又没能把它正确拉起来**。
+
+**教训**：动开机链里的常驻服务之前，先确认它的**完整启动环境**
+（尤其是 `LD_LIBRARY_PATH`、cwd、PATH），并且**准备好正确的重启命令**。
+我因为漏了这一步，浪费了一整轮，还差点把一个正确的配置当成"有毒"回滚掉。
 
 ### 3.4 关键决策数据：NPU 持有**不影响控制延迟**
 
@@ -167,23 +235,67 @@ RkipcNpuOsd / ai_get_detect_result           <- 结果直接画到 OSD
 6. **busybox 的 `ps` 里 `grep` 会匹配到自己**，统计进程数要用 `grep -c '[l]uckfox'`
    这种写法。
 
+7. **重启 rkipc 必须带 `LD_LIBRARY_PATH`**（见 §3.3 的三组对照试验）。
+   漏了它 rkipc 会以 `can't load library 'librockit.so'` 秒退，
+   而它是开机链的一部分 → 硬件看门狗复位板子。
+
+8. **rkipc 的 IVS 结果只在终端打印，不画到画面上**（默认只框人）：
+   `[video.c][rkipc_ivs_get_results]:MD: md_area is ...` 是运动检测输出。
+
 ---
 
-## 五、下一步（按代价排序）
+## 五、关于 rockiva 的检测能力（调研结论）
+
+rkipc 的 `enable_npu` 走的是 **rockiva** 引擎，模型是
+**PFP = Person / Face / Pet**（人 / 脸 / 宠物）—— **正好覆盖"人 + 狗"**。
+
+社区分析（[rkipc 的 npu(iva) 学习笔记](https://www.cnblogs.com/tlnshuju/p/19092860)）
+给出的源码路径与关键点：
+
+```c
+// rkipc/common/rockiva/rockiva.c
+globalParams.detModel |= ROCKIVA_DET_MODEL_PFP;   // 指定 PFP 前级检测
+initParams.baRules.areaInBreakRule[0].objType =
+    ROCKIVA_OBJECT_TYPE_BITMASK(ROCKIVA_OBJECT_TYPE_PERSON);
+initParams.baRules.areaInBreakRule[0].objType |=
+    ROCKIVA_OBJECT_TYPE_BITMASK(ROCKIVA_OBJECT_TYPE_PET);   // 宠物要手动加
+
+// rkipc/src/rv1106_ipc/video/video.c -> rkipc_get_nn_update_osd()
+// 默认只画 person, 宠物框要自己加:
+if (object->objInfo.type == ROCKIVA_OBJECT_TYPE_PERSON) { draw_rect_2bpp(...); }
+else if (object->objInfo.type == ROCKIVA_OBJECT_TYPE_PET) { draw_rect_2bpp(...); }
+```
+
+要点：
+
+* **检测框是 rkipc 自己画的**（`draw_rect_2bpp` 到 RGN 画布），不需要我们写 UI。
+* 坐标是**归一化的 1~10000**，要乘以图像分辨率才是真实像素位置。
+* `objId` 是目标序号；目标消失再出现会 +1。
+* **默认只框 person**，宠物要改代码 —— 意味着要**重新编译 rkipc**，
+  而板上没有编译器（需要 Luckfox SDK 交叉编译）。
+
+---
+
+## 六、下一步（修正后的优先级）
 
 | 方案 | 做法 | 代价 / 风险 |
 |---|---|---|
-| **① 抓串口日志定位重启原因** | 接串口，开 `enable_npu=1`，看崩溃现场 | 需要接线；但这是唯一能证实/证伪的方向 |
-| ② 找 rockiva 配套模型 | 查该固件版本是否需要额外 `.rknn` 放进 `/oem` | 需要知道 Rockchip 的约定路径 |
-| ③ 旁路取帧（不抢相机） | 从 rkipc 的**次码流 704×576**（已在跑）拉流解码喂 NPU | 要自己写取帧；解码占 CPU，需实测 |
+| **① 找 rockiva 模型** | 拿到 `object_detection_pfp.data`（RockX 格式）放进 rkipc 的查找路径 | 模型**不在本固件里**；需要从 Rockchip SDK 或 Luckfox 官方获取 |
+| ② 自建检测（不依赖 rockiva） | 拿 `yolov5.rknn`（已验证能加载）+ 从 rkipc **次码流 704×576** 取帧，自己做推理，框通过网页叠加 | 要自己写取帧+后处理；解码占 CPU 需实测 |
+| ③ 重编 rkipc 加宠物框 | 用 Luckfox SDK 交叉编译，改 `rkipc_get_nn_update_osd()` | 前提是 ① 先解决（没模型编了也没用）|
 | ④ 官方 demo 独占相机 | `RkLunch-stop.sh` 后跑 demo | **开车时看不到图传**，不实用 |
 
-**推荐顺序：① → ②**。先看崩溃现场，避免继续盲试；
-如果确实缺模型，② 就能解决。
+**推荐：②**。
+
+理由：① 依赖一份我们手上没有、且来源不确定的模型文件（`rockiva` 用的
+RockX `.data` 格式，**不能**用现成的 `yolov5.rknn` 顶替）；
+而 ② 路线的关键组件**都已经验证可用**：
+`yolov5.rknn` 能加载、NPU 能持有、次码流 `704×576` 已经在跑、
+控制延迟不受影响（§3.4）。
 
 ---
 
-## 六、复现命令
+## 七、复现命令
 
 ```sh
 # 确认 NPU 硬件在
@@ -194,13 +306,27 @@ ls -l /dev/rknpu
 # 运行时版本
 strings /oem/usr/lib/librknnmrt.so | grep 'librknnmrt version'
 
-# 跑 demo（会卡在摄像头，因为 rkipc 占着）
+# --- 复现"缺模型"这个结论 ---
+sed -i 's/^enable_npu.*/enable_npu = 1/' /userdata/rkipc.ini /oem/usr/share/rkipc-300w.ini
+for p in $(ps | grep '[r]kipc' | awk '{print $1}'); do kill $p; done; sleep 5
+cd /oem/usr/bin
+# ⚠️ 必须带 LD_LIBRARY_PATH, 否则 rkipc 秒退 -> 看门狗复位板子
+LD_LIBRARY_PATH=/oem/usr/lib:/lib:/usr/lib ./rkipc -a /oem/usr/share/iqfiles > /tmp/rk.log 2>&1 &
+sleep 20
+grep -iE 'rockiva|rockx|not found' /tmp/rk.log
+#   -> E rockx(load_model+398): object_detection_pfp model data not found!
+
+# --- 回滚 ---
+sed -i 's/^enable_npu.*/enable_npu = 0/' /userdata/rkipc.ini /oem/usr/share/rkipc-300w.ini
+
+# --- 跑官方 demo（会卡在摄像头，因为 rkipc 占着；但能验证 NPU）---
 nohup /mnt/sdcard/npu/launch.sh >/dev/null 2>&1 &
 sleep 12
 lsmod | grep rknpu          # Used=1 表示 NPU 被持有
 cat /tmp/launch.log
 
-# 控制延迟对比
-python3 /tmp/lat.py cleanBase          # 先确保没有 demo
-# 对比时把 demo 拉起来再跑一次
+# --- 控制延迟对比 ---
+python3 /tools/npu/measure-control-latency.py cleanBase   # 先确保没有 demo
+# 再拉起 demo, 跑一次对比
 ```
+
