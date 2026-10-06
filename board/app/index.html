@@ -175,79 +175,53 @@ main{max-width:1100px;margin:0 auto;padding:10px 12px 24px}
 .panel h3{margin:0 0 8px;font-size:10.5px;color:var(--dim);font-weight:600;
   text-transform:uppercase;letter-spacing:.5px}
 
-/* 转盘 + 左右两侧的原地转按钮。
+/* 原地转按钮: **等腰直角三角形**, 贴在转盘(摇杆圆盘)的左上角 / 右上角。
  *
- * 形状要求 (用户指定): **直角三角, 左右镜像对称**。
+ *     ◤▔▔▔▔▔▔▔▔◥        <- 两个三角的斜边朝内下, 直角在外侧上角
+ *      ╲   O    ╱
+ *       ╲      ╱
+ *        ╲    ╱
+ *         ╲  ╱
  *
- *     ◀▏  ( O )  ▕▶
- *     左          右
+ *   左上(◤): 直角在左上角, 斜边从左下 -> 右上 (朝内下)
+ *   右上(◥): 直角在右上角, 斜边从右下 -> 左上 (朝内下)
+ *   两者严格镜像。三角里面显示 "左" / "右" 汉字。
+ * 放在圆盘上角 + 尺寸够大 -> 手机上左右拇指自然落在那里, 不用移动手掌。
  *
- *   左三角: 直角边(竖直)贴圆盘, 尖朝**左**
- *   右三角: 直角边(竖直)贴圆盘, 尖朝**右**
- *   两者是严格的镜像 —— 看起来就像圆盘左右各长出一个"播放键"。
- * 这样三角是"贴"在圆盘外缘的, 不占额外方框, 手机上左右拇指正好
- * 落在圆盘两侧, 手掌不用移动就能按到。
+ * ---- 怎么做出"等腰直角三角形 + 里面还能放字" ----
+ * 用 CSS border 画的三角**不能放文字**(伪元素里放不了内容),
+ * 所以这里用 **clip-path** 把按钮本身裁成三角 —— 这样文字就在按钮里,
+ * 而且触摸热区/点击判定都跟着形状走, 比 border 方案更好用。
  *
- * ---- border 画三角的原理 (这里踩过坑, 实测记录) ----
- * 宽高都是 0 的盒子, 四条 border 各自斜切成三角形。
- *
- * ⚠️ 想让实色部分成为**直角三角**, 必须**只留一条透明边**:
- *     border-top:36px transparent  +  border-right:24px solid
- *         -> 直角在右下角, 尖朝左, 斜边从左下到右上  ✓ 直角三角
- *     若写成 border-top:18px + border-bottom:18px 都透明
- *         -> 得到的是**等腰三角** (尖在左中, 上下对称)  ✗ 不是我想要的
- *
- * 一开始我就是写成了两条透明边, 渲染出来是等腰三角, 被用户指出来了。
- * 现在这份是**用真实浏览器逐像素量过**的 (见 _tritest.js):
- *   变体 B/C = 直角三角 (宽度从 24 单调收到 1, 最宽行贴在圆盘那侧)
- *   变体 A/D = 等腰三角 (宽度 1->24->1, 中间最宽)
+ *   clip-path: polygon(...) 用**百分比**写, 天然自适应尺寸。
+ *   等腰直角三角 = 三个顶点里有一个是 90 度、两条直角边等长。
  */
-#stickWrap{display:flex;align-items:center;justify-content:center;gap:0}
-.rotb{flex:none;cursor:pointer;padding:0;border:0;background:none;
-  display:flex;align-items:center;justify-content:center;
-  /* 触摸热区 (透明), 比三角形本身大一圈, 手机上好按 */
-  width:36px;height:64px;
+.rotb{position:absolute;top:0;width:78px;height:78px;padding:0;margin:0;
+  border:0;cursor:pointer;color:#8b949e;background:#1b2129;
+  font:600 15px/1 inherit;letter-spacing:0;
+  display:flex;align-items:flex-start;justify-content:center;
   touch-action:none;-webkit-tap-highlight-color:transparent;
-  border-radius:var(--r-sm);
-  transition:background .12s}
-/* 直角三角本体 (伪元素)。宽=0 高=0, 全靠 border 撑出形状。
- *
- * 目标形状 (实测逐像素调出来的):
- *
- *     左 ◀            右 ▶
- *     ┌              ┐
- *     │╲             ╱│
- *     │ ╲           ╱ │      <- 竖直直角边贴圆盘
- *     │  ╲         ╱  │
- *     └              ┘
- *     竖直边在贴圆盘那侧, 尖朝外 —— 像播放器的"快退/快进"。
- *
- * 关键: 只想得到**直角三角**, 就必须**只留一条透明边**。
- *   border-left(或 right) 为 0 的那条边决定哪一侧是"竖直直角边"。
- * 两条都留 -> 等腰三角 (错了, 一开始就是这么写的)。
- *
- * 四个方向对应关系 (实测):
- *   透明 top    + 实色 right  ->  ╲│  竖直边在右, 尖在左上
- *   透明 bottom + 实色 right  ->  ╱│  竖直边在右, 尖在左下   <-- 左边用这个
- *   透明 top    + 实色 left   ->  │╱  竖直边在左, 尖在右上
- *   透明 bottom + 实色 left   ->  │╲  竖直边在左, 尖在右下   <-- 右边用这个
- *
- * 用**上下各半**的方式不好, 所以这里用"透明边占满高度, 另一条竖直边为 0",
- * 这样得到的就是标准的左右指向直角三角。
- */
-.rotb:after{content:"";display:block;width:0;height:0;
-  transition:border-color .12s}
-/* 左: 竖直直角边贴圆盘(在右侧), 尖朝左 */
-.rotb.l:after{border-top:0;border-bottom:32px solid transparent;
-  border-left:0;border-right:22px solid #6e7681}
-/* 右: 与左严格镜像 (竖直直角边在左, 尖朝右) */
-.rotb.r:after{border-top:32px solid transparent;border-bottom:0;
-  border-right:0;border-left:22px solid #6e7681}
-.rotb:hover{background:rgba(255,255,255,.07)}
-/* 按住时: 三角变亮蓝, 明确反馈"正在原地转" */
-.rotb.on{background:rgba(47,129,247,.18)}
-.rotb.on.l:after{border-right-color:#4a9eff}
-.rotb.on.r:after{border-left-color:#4a9eff}
+  transition:background .12s,color .12s;
+  -webkit-user-select:none;user-select:none}
+/* 左上: ◤ 直角在左上, 斜边从左下到右上; 文字靠近直角(左上)那一侧 */
+.rotb.l{left:0;
+  clip-path:polygon(0 0, 100% 0, 0 100%);
+  padding:9px 0 0 11px;
+  align-items:flex-start;justify-content:flex-start}
+/* 右上: ◥ 直角在右上, 斜边从右下到左上; 与左严格镜像 */
+.rotb.r{right:0;
+  clip-path:polygon(100% 0, 100% 100%, 0 0);
+  padding:9px 11px 0 0;
+  align-items:flex-start;justify-content:flex-end}
+.rotb:hover{background:#232b35;color:#c9d1d9}
+/* 按住时: 变蓝 + 字变白, 明确反馈"正在原地转" */
+.rotb.on{background:rgba(47,129,247,.92);color:#fff}
+/* 三角内部文字: 单独一个 span, 方便定位 */
+.rotb span{display:block;font-size:15px;font-weight:700;line-height:1}
+
+/* 转盘容器: 两个三角按钮相对它绝对定位 (贴在它的左上角/右上角)。
+   所以这里必须是 position:relative。 */
+#stickWrap{position:relative}
 
 #stick{position:relative;width:100%;max-width:300px;aspect-ratio:1;margin:0 auto;
   border-radius:50%;
@@ -317,16 +291,18 @@ input[type=range]::-moz-range-thumb{width:15px;height:15px;border:0;border-radiu
   .row{margin-top:8px}
   input[type=range]{height:24px}
   input[type=range]::-webkit-slider-thumb{width:20px;height:20px;margin-top:-8px}
-  /* 小屏上把整个转盘装配收窄, 保证 "三角 + 圆盘 + 三角" 不溢出。
-     圆盘是 aspect-ratio:1 的正方形, 所以用 flex:1 + max-width 让它自适应。 */
-  #stickWrap{gap:0}
-  #stick{flex:1;min-width:0;max-width:none}
-  /* 手机上触摸热区给足 (≥44px 高), 三角形本体大小不变 */
-  .rotb{width:32px;height:60px}
+  /* 手机上三角按钮再放大一点: 拇指更好按 (触控目标 ≥48px) */
+  .rotb{width:86px;height:86px}
+  .rotb span{font-size:16px}
+  .rotb.l{padding:10px 0 0 12px}
+  .rotb.r{padding:10px 12px 0 0}
 }
-/* 窄到 360px 以下再收一档 */
+/* 窄到 380px 以下按比例收一档 */
 @media(max-width:380px){
-  .rotb{width:28px;height:56px}
+  .rotb{width:74px;height:74px}
+  .rotb span{font-size:14px}
+  .rotb.l{padding:8px 0 0 10px}
+  .rotb.r{padding:8px 10px 0 0}
 }
 
 #dirbar{display:flex;align-items:center;gap:6px;margin-top:9px;font-size:11px;
@@ -420,10 +396,11 @@ kbd{background:#21262d;border:1px solid var(--line);border-bottom-width:2px;
   <div>
     <div class="panel">
       <h3>方向摇杆</h3>
-      <!-- 左右原地转: 两个三角按钮贴在转盘**左右两侧** (原来是下面的滑条)。
-           按住持续转, 松开回正 —— 见 rotBtnDown/rotBtnUp。 -->
+      <!-- 原地转: 两个**等腰直角三角**按钮, 贴在转盘(摇杆圆盘)的左上角/右上角。
+           直角在外侧上角, 斜边朝内下, 里面是"左"/"右"。
+           按住持续转, 松开立刻回正。 -->
       <div id="stickWrap">
-        <button class="rotb l" id="rotL" title="按住原地左转 (或按 Q)" aria-label="原地左转"></button>
+        <button class="rotb l" id="rotL" title="按住原地左转 (或按 Q)" aria-label="原地左转"><span>左</span></button>
         <div id="stick">
           <div class="ring"></div>
           <div class="cross"></div>
@@ -431,7 +408,7 @@ kbd{background:#21262d;border:1px solid var(--line);border-bottom-width:2px;
           <div class="lbl l">左</div><div class="lbl r">右</div>
           <div id="knob"></div>
         </div>
-        <button class="rotb r" id="rotR" title="按住原地右转 (或按 E)" aria-label="原地右转"></button>
+        <button class="rotb r" id="rotR" title="按住原地右转 (或按 E)" aria-label="原地右转"><span>右</span></button>
       </div>
 
       <div class="row">
