@@ -339,6 +339,52 @@ input[type=range]::-moz-range-thumb{width:15px;height:15px;border:0;border-radiu
 @media(max-width:600px){.hint{display:none}}
 kbd{background:#21262d;border:1px solid var(--line);border-bottom-width:2px;
   border-radius:3px;padding:0 4px;font-size:9px;font-family:inherit}
+
+/* ============================================================================
+ * 系统状态面板 (板子自身: CPU / 内存 / NPU / 检测 / 温度 / 磁盘)
+ * ============================================================================
+ * 数据来自 /api/status 的 sys 字段 —— 板子在**它自己的 1Hz 遥测循环**里
+ * 采好放进缓存的, 网页只是读快照。所以这个面板**不增加板子任何开销**,
+ * 也不会像"在网页里直接调接口"那样把单核打满。
+ *
+ * 用 bar 而不是数字饼图: 一眼看出"哪个快满了"比精确读数重要。
+ */
+#sysPanel .sysgrid{display:grid;grid-template-columns:1fr 1fr;gap:8px 12px}
+#sysPanel .sysitem{min-width:0}
+#sysPanel .sysrow{display:flex;align-items:baseline;justify-content:space-between;
+  gap:6px;margin-bottom:3px}
+#sysPanel .sysrow .k{font-size:var(--fs-sm);color:var(--dim);flex:none}
+#sysPanel .sysrow .v{font-size:var(--fs-md);font-weight:700;color:var(--fg);
+  font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis}
+#sysPanel .bar{height:4px;border-radius:2px;background:#252b33;overflow:hidden}
+#sysPanel .bar i{display:block;height:100%;width:0;border-radius:2px;
+  background:var(--ok);transition:width .3s,background .3s}
+/* 占用率上色 (CPU/内存): <70% 绿 / <90% 黄 / 更高红 */
+#sysPanel .bar i.warn{background:var(--warn)}
+#sysPanel .bar i.bad{background:var(--err)}
+/* 状态上色 (NPU/检测): 满=正常(绿), 半=待确认(黄), 满而异常=红。
+   注意和占用率的区别 —— "100% 红"是故障, "100% 绿"是正常。 */
+#sysPanel .bar i.st-ok{background:var(--ok)}
+#sysPanel .bar i.st-warn{background:var(--warn)}
+#sysPanel .bar i.st-off{background:var(--err)}
+#sysPanel .sysfoot{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:8px;
+  font-size:var(--fs-sm);color:var(--dim);font-variant-numeric:tabular-nums}
+#sysPanel .v.bad{color:var(--err)}
+#sysPanel .v.warn{color:var(--warn)}
+#sysPanel .v.ok{color:var(--ok)}
+/* 手机上单列更清楚 */
+@media(max-width:600px){
+  #sysPanel .sysgrid{grid-template-columns:1fr 1fr}
+  #sysPanel .sysrow .v{font-size:11px}
+}
+/* 宽屏时: 标签和数值之间的空隙太大 (实测 456~546px 的空洞),
+   而两列之间只有 24px —— 远处看像"标签飘在左边、数值飘在右边"。
+   给每列设上限宽度, 让内容聚拢。 */
+@media(min-width:900px){
+  #sysPanel .sysgrid{grid-template-columns:1fr 1fr;gap:8px 28px}
+  #sysPanel .sysitem{max-width:240px}
+}
 </style>
 </head>
 <body>
@@ -413,6 +459,38 @@ kbd{background:#21262d;border:1px solid var(--line);border-bottom-width:2px;
         <div class="k"><span class="dot" id="carDot"></span>状态</div>
         <div class="v" style="font-size:13px" id="carV">--</div>
         <div class="s" id="carS">--</div>
+      </div>
+    </div>
+
+    <!-- 系统状态 (板子自身): CPU / 内存 / NPU / 检测 / 温度 / 磁盘
+         数据来自 /api/status 的 sys 字段 (板子 1Hz 采集的缓存快照)。 -->
+    <div class="panel" id="sysPanel">
+      <h3>系统状态 <span id="sysUp" style="float:right;font-weight:400;color:#5a6472;text-transform:none;letter-spacing:0"></span></h3>
+      <div class="sysgrid">
+        <div class="sysitem">
+          <div class="sysrow"><span class="k">CPU</span><span class="v" id="sysCpu">--</span></div>
+          <div class="bar"><i id="sysCpuBar"></i></div>
+        </div>
+        <div class="sysitem">
+          <div class="sysrow"><span class="k">内存</span><span class="v" id="sysMem">--</span></div>
+          <div class="bar"><i id="sysMemBar"></i></div>
+        </div>
+        <div class="sysitem">
+          <div class="sysrow"><span class="k">NPU</span><span class="v" id="sysNpu">--</span></div>
+          <div class="bar"><i id="sysNpuBar"></i></div>
+        </div>
+        <div class="sysitem">
+          <div class="sysrow"><span class="k">检测</span><span class="v" id="sysDet">--</span></div>
+          <div class="bar"><i id="sysDetBar"></i></div>
+        </div>
+      </div>
+      <div class="sysfoot">
+        <span id="sysTemp">温度 --</span>
+        <span id="sysLoad">负载 --</span>
+        <span id="sysDisk">磁盘 --</span>
+      </div>
+      <div class="sysfoot">
+        <span id="sysProc">进程 --</span>
       </div>
     </div>
   </div>
@@ -1434,6 +1512,115 @@ function render(st){
   $('carDot').className = 'dot '+(live?'on':'off');
   $('carV').textContent = DIRN[st.dir] || st.dir || '--';
   $('carS').textContent = '速度 '+st.speed+'%'+(live?'':' · 模拟');
+
+  renderSys(st.sys);
+}
+
+/* ---- 系统状态面板 ----
+ * st.sys 是板子 1Hz 采集缓存下来的快照, 这里只做展示 —— 不在网页里另调接口,
+ * 否则会变成"每次轮询都让板子重新算一遍", 那是把单核打满的老路。
+ *
+ * ⚠️ 两套"进度条"语义不同, 别混:
+ *   CPU/内存 = **占用率** -> 越满越糟 (>=90% 红, >=70% 黄)
+ *   NPU/检测 = **开/关状态** -> 满 = 正常 (绿), 没跑 = 红
+ * 一开始我让它们共用 barCls(), 结果 NPU"在用"被画成 100% 红色,
+ * 看起来像故障 (实测截图发现的)。所以状态条单独一套配色。
+ */
+function barCls(pct){
+  return pct >= 90 ? 'bad' : (pct >= 70 ? 'warn' : '');
+}
+/* 状态条: 传 "ok" / "off" / "warn" 三种语义, 不用占用率阈值 */
+function stateBar(barId, txtId, state, text){
+  const b = $(barId), t = $(txtId);
+  if(!b || !t) return;
+  t.textContent = text;
+  t.className = 'v' + (state === 'ok' ? ' ok' : state === 'off' ? ' bad'
+                     : state === 'warn' ? ' warn' : '');
+  b.style.width = (state === 'ok' || state === 'warn') ? '100%'
+                : state === 'off' ? '100%' : '0%';
+  // 状态条的颜色直接用语义色, 不走占用率那套
+  b.className = state === 'ok' ? 'st-ok'
+              : state === 'warn' ? 'st-warn'
+              : state === 'off' ? 'st-off' : '';
+}
+function setBar(barId, txtId, pct, text, cls){
+  const b = $(barId), t = $(txtId);
+  if(!b || !t) return;
+  t.textContent = text;
+  t.className = 'v' + (cls ? ' '+cls : '');
+  b.style.width = Math.max(0, Math.min(100, pct || 0)) + '%';
+  b.className = barCls(pct);
+}
+function fmtUptime(s){
+  if(s == null) return '--';
+  const d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
+  if(d) return d+'天'+h+'小时';
+  if(h) return h+'小时'+m+'分';
+  return m+'分'+(s%60)+'秒';
+}
+function renderSys(s){
+  if(!s){
+    // 板子还没采到 (刚开机) 或老版本没这个字段
+    ['sysCpu','sysMem','sysNpu','sysDet'].forEach(id => {
+      const e = $(id); if(e) e.textContent = '--';
+    });
+    const u = $('sysUp'); if(u) u.textContent = '';
+    return;
+  }
+  const u = $('sysUp'); if(u) u.textContent = '运行 ' + fmtUptime(s.uptime_s);
+
+  // CPU
+  const cpu = s.cpu || {};
+  const p = cpu.pct;
+  setBar('sysCpuBar','sysCpu', p,
+    p == null ? '--' : p.toFixed(0)+'%' + (cpu.cores>1 ? ' · '+cpu.cores+'核' : ''),
+    p != null && p >= 90 ? 'bad' : (p != null && p >= 70 ? 'warn' : ''));
+
+  // 内存
+  const m = s.mem || {};
+  setBar('sysMemBar','sysMem', m.used_pct,
+    m.used_pct == null ? '--' : m.used_mb+'/'+m.total_mb+'M',
+    m.used_pct >= 90 ? 'bad' : (m.used_pct >= 80 ? 'warn' : ''));
+
+  // NPU: 硬件在 = 好; 被持有 = 在用
+  const npu = s.npu || {}, det = s.detect || {};
+  const npuOk = !!(npu.loaded && npu.dev);
+  stateBar('sysNpuBar','sysNpu',
+    npuOk ? (npu.in_use ? 'ok' : 'warn') : 'off',
+    npuOk ? (npu.in_use ? '在用' : '空闲') : '无');
+
+  // 检测: 配置开着 **且** NPU 真被持有 才算"跑着"
+  const on = det.enabled === true;
+  const running = on && !!det.holder;
+  stateBar('sysDetBar','sysDet',
+    running ? 'ok' : (on ? 'warn' : (det.enabled === false ? 'off' : null)),
+    running ? ((det.fps || '?') + 'fps · ' + det.holder)
+            : (on ? '未生效' : (det.enabled === false ? '关闭' : '--')));
+
+  // 温度 / 负载 / 磁盘
+  const t = $('sysTemp');
+  if(t){
+    const c = s.temp_c;
+    t.textContent = '温度 ' + (c == null ? '--' : c.toFixed(1)+'°C');
+    t.className = c != null && c >= 80 ? 'bad' : (c != null && c >= 70 ? 'warn' : '');
+  }
+  const l = $('sysLoad');
+  if(l && s.load) l.textContent = '负载 ' + s.load.l1.toFixed(1);
+  const d = $('sysDisk');
+  if(d && s.disk){
+    const r = s.disk.root;
+    d.textContent = r ? ('根分区 ' + r.free_mb + 'M 可用') : '磁盘 --';
+    d.className = r && r.free_mb < 5 ? 'bad' : '';
+  }
+  const pr = $('sysProc');
+  if(pr && s.proc){
+    const names = {rkipc:'图传', mediamtx:'流媒体', web_server:'网页', python3:'python'};
+    const parts = [];
+    for(const k in names){
+      if(s.proc[k]) parts.push(names[k]+'✓');
+    }
+    pr.textContent = '进程 ' + (parts.length ? parts.join(' · ') : '--');
+  }
 }
 
 /* 脚本末尾再报一次身份 —— 这里所有常量都已定义 (见 sendPageInfo 的说明) */

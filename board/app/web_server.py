@@ -20,6 +20,7 @@ API:
   python3 web_server.py [端口]     # 默认 80
 """
 import json, os, subprocess, sys, time, threading
+import sys_stats
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -133,9 +134,15 @@ STATE = {"dir": "stop", "speed": 30, "vx": 0.0, "vy": 0.0, "w": 0.0, "ts": time.
 def init_motor():
     global motor
     try:
-        motor = FourMotor(CONF["pin"], simulate=False)
+        # 轴向取反 (见 car_motor.drive 的说明) —— 从 car_config.json 的
+        # "axis_inv" 读, 例如 {"vx": true} 表示横移左右对调。
+        # 用配置而不是改代码, 是因为"板子怎么装"属于装配差异,
+        # 换一套安装方式不该改源码。
+        inv = CONF.get("axis_inv") or {}
+        motor = FourMotor(CONF["pin"], simulate=False, inv=inv)
         motor.start_pwm()
-        print("[motor] 已启动 (真实电机模式)")
+        print("[motor] 已启动 (真实电机模式)  axis_inv=%s"
+              % (inv if inv else "{}"))
     except Exception as e:
         print("[motor] 启动失败:", e)
         motor = None
@@ -541,6 +548,7 @@ def build_status():
         net4g = dict(_tel["net4g"])
         net = dict(_tel["net"])
         c3 = dict(_tel["c3"])
+        sysinfo = _tel.get("sys")
     # 给网页一句人话解释为什么没有定位 (见 gps_state 的说明)
     gps["state"], gps["state_text"] = gps_state(gps)
     # 顺带把三种坐标都算好。原始 lat/lon 保持 WGS-84 不动 (数据要干净),
@@ -584,6 +592,9 @@ def build_status():
         # 有了这个字段, 页面每 1 秒轮询时就能发现"文件已更新", 自己 reload,
         # 不用再指望用户手动刷新 —— 这类"改了没生效"的故障太容易误判。
         "ver": _page_ver(),
+        # 系统状态: CPU / 内存 / NPU / 检测 / 温度 / 磁盘。
+        # 由 telemetry_loop 1Hz 刷新, 这里是缓存快照 (不额外开销)。
+        "sys": sysinfo,
         "tel": {
             "bat_mv": mv,
             "bat_v": round(bat_volts(mv), 2) if mv else None,
@@ -603,6 +614,7 @@ _tel = {
     "net4g": {"present": False, "module": None},
     "net": {"ip": None, "ifaces": []},
     "c3": {"online": False},
+    "sys": None,
 }
 
 def telemetry_loop():
@@ -652,12 +664,20 @@ def telemetry_loop():
             c3 = c3_status()
         except Exception:
             c3 = {"online": False}
+        # 系统状态 (CPU/内存/NPU/温度/磁盘) —— 只读 /proc 和 /sys 的小文件,
+        # 实测很便宜; 但**仍然放在这个 1Hz 循环里**, 不单独提高频率。
+        # 理由见本函数开头的警告: 把重采集提到高频会把单核打满。
+        try:
+            ss = sys_stats.sample()
+        except Exception:
+            ss = None
         with TEL_LOCK:
             _tel["mv"] = mv
             _tel["gps"] = dict(_gps)
             _tel["net4g"] = g4
             _tel["net"] = nw
             _tel["c3"] = c3
+            _tel["sys"] = ss
         # 立刻再查一次保护, 不用等下一个 tick
         _failsafe_check()
         time.sleep(1.0)

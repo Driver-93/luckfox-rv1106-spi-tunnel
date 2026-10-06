@@ -16,7 +16,7 @@ import threading, time
 class FourMotor:
     CH = ('FL', 'FR', 'BL', 'BR')
 
-    def __init__(self, pin, simulate=False):
+    def __init__(self, pin, simulate=False, inv=None):
         """
         pin: dict
           {
@@ -26,11 +26,21 @@ class FourMotor:
             "BL": {"IN1":g, "IN2":g, "PWM":g},
             "BR": {"IN1":g, "IN2":g, "PWM":g},
           }
+        inv: dict, 轴向取反开关 (默认全不取反)
+          {"vx": True/False, "vy": Bool, "w": Bool}
+          - vx=True: 横移左右对调  (驱动板翻面装后常用)
+          - vy=True: 前后对调
+          - w =True: 原地转左右对调
+          取值来自 car_config.json 的 "axis_inv", 见 drive() 的说明。
         simulate: True 时不操作硬件 (用于无硬件测试)
         """
         from periphery import GPIO
         self.pin = pin
         self.simulate = simulate
+        inv = inv or {}
+        self.INV_VX = -1.0 if inv.get("vx") else 1.0
+        self.INV_VY = -1.0 if inv.get("vy") else 1.0
+        self.INV_W = -1.0 if inv.get("w") else 1.0
         self._g = {}
         self._duty = {c: 0.0 for c in self.CH}
         self._pwm_run = False
@@ -216,7 +226,24 @@ class FourMotor:
             BL = vy - vx + w
             BR = vy + vx - w
         归一化后再乘 speed, 保证任何方向组合都不会超过速度上限。
+
+        ---- 车体轴向修正 (AXIS_INV) ----
+        2026-10-06 用户把**驱动板翻过来装**(其他没动), 结果横移左右反了。
+        修正放在这一层(驱动层), 不动页面/摇杆/摄像头 —— 因为那些都没变。
+
+        为什么只翻 vx: vx 只出现在横移项里, 取负后
+            前进/后退 (vx=0)  四轮输出**完全不变**
+            原地转   (vx=0)  四轮输出**完全不变**
+            只有横移和含横向分量的斜向动作会翻转
+        这正是"其他都正常、只有横移反了"的现象。
+
+        ⚠️ 如果哪天发现**自转也反了**, 那不是这个开关能修的 —— 那种情况说明
+        左右整组对调了, 应该翻 self.INV_W 而不是 vx。
         """
+        vx = vx * self.INV_VX
+        vy = vy * self.INV_VY
+        w = w * self.INV_W
+
         fl = vy + vx + w
         fr = vy - vx - w
         bl = vy - vx + w
