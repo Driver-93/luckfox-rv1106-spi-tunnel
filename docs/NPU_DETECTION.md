@@ -12,7 +12,7 @@
 | # | 做什么 | 为什么 |
 |---|---|---|
 | 1 | 把 `object_detection_pfp.data` 放进 `/usr/lib/` | 固件里**没有**这个模型，rkipc 找不到就报错 |
-| 2 | 打开 `enable_npu = 1` + `npu_fps = 2` | 开启检测；帧率必须降，否则控制延迟涨 45% |
+| 2 | 打开 `enable_npu = 1` + `npu_fps = 15` | 开启检测；`npu_fps` 是送帧节奏，实测 15fps 只多 ~2ms 延迟 |
 | 3 | **重编译 rkipc，给宠物加画框分支** | 原厂只画"人"，狗检测到了也不画框 |
 
 第 3 步是可选的（不做也能检测，只是狗不出框）。
@@ -26,7 +26,7 @@
 | `/usr/lib/object_detection_pfp.data` | 1.0 MB | **关键**：rockiva 检测模型，固件原本没有 |
 | `/usr/lib/object_detection_pfp_896x512.data` | 1.0 MB | 备用分辨率 |
 | `/oem/usr/bin/rkipc` | 461648 B | 自编译版，带 PET 画框分支 |
-| `enable_npu = 1`<br>`npu_fps = 2` | ini **和**模板都要改 | 帧率 2 是控制延迟的平衡点 |
+| `enable_npu = 1`<br>`npu_fps = 15` | ini **和**模板都要改 | 实测 15fps 是"检测流畅度 vs 控制延迟"的平衡点 |
 
 ---
 
@@ -145,29 +145,43 @@ fd -> /dev/rknpu
 'model data not found' 次数 = 0
 ```
 
-### 4.2 控制延迟（关键：用户要求延迟优先）
+### 4.2 控制延迟与 npu_fps（关键调优）
 
-各 160 次采样，同一套测量脚本：
+**`npu_fps` 控制"每秒送几帧给 NPU"**（源码 `video.c:543`）：
 
-| 条件 | p50 | p90 | p99 |
+```c
+int npu_cycle_time_ms = 1000 / rk_param_get_int("video.source:npu_fps", 10);
+// 每轮: RK_MPI_VI_GetChnFrame(VIDEO_PIPE_2) -> rockiva_write_nv12_frame_by_phy_addr()
+//       -> 释放帧 -> usleep(补足周期)
+```
+
+送的是 **`video.2` 通道（960×540）**，不是主码流 —— 这也是它便宜的原因。
+
+#### 干净对比（每档等 60 秒稳定，各 3 轮 × 160 次采样）
+
+| npu_fps | p50（3 轮） | p90 | 说明 |
 |---|---|---|---|
-| 无 NPU（基线） | **26.1 ms** | 37.5 ms | 59.4 ms |
-| NPU @ 10fps（`npu_fps` 默认） | **37.8 ms** | 68.5 ms | 96.3 ms |
-| NPU @ 2fps（采用） | **29.2 ms** | 46.8 ms | 70.9 ms |
-| + PET 版 rkipc | 31.1 ms | 50.8 ms | 92.2 ms |
-| 重启后复测 | 29.7 ms | 47.8 ms | 78.2 ms |
+| **2** | 25.6 / 26.0 / 26.0 ms | ~37 ms | 最省，但框更新慢 |
+| **10** | 27.5 / 27.0 / 27.4 ms | ~40 ms | 原厂默认值 |
+| **15**（采用） | — | — | 实测 p50 28.8ms |
+| **30** | 30.1 / 29.8 / 30.0 ms | ~48 ms | 上限，再高没意义 |
 
-**默认的 `npu_fps = 10` 会让 p50 涨 12ms（+45%），必须降。**
-降到 **2fps** 后基本回到基线水平，检测还够用（人和狗不会一秒内消失）。
+**结论：提速代价很小。** 从 2 → 30fps（15 倍）只多 4ms。
+**`npu_fps = 15` 是平衡点**：检测比 2fps 快 7 倍，延迟代价约 2-3ms。
 
-> `npu_fps` 是最有效的旋钮，可继续降到 1。
+> ⚠️ **测量方法很重要**：我第一次扫描时每档只等 18 秒就测，得到
+> "fps=10 → 34ms"的结论，**是错的** —— rkipc 重启后 ISP/NPU 还在初始化。
+> 等 60 秒后复测，fps=10 其实只有 27ms。**改了配置必须等系统稳定再测。**
+
+> 注意：`npu_fps` 不是"检测帧率上限"，而是"送帧节奏"。
+> 实际上限还受 `VIDEO_PIPE_2` 的出帧率约束。
 
 ### 4.3 持久化（冷启动验证）
 
 ```
-重启前: rkipc md5 c13eff70...  enable_npu=1  npu_fps=2  模型在 /usr/lib
-重启后: rkipc md5 c13eff70...  enable_npu=1  npu_fps=2  模型仍在
-        rknpu Used=1  检测线程在跑  RTSP 有流  控制 move/stop 正常
+重启前: rkipc md5 c13eff70...  enable_npu=1  npu_fps=15  模型在 /usr/lib
+重启后: rkipc md5 c13eff70...  enable_npu=1  npu_fps=15  模型仍在
+        rknpu Used=1  检测线程在跑  RTSP 有流  控制正常
 ```
 
 三处都在持久分区：
@@ -236,7 +250,7 @@ cp object_detection_pfp_896x512.data   /usr/lib/
 
 # 2) 开 NPU (ini 和模板都要改!)
 sed -i 's/^enable_npu.*/enable_npu = 1/' /userdata/rkipc.ini /oem/usr/share/rkipc-300w.ini
-sed -i 's/^npu_fps.*/npu_fps = 2/'       /userdata/rkipc.ini /oem/usr/share/rkipc-300w.ini
+sed -i 's/^npu_fps.*/npu_fps = 15/'       /userdata/rkipc.ini /oem/usr/share/rkipc-300w.ini
 
 # 3) (可选) 换带 PET 分支的 rkipc
 cp rkipc_pet /oem/usr/bin/rkipc && chmod +x /oem/usr/bin/rkipc
@@ -282,7 +296,7 @@ sed -i 's/^enable_npu.*/enable_npu = 0/' /userdata/rkipc.ini /oem/usr/share/rkip
 |---|---|---|
 | `/usr/lib/object_detection_pfp.data` | 1.0 MB | **关键**：rockiva 的检测模型，固件里原本没有 |
 | `/usr/lib/object_detection_pfp_896x512.data` | 1.0 MB | 同上（备用分辨率）|
-| `/userdata/rkipc.ini` + `/oem/usr/share/rkipc-300w.ini` | `enable_npu = 1`<br>`npu_fps = 2` | 开启检测；帧率降到 2 保控制延迟 |
+| `/userdata/rkipc.ini` + `/oem/usr/share/rkipc-300w.ini` | `enable_npu = 1`<br>`npu_fps = 15` | 开启检测；帧率降到 2 保控制延迟 |
 
 改完用 `video_ctl._restart_rkipc()` 重启，然后 **重启板子验证过持久化**。
 
@@ -441,7 +455,7 @@ cp object_detection_pfp_896x512.data   /usr/lib/
 
 # 2) 开 NPU (ini 和模板都要改!)
 sed -i 's/^enable_npu.*/enable_npu = 1/' /userdata/rkipc.ini /oem/usr/share/rkipc-300w.ini
-sed -i 's/^npu_fps.*/npu_fps = 2/'       /userdata/rkipc.ini /oem/usr/share/rkipc-300w.ini
+sed -i 's/^npu_fps.*/npu_fps = 15/'       /userdata/rkipc.ini /oem/usr/share/rkipc-300w.ini
 
 # 3) 用正确方式重启 (别手搓, 会挂图传+触发看门狗)
 python3 -c "
