@@ -259,7 +259,7 @@
 
 ## 控制端 / 网页【✅ 已更新】
 - 网页: `/userdata/car/index.html` (本地直接打开)
-- MQTT: `ws://150.109.12.233:8083/mqtt`, 用户 car / LuckfoxCar2025!, token: test-secret-123
+- MQTT: `ws://<broker-host>:8083/mqtt`, 用户 car / <见 car_config.json>, token: <见 car_config.json>
 - 状态消息 `luckfox/car/status` 新增 `tel` 字段:
   - `bat_mv`/`bat_v`: 电池电压 (ADC×ratio)
   - `gps`: {present, fix, lat, lon, sats, speed_kmh}

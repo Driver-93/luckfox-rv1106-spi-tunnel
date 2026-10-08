@@ -1,0 +1,135 @@
+#!/bin/sh
+# /etc/init.d/S22c_tun_guard -- userspace jobs the KERNEL MODULE cannot do.
+#
+# ============================================================================
+# WHY THIS EXISTS
+# ============================================================================
+# The user-space pump (spinet_c) performed three housekeeping jobs that the
+# kernel module has no way to do (it has no userspace loop). Without them the
+# tunnel will misbehave or the video path will break:
+#
+#   1. REAP `udhcpc -i <tun>`  -- CRITICAL
+#      rkipc spawns `udhcpc -i tun0` on its own. The udhcpc helper script
+#      (/usr/share/udhcpc/default.script) does `ip addr flush` / `ip route
+#      flush`, which WIPES the tunnel address and routes we just configured.
+#      It also squats on port 554, which BLOCKS RTSP -> no video.
+#        spinet_c handled this in reap_udhcpc_tun0() (spinet.c:649-682).
+#      With the module the interface is `spitun0`, so rkipc would spawn
+#      `udhcpc -i spitun0` and flush spitun0's address.
+#
+#   2. KEEP THE RETURN ROUTE INSTALLED
+#      spitun0 needs a /32 route per client. The module cannot install routes
+#      (fib_table_insert is not EXPORT_SYMBOL -- spitun.c:766-771), and the
+#      udhcpc flush above can remove what we installed. Re-assert it.
+#
+#   3. NOTHING ELSE. In particular this script must NOT touch the default
+#      route: with the cable unplugged the tunnel is the only way out, but
+#      spinet_c's cable-aware default-route juggling is deliberately not
+#      reproduced here -- it is riskier than it is worth and is not needed
+#      for the browser path (which uses /32 routes).
+#
+# Runs every 20s in the background; never blocks rcS.
+# ============================================================================
+
+TUN=spitun0
+ADDR=10.77.0.2
+CLIENTS="192.168.3.64"
+LOG=/userdata/tun_guard.log
+PIDF=/var/run/tun_guard.pid
+INTERVAL=20
+
+log() { echo "[tun_guard] $1"; }
+rlog() { echo "$(date '+%H:%M:%S') $1" >> "$LOG"; }
+
+# ---- 1. kill any udhcpc squatting on the tunnel ----------------------------
+reap_udhcpc() {
+    n=0
+    for p in /proc/[0-9]*; do
+        [ -r "$p/cmdline" ] || continue
+        cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)
+        case "$cmd" in
+            *udhcpc*"$TUN"*|*udhcpc*tun0*)
+                pid=$(basename "$p")
+                kill -9 "$pid" 2>/dev/null && n=$((n+1))
+                ;;
+        esac
+    done
+    if [ "$n" -gt 0 ]; then
+        log "killed $n udhcpc on $TUN (it flushes the addr and blocks :554)"
+        rlog "reaped $n udhcpc on $TUN"
+    fi
+}
+
+# ---- 2. re-assert address + return routes ---------------------------------
+ensure_config() {
+    ifconfig "$TUN" >/dev/null 2>&1 || return 1     # module not up yet
+
+    if ! ip addr show dev "$TUN" 2>/dev/null | grep -q "$ADDR"; then
+        ip addr add "$ADDR/24" dev "$TUN" 2>/dev/null
+        rlog "re-added $ADDR/24 (something flushed it)"
+    fi
+    ifconfig "$TUN" 2>/dev/null | grep -q 'UP' || ip link set "$TUN" up 2>/dev/null
+
+    for c in $CLIENTS; do
+        if ! ip route list 2>/dev/null | grep -q "$c/32"; then
+            ip route replace "$c/32" dev "$TUN" 2>/dev/null \
+                && rlog "re-asserted route $c/32"
+        fi
+    done
+    return 0
+}
+
+guard_loop() {
+    echo $$ > "$PIDF"
+    while true; do
+        # If the kernel module is not loaded there is nothing to guard:
+        #   * no tunnel interface to protect
+        #   * udhcpc would not be targeting spitun0
+        # We keep looping anyway (the module may load later), but we do not
+        # touch anything and we do not spin the reaper needlessly.
+        if lsmod 2>/dev/null | grep -q '^spitun'; then
+            reap_udhcpc
+            ensure_config
+        fi
+        sleep $INTERVAL
+    done
+}
+
+start() {
+    if [ -f "$PIDF" ] && kill -0 "$(cat $PIDF 2>/dev/null)" 2>/dev/null; then
+        log "already running (pid $(cat $PIDF))"
+        return 0
+    fi
+
+    # ⚠️ RACE: rcS runs this as a standalone S* script, but S22b loads the
+    # module with a BACKGROUND insmod. So at this instant spitun.ko may not be
+    # loaded yet. The old code gave up permanently here ("not needed") and
+    # nothing would ever retry -- leaving udhcpc free to flush the tunnel
+    # address and block port 554.
+    #
+    # Instead: launch the loop now, and let the loop itself wait for the
+    # module. The loop already tolerates "module not up" every cycle.
+    log "starting tunnel guard (every ${INTERVAL}s; waits for module if needed)"
+    setsid sh -c "$0 loop" </dev/null >/dev/null 2>&1 &
+    log "dispatched"
+}
+
+stop() {
+    [ -f "$PIDF" ] && kill "$(cat $PIDF)" 2>/dev/null
+    rm -f "$PIDF"
+    log "stopped"
+}
+
+case "$1" in
+    start)  start ;;
+    stop)   stop ;;
+    loop)   guard_loop ;;
+    reap)   reap_udhcpc ;;
+    check)  ensure_config && echo "config OK" || echo "tunnel not up" ;;
+    status)
+        echo "guard:  $([ -f "$PIDF" ] && echo "pid $(cat $PIDF)" || echo 'not running')"
+        echo "udhcpc on tunnel: $(for p in /proc/[0-9]*; do tr '\0' ' ' < $p/cmdline 2>/dev/null | grep -l udhcpc >/dev/null 2>&1 && echo x; done | wc -c)"
+        echo "addr:   $(ip addr show dev $TUN 2>/dev/null | grep -o 'inet [0-9.]*' | head -1)"
+        ;;
+    *) echo "usage: $0 {start|stop|status|reap|check}"; exit 1 ;;
+esac

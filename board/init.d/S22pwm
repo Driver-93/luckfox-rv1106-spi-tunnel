@@ -1,153 +1,82 @@
 #!/bin/sh
-# /etc/init.d/S22pwm -- 开机加载硬件 PWM overlay (4 路电机调速)
+# /etc/init.d/S22pwm -- 应用 4 路硬件 PWM overlay (电机调速)
 #
-# 排序很重要: 必须排在 S23web **之前**, 因为 web_server.py 启动时就会
-# import car_motor 并 export 四个 PWM 通道。若 PWM 还没就绪, 电机将无法
-# 调速 (driver 会打印 "pwmchipN 不存在")。
-# 当前次序: S21wdt < S22pwm < S22spinet < S23web
+# 为什么需要它:
+#   电机的 4 路调速走**硬件 PWM** (pwmchip10/8/6/11)。而 /sys/class/pwm/ 下
+#   的 pwmchipN 只有在 pwm4 overlay 应用后才出现。没有这个脚本,
+#   /sys/class/pwm/ 是空的, 电机就无法调速。
 #
-# ⚠️ 开机失败过的坑 (2026-10-07 实测, 都踩过):
-#   0) **configfs 在 S22 阶段还没挂载**。全系统只有 S50usbdevice 会挂它,
-#      而那是排在后面的。所以本脚本必须**自己确保 configfs 挂上**,
-#      否则 /sys/kernel/config/device-tree 不存在, overlay 无从加载,
-#      表现就是开机后 /sys/class/pwm 空、电机完全不能调速。
-#   1) overlay 是**两步**: 先 cat dtbo > .../dtbo, 再 echo 1 > .../status。
-#      只写 dtbo 不写 status, 会静默不生效 (status 停在 0)。
-#   2) dtbo 里**不能用 &symbol 引用** -- 板上 dtc 编译时解析不了, 会编成
-#      0xffffffff, 加载必失败。所以写 target-path 绝对路径 + 数字 phandle。
-#   3) pinctrl-names 必须写 "active" 不是 "default", 否则驱动报
-#      "No active pinctrl state", chip 不注册, /sys/class/pwm 依然为空。
-#   4) 引脚是**懒申请**: probe 后 pinmux-pins 仍显示 UNCLAIMED 是正常的,
-#      要等某个通道被 export 才会 claim。
+# ⚠️ overlay 只能在重启边界安全切换 (热换会泄漏 IOMUX, 文档里有血泪记录)。
+#    本脚本在开机时运行, 属于正确的时机。
 #
-# 背景:
-#   设备树里 12 个 pwm@ 节点全是 status="disabled", 所以 /sys/class/pwm 是空的。
-#   本脚本用 configfs device-tree overlay 动态打开 4 路, 供 car_motor.py 使用。
-#
-# 通道映射 (用户实测接线):
-#   FL 左前 gpio54 -> pwm10 -> pwmchip10
-#   FR 右前 gpio73 -> pwm6  -> pwmchip6
-#   BL 左后 gpio71 -> pwm4  -> pwmchip4
-#   BR 右后 gpio58 -> pwm0  -> pwmchip0
+# ⚠️ 绝不阻塞 rcS: rcS 串行执行 S* 脚本, 卡住会导致后面全不执行,
+#    表现为"ping 通但 SSH/Web 全死", 只能刷机。
 
-DTBO_DIR=/userdata/hwcfg
-DTS=$DTBO_DIR/pwm4.dts
-DTBO=$DTBO_DIR/pwm4.dtbo
+DTS=/userdata/hwcfg/pwm4.dts
+DTBO=/userdata/hwcfg/pwm4.dtbo
 OVL=/sys/kernel/config/device-tree/overlays/pwm4
-EXPECT_CHIPS="6 8 10 11"
 
 log() { echo "[S22pwm] $1"; }
 
-chips_present() {
-    for c in $EXPECT_CHIPS; do
-        [ -d /sys/class/pwm/pwmchip$c ] || return 1
-    done
-    return 0
-}
-
 ensure_configfs() {
-    # 关键: configfs 可能还没挂 (S50usbdevice 才挂, 排在我们后面)
-    if [ -d /sys/kernel/config/device-tree ]; then
-        return 0
-    fi
-    grep -q 'configfs' /proc/mounts || log "configfs 未挂载, 现在挂载"
-    mkdir -p /sys/kernel/config
-    mount -t configfs none /sys/kernel/config 2>/dev/null
-
-    # 挂载后 device-tree 子目录由 dtbocfg 驱动生成, 可能要等一下
+    [ -d /sys/kernel/config/device-tree ] && return 0
+    grep -q configfs /proc/mounts || {
+        mkdir -p /sys/kernel/config
+        mount -t configfs none /sys/kernel/config 2>/dev/null
+    }
     i=0
     while [ $i -lt 30 ]; do
         [ -d /sys/kernel/config/device-tree ] && return 0
-        sleep 0.1
-        i=$((i + 1))
+        sleep 0.1; i=$((i+1))
     done
     return 1
 }
 
-start() {
-    grep -q debugfs /proc/mounts || mount -t debugfs none /sys/kernel/debug 2>/dev/null
-
-    if chips_present; then
-        log "硬件 PWM 已就绪 (pwmchip $EXPECT_CHIPS 全部存在), 跳过"
-        return 0
-    fi
-
-    if ! ensure_configfs; then
-        log "错误: configfs device-tree 接口不可用, 无法加载 overlay"
-        return 1
-    fi
-
-    if [ -d "$OVL" ]; then
-        log "清理残留 overlay"
-        echo 0 > $OVL/status 2>/dev/null
-        rmdir $OVL 2>/dev/null
-    fi
-
+do_overlay() {
     if [ ! -f "$DTBO" ] && [ -f "$DTS" ]; then
-        log "编译 $DTS -> $DTBO"
+        log "compiling $DTS"
         dtc -@ -I dts -O dtb -o "$DTBO" "$DTS" 2>/dev/null
     fi
+    [ -f "$DTBO" ] || { log "ERROR: $DTBO missing"; return 1; }
 
-    if [ ! -f "$DTBO" ]; then
-        log "错误: $DTBO 不存在, 硬件 PWM 不可用 (电机将无法调速)"
-        return 1
-    fi
-
-    log "加载 overlay"
+    [ -d "$OVL" ] && { echo 0 > $OVL/status 2>/dev/null; rmdir $OVL 2>/dev/null; }
     mkdir -p $OVL
     cat "$DTBO" > $OVL/dtbo
     echo 1 > $OVL/status
-
-    i=0
-    while [ $i -lt 50 ]; do
-        chips_present && break
-        sleep 0.1
-        i=$((i + 1))
-    done
-
-    if chips_present; then
-        log "OK: 4 路硬件 PWM 就绪"
-        for c in $EXPECT_CHIPS; do
-            log "  pwmchip$c -> $(readlink -f /sys/class/pwm/pwmchip$c/device 2>/dev/null)"
-        done
-        return 0
-    fi
-
-    log "警告: overlay 已加载但 pwmchip 不全"
-    log "  实际: $(ls -d /sys/class/pwm/pwmchip* 2>/dev/null | tr '\n' ' ')"
-    log "  若 dmesg 有 'No active pinctrl state', 说明 pinctrl-names 写错了"
-    return 1
+    log "overlay applied, status=$(cat $OVL/status 2>/dev/null)"
 }
 
-stop() {
-    log "卸载 overlay (电机 PWM 将失效)"
-    if [ -d "$OVL" ]; then
-        echo 0 > $OVL/status 2>/dev/null
-        rmdir $OVL 2>/dev/null
+start() {
+    if ! ensure_configfs; then
+        log "ERROR: configfs unavailable"
+        return 1
     fi
-    log "已卸载"
+    do_overlay
+
+    # 报告结果 (不阻塞)
+    n=0
+    for d in /sys/class/pwm/pwmchip*; do
+        [ -d "$d" ] && n=$((n+1))
+    done
+    log "pwmchips present: $n (expect 4)"
+    for d in /sys/class/pwm/pwmchip*; do
+        [ -d "$d" ] && log "  $(basename $d) npwm=$(cat $d/npwm 2>/dev/null)"
+    done
 }
 
 status() {
-    if chips_present; then
-        echo "硬件 PWM: 就绪"
-        for c in $EXPECT_CHIPS; do
-            d=$(readlink -f /sys/class/pwm/pwmchip$c/device 2>/dev/null)
-            p=${d##*/}
-            n=$(ls /sys/class/pwm/pwmchip$c/ 2>/dev/null | grep -c '^pwm')
-            echo "  pwmchip$c  ($p)  exported=$n"
-        done
-    else
-        echo "硬件 PWM: 未就绪"
-        echo "  configfs: $(grep -c configfs /proc/mounts) 个挂载"
-        echo "  实际 chip: $(ls -d /sys/class/pwm/pwmchip* 2>/dev/null | tr '\n' ' ')"
-    fi
+    echo "overlay: $(ls /sys/kernel/config/device-tree/overlays/ 2>/dev/null | tr '\n' ' ')"
+    echo "pwmchips:"
+    for d in /sys/class/pwm/pwmchip*; do
+        [ -d "$d" ] || continue
+        echo "  $(basename $d) npwm=$(cat $d/npwm 2>/dev/null)"
+    done
 }
 
 case "$1" in
-    start)   start ;;
-    stop)    stop ;;
-    restart) stop; sleep 1; exec "$0" start ;;
-    status)  status ;;
-    *)       echo "usage: $0 {start|stop|restart|status}"; exit 1 ;;
+    start)  start ;;
+    stop)   log "stop does nothing (overlay stays)" ;;
+    restart) start ;;
+    status) status ;;
+    *) echo "usage: $0 {start|stop|restart|status}"; exit 1 ;;
 esac

@@ -1,0 +1,290 @@
+#!/bin/sh
+# /etc/init.d/S22b_spitun_kmod -- bring up the KERNEL-MODULE SPI tunnel.
+#
+# Replaces the user-space pump (S22spinet). spinet_c stays on disk for rollback.
+#
+# ============================================================================
+# WHY THE KERNEL MODULE
+# ============================================================================
+#   * no 120s handshake timeout that EXITS and leaves the board dark
+#   * can submit several frames back-to-back (no stop-and-wait round trip)
+#   * `spi_speed` is a MODULE PARAMETER -> retune without recompiling
+# Verified on the board: the module loads and probe() succeeds (spidev yields
+# the bus, `frames` on the C5 rises while HELLO stays 0).
+#
+# ============================================================================
+# HARD-WON RULES
+# ============================================================================
+#   1. A BLOCKING insmod in an init script stalls rcS and leaves the board
+#      "ping OK but SSH/Web dead" (documented twice; each needed a re-flash).
+#      -> only `insmod` is backgrounded.
+#   2. Kernel modules / DT overlays are swapped ONLY at a reboot boundary.
+#   3. spidev must RELEASE the bus (see _spi0_spitun.dts) or the module never
+#      gets a spi_device and carries nothing.
+#   4. FAIL LOUDLY. An earlier version of this script ran ALL of bringup() in
+#      a background subshell; when it failed the board was left with no
+#      network configuration at all and nothing in the boot log said so.
+#      Now: module load is backgrounded, CONFIGURATION IS FOREGROUND and
+#      verified, and everything is logged with a clear marker.
+#
+# ============================================================================
+# RETURN ROUTE -- do not skip
+# ============================================================================
+# Two ways out of the board:
+#     eth0      192.168.3.x/24   (cable)
+#     spitun0   10.77.0.2/24     (via C5 -> WiFi)
+# A browser arrives over WiFi (192.168.3.69). The board's reply consults the
+# routing table, sees 192.168.3.0/24 -> eth0, and sends it out the CABLE.
+# The C5 never sees it, so the browser just spins.
+#
+# The kernel module CANNOT fix this: fib_table_insert() is not EXPORT_SYMBOL'd
+# on this kernel (spitun.c:766-771). So the route is installed HERE.
+# A /32 is more specific than the /24 on eth0, so it wins.
+# ============================================================================
+
+KO=/userdata/hwcfg/spitun.ko
+LOG=/userdata/spitun_kmod.log
+# ⚠️ The module parameter is named `spi_speed_hz`, NOT `spi_speed`.
+#    Passing the wrong name makes the kernel log
+#        spitun: unknown parameter 'spi_speed' ignored
+#    and the module silently keeps its 20 MHz default -- the speed that is
+#    documented as unreliable on this wiring. This is exactly what happened
+#    on the first kernel-module boot (dmesg confirmed 20000000 Hz).
+#    Verified against: spitun.c:179 `module_param(spi_speed_hz, uint, 0644)`
+#    and /sys/module/spitun/parameters/spi_speed_hz
+SPEED=${SPITUN_SPEED:-5000000}
+PARAM=spi_speed_hz
+TUN=spitun0
+ADDR=10.77.0.2
+
+# Client addresses that must come back through the tunnel.
+#
+# NOTE (2026-10-08): .65 was the PC's ETHERNET address. The cable is now
+# disconnected (my side: MediaConnectionState=Disconnected), so .65 no longer
+# reaches the board and a route for it is pointless. .64 is the PC's WLAN
+# address and is the one actually in use. Add more entries (a phone, a second
+# PC) as needed -- each gets its own /32.
+CLIENTS="192.168.3.64"
+
+log()  { echo "[S22spitun_kmod] $1"; }
+rlog() { echo "$1" >> "$LOG"; }
+
+# ---- return route ---------------------------------------------------------
+install_routes() {
+    rc=0
+    for c in $CLIENTS; do
+        if ip route replace "$c/32" dev "$TUN" 2>/dev/null; then
+            rlog "route $c/32 -> $TUN ok"
+        else
+            rlog "route $c/32 FAILED"
+            rc=1
+        fi
+    done
+    return $rc
+}
+
+# ---- interface configuration (FOREGROUND, verified) ------------------------
+config_iface() {
+    # Address (idempotent: delete then add avoids "File exists")
+    ip addr del "$ADDR/24" dev "$TUN" 2>/dev/null
+    if ! ip addr add "$ADDR/24" dev "$TUN" 2>/dev/null; then
+        # already present is fine
+        :
+    fi
+    if ! ip link set "$TUN" up 2>/dev/null; then
+        rlog "ip link set $TUN up FAILED"
+        return 1
+    fi
+    ip link set "$TUN" mtu 1350 2>/dev/null
+
+    # verify the address really took
+    if ! ip addr show dev "$TUN" 2>/dev/null | grep -q "$ADDR"; then
+        rlog "VERIFY FAILED: $ADDR not present on $TUN"
+        return 1
+    fi
+    return 0
+}
+
+start() {
+    if lsmod | grep -q '^spitun'; then
+        log "spitun already loaded"
+    else
+        log "loading $KO ($PARAM=$SPEED)"
+        rlog "--- $(date) load $PARAM=$SPEED ---"
+        # RULE 1: only insmod is backgrounded. It is the call that can block.
+        (
+            if insmod "$KO" "$PARAM=$SPEED" >> "$LOG" 2>&1; then
+                echo "insmod OK ($PARAM=$SPEED)" >> "$LOG"
+            else
+                echo "insmod FAILED rc=$?" >> "$LOG"
+            fi
+            # verify the clock actually took (a wrong parameter name is
+            # silently ignored and leaves the 20 MHz default in place)
+            sleep 1
+            got=$(cat /sys/module/spitun/parameters/spi_speed_hz 2>/dev/null)
+            if [ -n "$got" ] && [ "$got" != "$SPEED" ]; then
+                echo "WARNING: spi clock is $got, wanted $SPEED" >> "$LOG"
+            else
+                echo "spi clock confirmed: $got Hz" >> "$LOG"
+            fi
+        ) &
+    fi
+
+    # ---- short bounded wait for the interface (foreground) ----
+    #
+    # RULE 1 (again): rcS runs S* scripts SERIALLY, so a long foreground wait
+    # here delays everything after us -- including S40network / S50sshd. The
+    # documented symptom of that is "ping OK but SSH/Web dead", which has
+    # needed a re-flash to fix. So this check is deliberately SHORT (max 3s);
+    # the real waiting happens in the background block below.
+    i=0
+    while [ $i -lt 6 ]; do
+        ifconfig "$TUN" >/dev/null 2>&1 && break
+        sleep 0.5; i=$((i+1))
+    done
+
+    if ! ifconfig "$TUN" >/dev/null 2>&1; then
+        # Not up yet. It may still be loading/binding, so do NOT rmmod
+        # immediately -- hand the wait + configure to the background.
+        log "$TUN not up after 3s; continuing in background"
+        rlog "iffup: $TUN not present after 3s, background wait starts"
+        (
+            n=0
+            while [ $n -lt 40 ]; do
+                sleep 2; n=$((n+1))
+                ifconfig "$TUN" >/dev/null 2>&1 && break
+            done
+            if ! ifconfig "$TUN" >/dev/null 2>&1; then
+                rlog "FAIL: $TUN never appeared (80s) -- falling back"
+                log "FAIL: $TUN missing -- falling back to user-space pump"
+                rmmod spitun 2>/dev/null
+
+                # ⚠️ IMPORTANT: the user-space pump is NOT a drop-in fallback.
+                #
+                #   spinet_c needs /dev/spidev0.0 (spinet.c:943 hardcodes it),
+                #   but the spitun overlay DISABLES spidev by design -- that is
+                #   precisely how the kernel module gets the bus. So launching
+                #   spinet_c here would fail immediately with
+                #       FileNotFoundError: /dev/spidev0.0
+                #
+                #   A working fallback therefore requires BOTH:
+                #     1. the spidev overlay restored, and
+                #     2. a REBOOT (overlays only switch at a reboot boundary)
+                #
+                #   We cannot do that from here, so we do NOT pretend to
+                #   recover. We log loudly and leave the board reachable over
+                #   the WIRE (eth0), which is unaffected by any of this.
+                if [ -e /dev/spidev0.0 ]; then
+                    # spidev happens to be present -> the pump CAN work
+                    if [ -x /userdata/car/spinet_c ]; then
+                        ( cd /userdata/car && nohup ./spinet_c >> /userdata/spinet.log 2>&1 & )
+                        log "spinet_c relaunched (rollback)"
+                        rlog "rollback: spinet_c launched (spidev present)"
+                    fi
+                else
+                    log "!! cannot fall back: /dev/spidev0.0 missing (spitun overlay)"
+                    log "!! use the WIRE (ssh) and run: _fix_tunnel_now.sh rollback"
+                    rlog "rollback IMPOSSIBLE in-place: /dev/spidev0.0 absent."
+                    rlog "   -> restore spi0_spidev overlay + spinet_c, then reboot."
+                    rlog "   -> eth0 is unaffected; SSH over the cable still works."
+                fi
+                return 0
+            fi
+            rlog "iface appeared on background retry #$n"
+            if config_iface; then
+                rlog "iface configured (background)"
+            else
+                rlog "iface CONFIG FAILED (background)"
+            fi
+            install_routes
+            start_guard
+            cat /sys/class/net/$TUN/tun_stats >> "$LOG" 2>&1
+        ) &
+        log "done (deferred; see $LOG)"
+        return 0
+    fi
+
+    log "$TUN present, configuring"
+    if config_iface; then
+        rlog "iface configured: $ADDR/24 up"
+    else
+        rlog "iface CONFIG FAILED -- trying again in background"
+        # keep trying: the module may still be binding the SPI device
+        (
+            n=0
+            while [ $n -lt 40 ]; do
+                sleep 2; n=$((n+1))
+                if config_iface; then
+                    echo "iface configured on retry #$n" >> "$LOG"
+                    install_routes
+                    break
+                fi
+            done
+        ) &
+    fi
+
+    install_routes
+    start_guard
+
+    rlog "--- counters after bringup ---"
+    cat /sys/class/net/$TUN/tun_stats >> "$LOG" 2>&1
+    ifconfig "$TUN" >> "$LOG" 2>&1
+    ip route list >> "$LOG" 2>&1
+
+    log "done (see $LOG)"
+    return 0
+}
+
+# ---- userspace guard (jobs the kernel module cannot do) --------------------
+#
+# The module's thread lives in the kernel, so three things spinet_c used to do
+# in userspace now have no owner:
+#   1. reap `udhcpc -i <tun>`: rkipc spawns one, and its helper runs
+#      `ip addr flush` / `ip route flush` -- WIPING the tunnel address and
+#      routes we just configured -- and it squats on port 554, BLOCKING RTSP.
+#   2. re-assert the address + /32 return routes after such a flush.
+#   3. (deliberately NOT reproduced: spinet_c's cable-aware default-route
+#       juggling -- riskier than useful, and the browser path uses /32s.)
+#
+# S22c_tun_guard does those, in the background, every 20s.
+GUARD=/etc/init.d/S22c_tun_guard
+
+start_guard() {
+    if [ ! -x "$GUARD" ]; then
+        rlog "WARNING: $GUARD missing/not executable -- udhcpc may flush $TUN"
+        log "WARNING: tun guard not installed (see round-35 notes)"
+        return 1
+    fi
+    "$GUARD" start >/dev/null 2>&1
+    rlog "tun guard started"
+    return 0
+}
+
+stop() {
+    log "stopping"
+    for c in $CLIENTS; do ip route del "$c/32" dev "$TUN" 2>/dev/null; done
+    if lsmod | grep -q '^spitun'; then
+        ifconfig "$TUN" down 2>/dev/null
+        rmmod spitun 2>/dev/null && log "module unloaded"
+    fi
+    return 0
+}
+
+status() {
+    echo "module:  $(lsmod | grep -c '^spitun')"
+    echo "iface:   $(ifconfig $TUN >/dev/null 2>&1 && echo present || echo MISSING)"
+    echo "addr:    $(ip addr show dev $TUN 2>/dev/null | grep -o 'inet [0-9.]*' | head -1)"
+    echo "routes:"
+    ip route list 2>/dev/null | grep "$TUN" | sed 's/^/  /'
+    echo "counters:"
+    cat /sys/class/net/$TUN/tun_stats 2>/dev/null | sed 's/^/  /'
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; sleep 1; start ;;
+    status)  status ;;
+    routes)  install_routes ;;
+    *) echo "usage: $0 {start|stop|restart|status|routes}"; exit 1 ;;
+esac

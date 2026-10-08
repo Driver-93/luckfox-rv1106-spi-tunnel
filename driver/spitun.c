@@ -18,7 +18,7 @@
  * 内核里这些全部消失: 直接调 SPI 子系统, DMA 直接读写, 中断直接处理,
  * 而且可以连续提交多帧而不逐帧等待 —— 不再受 stop-and-wait 的往返限制。
  *
- * ---- 协议 (必须与 C5 固件 firmware/c5-tunnel/tunnel.h 完全一致) ----
+ * ---- 协议 (必须与 C5 固件 spi_tunnel_c3/main/tunnel.h 完全一致) ----
  *
  * 帧头 16 字节, 小端:
  *     off  0  u32 magic     0x3254464C
@@ -163,7 +163,22 @@ static unsigned long stat_bad_magic, stat_bad_csum;
 
 /* SPI 设备 */
 static struct spi_device *spi_dev;
+
+/* SPI 时钟频率 (Hz)。
+ *
+ * 默认 20MHz, 但实测飞线 + 无屏蔽时这个速度跑不动:
+ * Luckfox 侧读到恒定错误 magic (0x52951153), C5 侧每帧 err,
+ * 两边 frames 都在涨但数据全错 —— 典型的采样错位。
+ *
+ * 改成模块参数, 可以 insmod 时指定, 不用重编:
+ *     insmod spitun.ko spi_speed=1000000     # 1MHz
+ *     insmod spitun.ko spi_speed=100000      # 100kHz
+ *     insmod spitun.ko spi_speed=5000000     # 5MHz
+ */
 static u32 spi_speed_hz = 20000000;
+module_param(spi_speed_hz, uint, 0644);
+MODULE_PARM_DESC(spi_speed_hz, "SPI clock in Hz (default 20000000)");
+
 
 static struct net_device *tun_netdev;
 static struct task_struct *spitun_thread;
@@ -619,6 +634,18 @@ static int spitun_xmit(struct sk_buff *skb, struct net_device *dev)
     u8 *frame;
     size_t len = skb->len;
 
+    /* 诊断 (2026-10-07): ip_drop 增长但队列计数不动, 需要看清是
+     * "包长非法" 还是 "kmalloc 失败" 还是 "队列满" 在丢。
+     * 只在最初几次打印, 避免刷屏。 */
+    {
+        static int dbg_n;
+        if (dbg_n < 8) {
+            pr_info(DRV_NAME ": xmit#%d len=%zu mtu=%u\n",
+                    dbg_n, len, dev->mtu);
+            dbg_n++;
+        }
+    }
+
     if (len == 0 || len > 1350) {
         /* 空包或超过隧道 MTU */
         stat_ip_drop++;
@@ -934,6 +961,30 @@ static void spitun_setup_netdev(struct net_device *dev)
     dev->hard_header_len = 0;
     dev->addr_len        = 0;
     dev->tx_queue_len    = 500;
+
+    /* ---- dev->type 必须设置 (2026-10-08 实测踩的坑) ----
+     *
+     * 原来这里**没有**设置 dev->type, 于是它是 0 = ARPHRD_VOID。
+     * 实测后果 (刷机后第一次把模块真正跑起来时暴露):
+     *
+     *   /sys/class/net/spitun0/type      -> 0        <-- 应该是 ARPHRD_NONE
+     *   tx_packets=0 tx_bytes=0 tx_dropped=36
+     *   rx_packets=0 rx_bytes=0 rx_dropped=10
+     *   dmesg: spitun: xmit#N len=0 mtu=1350        <-- 内核给的是空 skb
+     *   /proc/net/snmp: InAddrErrors 持续增长        <-- 注入的包被内核拒绝
+     *
+     * 即 **TX 和 RX 双向全废**, 但 SPI 链路本身是好的
+     * (frames/ok 一直在涨, fail=0 bad_magic=0)。
+     *
+     * 对照: 用户态 spinet_c 用的是**真 TUN 设备**
+     * (IFF_TUN|IFF_NO_PI, 由内核 tun 驱动配好 netdev), 所以没这个问题。
+     * 我们自己 alloc_netdev 就必须把 netdev 语义配全。
+     *
+     * ARPHRD_NONE (0xFFFE) 是"没有链路层地址的裸 IP 设备", 正是
+     * IFF_NOARP|IFF_POINTOPOINT 隧道该有的 type。
+     *
+     * 参考 lo=772(ARPHRD_LOOPBACK), eth0=1(ARPHRD_ETHER)。 */
+    dev->type            = ARPHRD_NONE;
 
     /* 挂上 sysfs 属性组: /sys/class/net/spitun0/c3_status
      * 网页靠它显示 C5 的 WiFi 信号 (见 c3_status_show 的说明)。

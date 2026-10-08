@@ -20,7 +20,9 @@ KO=/oem/usr/ko/sc3336.ko
 RKIPC=/oem/usr/bin/rkipc
 IQDIR=/oem/usr/share/iqfiles
 LOG=/tmp/rkipc.log
-LIBPATH=/oem/usr/lib:/oem/lib
+# ⚠️ 必须含 /usr/lib: NPU 的模型 (object_detection_pfp*.data) 装在那里,
+#    少了它 rkipc 的 rockiva 初始化会失败 (表现为网页没有检测框)。
+LIBPATH=/oem/usr/lib:/usr/lib:/oem/lib
 WORKER=/tmp/.s25rkipc_worker
 
 log() { echo "[S25rkipc] $1"; }
@@ -52,7 +54,7 @@ KO=/oem/usr/ko/sc3336.ko
 RKIPC=/oem/usr/bin/rkipc
 IQDIR=/oem/usr/share/iqfiles
 LOG=/tmp/rkipc.log
-LIBPATH=/oem/usr/lib:/oem/lib
+LIBPATH=/oem/usr/lib:/usr/lib:/oem/lib
 
 # 1) sensor 驱动
 lsmod | grep -q '^sc3336' || { insmod "$KO" 2>/dev/null; sleep 2; }
