@@ -603,8 +603,7 @@ def build_status():
         # 失控保护现状 + "这个超时是不是太短"的定量指标
         "failsafe_cfg": _fs_stats(),
 
-        # 页面版本 = index.html 的 mtime。
-        #
+        # 页面版本 = index.html 的 mtime。        #
         # ⚠️ 2026-10-05 加, 因为踩了一次真实的坑: 用户浏览器里那个页面是
         # **上午 10:43 打开的**, 而我在 18:42 才改好前端的控制循环。旧页面
         # 一直跑着旧 JS ("只在数值变化时才发指令"), 于是板子的 1 秒失控保护
@@ -614,6 +613,9 @@ def build_status():
         # 有了这个字段, 页面每 1 秒轮询时就能发现"文件已更新", 自己 reload,
         # 不用再指望用户手动刷新 —— 这类"改了没生效"的故障太容易误判。
         "ver": _page_ver(),
+        # 单客户端接管: 被 403 挡掉的请求统计。
+        # 存在的意义就是让"控制被静默挡掉"这件事可见 —— 见 _DENIED 的说明。
+        "denied": denied_view(),
         # 系统状态: CPU / 内存 / NPU / 检测 / 温度 / 磁盘。
         # 由 telemetry_loop 1Hz 刷新, 这里是缓存快照 (不额外开销)。
         "sys": sysinfo,
@@ -1031,6 +1033,36 @@ def _owner_save():
             json.dump(d, f)
     except Exception:
         pass
+
+
+# 被 403 挡掉的请求计数。
+#
+# 存在的唯一目的: 让"控制被静默挡掉"这件事**看得见**。
+# 2026-10-08 踩的坑正是它反面 —— 前端漏发 X-Page-Id, 所有控制指令都被 403,
+# 而两边都没有任何错误迹象 (前端把 403 当成功, 板子不记被拒的请求),
+# 排查只能靠猜。现在 /api/status 里直接能看到 403 次数和最后一次是谁。
+_DENIED = {"n": 0, "path": "", "page": "", "ip": "", "ts": 0.0}
+
+
+def _note_denied(path, page, ip):
+    try:
+        _DENIED["n"] += 1
+        _DENIED["path"] = path
+        _DENIED["page"] = page or "(无页面标识)"
+        _DENIED["ip"] = ip
+        _DENIED["ts"] = time.time()
+    except Exception:
+        pass
+
+
+def denied_view():
+    with OWN_LOCK:
+        pass
+    d = dict(_DENIED)
+    if d["ts"]:
+        d["ago"] = round(time.time() - d["ts"], 1)
+    d.pop("ts", None)
+    return d
 
 
 def owner_view(page):
@@ -1566,12 +1598,26 @@ class H(BaseHTTPRequestHandler):
         # 被接管之后旧页面一律 403。返回体带 taken_over, 前端据此显示横幅。
         # 注意 /api/status 和 /api/ping **不**在这里 —— 前者是通知通道,
         # 后者是诊断探针, 挡掉它们只会让排查变难。
+        #
+        # ⚠️ "完全没有 page id" 的客户端**只在已经有人上车时才挡**。
+        #
+        # 这一条是踩坑之后加的: 最初写的是 `if not page or ...` —— 只要没带
+        # 页面标识就一律 403。结果前端有一条控制路径 (ctlSend) 漏发了
+        # X-Page-Id, 于是**每一条控制指令都被 403**, 车完全不动; 而前端当时
+        # 又没检查状态码, 把它当成成功, 页面上一切正常 —— 零错误迹象。
+        #
+        # 现在: 没人上车时, 不带标识的客户端 (旧页面 / curl / 脚本) 照常能
+        # 控制 —— 那是这个功能引入**之前**的行为, 不会因为新功能而变砖。
+        # 一旦有人认领了所有权, 规则立刻恢复严格。
         if p in OWNED_POST_PATHS:
             with OWN_LOCK:
                 cur = _OWN["page"]
-            if not page or (cur is not None and cur != page):
+            denied = (cur is not None and cur != page) if page else (cur is not None)
+            if denied:
+                _note_denied(p, page, self.client_address[0])
                 self._json(403, {"ok": False, "taken_over": True,
-                                 "err": "已被其它设备接管"})
+                                 "err": "已被其它设备接管" if page else
+                                        "需要页面标识 (请刷新页面)"})
                 return
 
         # ---- 指令追踪 (诊断): 把每条控制指令连"谁发的"一起记下来 ----

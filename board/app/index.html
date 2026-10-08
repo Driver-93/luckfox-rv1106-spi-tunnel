@@ -1217,11 +1217,34 @@ async function ctlSend(cmd){
   try{
     const r = await fetch(API+cmd.path, {
       method:'POST',
-      headers:{'Content-Type':'application/json'},
+      /* ⚠️ X-Page-Id 是**必需**的, 不是可选的诊断信息。
+       *
+       * 控制类接口在板子侧按"当前所有者"鉴权 (单客户端接管, 见
+       * docs/SINGLE_CLIENT.md)。这里**曾经漏掉这个头**, 后果是:
+       *
+       *   每条控制指令都以空 page id 到达 -> 板子一律回 403 -> 车完全不动。
+       *   而下面当时没有检查 r.status, 于是页面把它当成**成功**:
+       *   apiOk=true / 状态灯绿的"板载直连" / RTT 照常刷新 / 失控保护也不触发。
+       *   用户看到的是"页面上什么都正常, 就是车不动", 板子侧
+       *   /api/motordbg 的 calls 一直是 0 —— 没有任何一处报错。
+       *
+       * 为什么容易漏: 这条路径**不走 api()** —— 它为了精确测 RTT 自己带了
+       * AbortController 和超时。所以"我在 api() 里统一加了头"并不覆盖它。
+       * 加这类全局请求头时, 必须 grep 出**每一个** fetch 调用点。 */
+      headers:{'Content-Type':'application/json', 'X-Page-Id': TAB_ID},
       body: JSON.stringify(cmd.body),
       cache:'no-store',
       signal: ac.signal
     });
+    /* 403 = 被接管了。必须显式处理, 而且**绝不能当成成功** ——
+       否则又回到"一切正常但车不动"那种查不出来的状态。 */
+    if(r.status === 403){
+      ctlFail++;
+      setApi('warn','已被接管');
+      onTakenOver();
+      return;
+    }
+    if(!r.ok) throw new Error('HTTP '+r.status);
     apiOk = true; failCount = 0; setApi('ok','板载直连');
     ctlSent++;
     ctlRtt = performance.now() - t0;
