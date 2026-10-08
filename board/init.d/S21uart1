@@ -1,0 +1,47 @@
+#!/bin/sh
+# /etc/init.d/S21uart1 -- 应用 UART1 overlay (GPS 在 GPIO 68/69, 物理脚 21/22)
+#
+# ⚠️ 与 S21spitun 同样的规矩: 本脚本只做快速的 sysfs 写 (overlay 应用),
+#    绝不放阻塞命令; configfs 自己挂 (S22 阶段还没挂)。
+#    overlay 文件: /userdata/hwcfg/uart1_gps.dts / .dtbo
+
+DTS=/userdata/hwcfg/uart1_gps.dts
+DTBO=/userdata/hwcfg/uart1_gps.dtbo
+OVL=/sys/kernel/config/device-tree/overlays/uart1
+
+log() { echo "[S21uart1] $1"; }
+
+start() {
+    [ -d /sys/kernel/config/device-tree ] || {
+        mkdir -p /sys/kernel/config 2>/dev/null
+        grep -q configfs /proc/mounts || \
+            mount -t configfs none /sys/kernel/config 2>/dev/null
+    }
+    [ -d /sys/kernel/config/device-tree ] || { log "configfs 不可用, 跳过"; return 0; }
+
+    [ -e /dev/ttyS1 ] && { log "ttyS1 已存在"; return 0; }
+
+    if [ ! -f "$DTBO" ] && [ -f "$DTS" ]; then
+        dtc -@ -I dts -O dtb -o "$DTBO" "$DTS" 2>/dev/null
+    fi
+    [ -f "$DTBO" ] || { log "!! $DTBO 不存在"; return 0; }
+
+    [ -d "$OVL" ] && { echo 0 > $OVL/status 2>/dev/null; rmdir $OVL 2>/dev/null; }
+    mkdir -p $OVL
+    cat "$DTBO" > $OVL/dtbo
+    echo 1 > $OVL/status
+    sleep 1
+    log "overlay applied: ttyS1=$([ -e /dev/ttyS1 ] && echo yes || echo no)"
+    return 0
+}
+
+stop() { :; }
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) start ;;
+    status)  echo "ttyS1: $([ -e /dev/ttyS1 ] && echo 存在 || echo 缺失)"; \
+             echo "overlay: $(ls /sys/kernel/config/device-tree/overlays/ 2>/dev/null | tr '\n' ' ')" ;;
+    *) echo "usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

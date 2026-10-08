@@ -1,0 +1,51 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * Luckfox Pico Pro Max (新固件 2025-06-26) -- 启用 SPI0 (给 spinet.py 用)
+ *
+ * ⚠️ 关键: 这套架构跑的是【用户态 spinet.py】, 它需要 /dev/spidev0.0。
+ *    所以 spidev@0 必须 **enabled** (和 spitun.ko 相反 —— 那个要禁用 spidev)。
+ *
+ *    spinet.py 架构:
+ *      /dev/spidev0.0  <-> SPI  <->  ESP32-C5
+ *      /dev/net/tun    <-> 内核网络栈
+ *
+ * phandle (读自本固件 /proc/device-tree/pinctrl/spi0/):
+ *   spi0m0-clk  = 0x46 (gpio49, 物理脚14)
+ *   spi0m0-miso = 0x47 (gpio51, 物理脚16)
+ *   spi0m0-mosi = 0x48 (gpio50, 物理脚15)
+ *   spi0m0-cs0  = 0x49 (gpio48, 物理脚12)
+ *
+ * spidev 参数: spinet.py 里 SpiLink(speed=24MHz), 但设备树默认可能更低,
+ *              实际速度由用户态 ioctl 设置 (SPI_IOC_WR_MAX_SPEED_HZ)。
+ */
+
+/ {
+	/* ---- 启用 SPI0 控制器 ---- */
+	fragment@0 {
+		target-path = "/spi@ff500000";
+		__overlay__ {
+			status = "okay";
+			pinctrl-names = "default";
+			pinctrl-0 = <0x46 0x47 0x48 0x49>;	/* clk miso mosi cs0 */
+		};
+	};
+
+	/* ---- spidev@0: 必须启用 (spinet.py 用 /dev/spidev0.0) ---- */
+	fragment@1 {
+		target-path = "/spi@ff500000/spidev@0";
+		__overlay__ {
+			status = "okay";
+			spi-max-frequency = <24000000>;
+		};
+	};
+
+	/* ---- fbtft@0: 保留禁用 (它也占 CS0, 会和 spidev 抢) ---- */
+	fragment@2 {
+		target-path = "/spi@ff500000/fbtft@0";
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+};

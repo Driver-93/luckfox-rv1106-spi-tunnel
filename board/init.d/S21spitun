@@ -1,0 +1,102 @@
+#!/bin/sh
+# /etc/init.d/S21spitun -- 开机准备 SPI 隧道环境 (overlay + tun 模块)
+#
+# 顺序: S21appinit < S21spitun < S22spinet < S23web
+#
+# ⚠️⚠️ 最重要的一条 (用两次刷机换来的教训): ⚠️⚠️
+#   本脚本【绝对不能】同步执行会阻塞的命令 (尤其 insmod)。
+#   rcS 是串行跑 S* 的, 一旦某个脚本卡住, 后面的 S40network/S50sshd/S99*
+#   全都不执行 —— 表现是 ping 通但 SSH/Telnet/Web 全死, 只能重新刷机。
+#
+#   所以: 所有 insmod 都放在**后台子 shell** 里, 主脚本立刻返回。
+#
+# 内容:
+#   1) configfs 挂载 (S22 阶段还没挂, 只有 S50usbdevice 会挂)
+#   2) SPI0 overlay (启用 spidev0.0, 给 spinet.py 用)
+#   3) tun.ko (提供 /dev/net/tun)
+#
+# 依赖文件 (都在 /userdata, ubifs 持久):
+#   /userdata/hwcfg/spi0_spidev.dts / .dtbo
+#   /userdata/hwcfg/tun.ko
+
+DTS=/userdata/hwcfg/spi0_spidev.dts
+DTBO=/userdata/hwcfg/spi0_spidev.dtbo
+KO=/userdata/hwcfg/tun.ko
+OVL=/sys/kernel/config/device-tree/overlays/spi0
+
+log() { echo "[S21spitun] $1"; }
+
+# ---- 1. configfs ----
+ensure_configfs() {
+    [ -d /sys/kernel/config/device-tree ] && return 0
+    grep -q configfs /proc/mounts || {
+        mkdir -p /sys/kernel/config
+        mount -t configfs none /sys/kernel/config 2>/dev/null
+    }
+    i=0
+    while [ $i -lt 30 ]; do
+        [ -d /sys/kernel/config/device-tree ] && return 0
+        sleep 0.1; i=$((i+1))
+    done
+    return 1
+}
+
+# ---- 2. SPI overlay ----
+do_overlay() {
+    [ -e /dev/spidev0.0 ] && { log "spidev0.0 已存在"; return 0; }
+    if [ ! -f "$DTBO" ] && [ -f "$DTS" ]; then
+        log "编译 $DTS"
+        dtc -@ -I dts -O dtb -o "$DTBO" "$DTS" 2>/dev/null
+    fi
+    [ -f "$DTBO" ] || { log "错误: $DTBO 不存在"; return 1; }
+
+    [ -d "$OVL" ] && { echo 0 > $OVL/status 2>/dev/null; rmdir $OVL 2>/dev/null; }
+    mkdir -p $OVL
+    cat "$DTBO" > $OVL/dtbo
+    echo 1 > $OVL/status
+    log "overlay status=$(cat $OVL/status 2>/dev/null)"
+}
+
+# ---- 3. tun 模块 (后台, 不阻塞) ----
+load_tun_bg() {
+    if lsmod | grep -q '^tun'; then
+        log "tun 已加载"
+    else
+        ( insmod "$KO" > /tmp/tun_load.log 2>&1; echo "RC=$?" >> /tmp/tun_load.log ) &
+        log "tun insmod 已后台派发"
+    fi
+    # /dev/net/tun 节点 (有些固件不会自动建)
+    if [ ! -e /dev/net/tun ]; then
+        mkdir -p /dev/net
+        mknod /dev/net/tun c 10 200 2>/dev/null
+        chmod 666 /dev/net/tun
+    fi
+}
+
+start() {
+    grep -q debugfs /proc/mounts || mount -t debugfs none /sys/kernel/debug 2>/dev/null
+
+    if ! ensure_configfs; then
+        log "错误: configfs 不可用, 跳过 overlay"
+    else
+        do_overlay
+    fi
+
+    load_tun_bg
+    log "done (后台任务继续)"
+}
+
+status() {
+    echo "SPI overlay: $(ls /sys/kernel/config/device-tree/overlays/ 2>/dev/null | tr '\n' ' ')"
+    echo "spidev0.0:   $([ -e /dev/spidev0.0 ] && echo 存在 || echo 缺失)"
+    echo "tun 模块:    $(lsmod | grep -c '^tun')"
+    echo "dev/net/tun: $([ -e /dev/net/tun ] && echo 存在 || echo 缺失)"
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    log "stop 不做任何事 (overlay/模块保持)" ;;
+    restart) start ;;
+    status)  status ;;
+    *)       echo "usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

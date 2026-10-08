@@ -1,43 +1,58 @@
 {
-  "_说明": [
-    "这是 sanitized 模板, 真实凭据不在仓库里。",
-    "部署时把它拷成 car/car_config.json 并填入你的实际值:",
-    "  cp board/config/car_config.example.json car/car_config.json  然后改 broker/password/token",
-    "pin 段按你的实际接线改 (默认是与 MD240A + TB6612 对应的 GPIO 号)。"
-  ],
   "mqtt": {
-    "broker": "YOUR_MQTT_BROKER",
+    "broker": "150.109.12.233",
     "port": 1883,
     "topic_cmd": "luckfox/car/cmd",
     "topic_status": "luckfox/car/status",
     "heartbeat": 5,
     "username": "car",
-    "password": "YOUR_MQTT_PASSWORD",
-    "token": "YOUR_API_TOKEN"
+    "password": "CHANGE_ME",
+    "token": "CHANGE_ME"
   },
+  "_comment_pin": "方向脚 IN1/IN2 必须是【两个不同的纯 GPIO】, 且不能撞 PWM 脚。PWM 字段仅记录实际 PWM 脚 (供排查), 调速走 pwm_chip。",
+  "_comment_wiring": "2026-10-07 实测接线。PWM: FL=54 FR=73 BL=71 BR=58。FR 原为 IN1=55/IN2=54, 但 54 现在是 FL 的 PWM (pwm10), 54 已被内核夺走做 PWM 不再是 GPIO -> FR.IN2 必须迁到空闲脚。",
+  "_comment_fr_in2": "FR.IN2 从 54 迁到 41。若右前转向相反, 把 FR 的 IN1/IN2 对调即可 (改这里, 不用动线)。",
   "pin": {
     "STBY": 7,
-    "FL": { "IN1": 65, "IN2": 64, "PWM": 67 },
-    "FR": { "IN1": 54, "IN2": 55, "PWM": 58 },
-    "BL": { "IN1": 56, "IN2": 57, "PWM": 68 },
-    "BR": { "IN1": 59, "IN2": 69, "PWM": 70 }
+    "FL": {
+      "IN1": 56,
+      "IN2": 72,
+      "PWM": 57
+    },
+    "FR": {
+      "IN1": 53,
+      "IN2": 54,
+      "PWM": 52
+    },
+    "BL": {
+      "IN1": 58,
+      "IN2": 59,
+      "PWM": 73
+    },
+    "BR": {
+      "IN1": 66,
+      "IN2": 65,
+      "PWM": 55
+    }
   },
+  "_comment_pwm": "硬件 PWM: 4 路电机各自的 pwmchip 号。由 pinctrl 决定, 勿随意改。FL=gpio54=pwm10m1 -> chip10, FR=gpio73=pwm6m1 -> chip6, BL=gpio71=pwm4m1 -> chip4, BR=gpio58=pwm0m1 -> chip0。开机由 /etc/init.d/S22pwm 加载 overlay 后才存在。",
+  "pwm_chip": {
+    "FL": 10,
+    "FR": 8,
+    "BL": 6,
+    "BR": 11
+  },
+  "pwm_freq": 1000.0,
+  "use_hw_pwm": true,
   "failsafe_s": 0.5,
-
-  "_axis_inv_说明": [
-    "轴向取反开关。装配差异(比如驱动板翻面装)导致某个方向反了, 改这里, 不用改代码。",
-    "vx: true = 横移左右对调   (最常见的需求)",
-    "vy: true = 前后对调",
-    "w : true = 原地转左右对调",
-    "只翻 vx 时, 前进/后退/自转的四轮输出完全不变, 只有横移和斜向会翻转。",
-    "留空 {} 或删掉这一段 = 全部不取反(默认)。"
-  ],
-  "axis_inv": {},
-
   "telemetry": {
     "adc_channel": 1,
     "adc_ratio": 8.71,
     "gps_enabled": true,
     "check_4g": true
-  }
+  },
+  "axis_inv": {
+    "vx": true
+  },
+  "gps_uart": "/dev/ttyS1"
 }

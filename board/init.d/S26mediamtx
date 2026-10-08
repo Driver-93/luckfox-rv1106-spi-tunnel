@@ -1,0 +1,119 @@
+#!/bin/sh
+# /etc/init.d/S25mediamtx -- 小车图传 (WebRTC / HLS)
+#
+# ============================================================================
+# 为什么需要这个脚本
+# ============================================================================
+# mediamtx 二进制 38MB, 放不进只有 2.2MB 的 /userdata, 所以它一直在
+# /root/mediamtx/ (rootfs, 重启保留)。
+#
+# 但**一直没有人给它写 init 脚本** —— 于是每次重启后它都不启动。
+# 表现: 8889/8189/8888 端口全不通, 网页里视频一直转圈, 而 rkipc 明明
+# 正常出流 (554 在听)。排查时极容易怀疑网络/隧道, 其实只是没启动。
+#
+# 所以放在 S25: 必须在 rkipc 之后 (要连它的 rtsp://127.0.0.1:554),
+# 也必须在 S23web 之后。
+# ============================================================================
+
+BIN=/root/mediamtx/mediamtx
+CONF=/root/mediamtx/mediamtx.yml
+LOG=/tmp/mediamtx_local.log
+
+# 杀掉正在跑的 mediamtx。
+#
+# ⚠️ 必须用 pidof, **不能**用 `ps | grep mediamtx`。
+#
+# 踩过的坑 (和 S24spinet_wd 的 stop_wd 是同一类, 这是第二次):
+#   `ps | grep '[m]ediamtx'` 里的 `[m]` 只是避免匹配到 grep 自己, 它挡不住
+#   **其它命令行里含 "mediamtx" 的进程**。而本脚本自己的命令行就是
+#       /bin/sh /etc/init.d/S25mediamtx start
+#   —— 含 "mediamtx"。于是脚本执行到这里会**把自己 kill -9 掉**:
+#       * 症状: 开机后 mediamtx 从不启动, 日志文件 /tmp/mediamtx_local.log
+#         压根不创建; 手动跑 `S25mediamtx start` 也只回一个 "Killed" 就没了。
+#       * 更坑的是 ssh 执行时, 把管理员那条 `sh -c "...S25mediamtx..."`
+#         也一起杀掉, 表现为"SSH 命令莫名卡死/超时"。
+#
+# pidof 按**进程名**精确匹配 (进程名是 "mediamtx"), 不会误伤脚本和 shell。
+kill_mtx() {
+    for p in $(pidof mediamtx 2>/dev/null); do
+        kill -9 "$p" 2>/dev/null
+    done
+}
+
+# 兜底: 万一没有 pidof, 用"二进制路径"做匹配 —— 真实进程的命令行是
+# ./mediamtx /root/mediamtx/mediamtx.yml, 含 "mediamtx/mediamtx",
+# 而脚本自身 /etc/init.d/S25mediamtx 不含这个子串。
+mtx_running_pid() {
+    p=$(pidof mediamtx 2>/dev/null)
+    if [ -n "$p" ]; then echo "$p"; return; fi
+    ps | grep '[m]ediamtx/mediamtx' | awk '{print $1}' | head -1
+}
+
+# 等 rkipc 的 RTSP 起来。C5/板子开机时 rkipc 要初始化 ISP, 可能要十几秒,
+# 期间连 554 会失败 —— mediamtx 连不上会自己重试, 但先把 554 等出来
+# 能少很多无谓的报错日志。
+wait_rtsp() {
+    i=0
+    while [ $i -lt 60 ]; do
+        if netstat -tln 2>/dev/null | grep -q ':554 '; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 1
+    done
+    return 1
+}
+
+start() {
+    [ -x "$BIN" ] || { echo "[S25mediamtx] 找不到 $BIN"; return 1; }
+    [ -f "$CONF" ] || { echo "[S25mediamtx] 找不到 $CONF"; return 1; }
+
+    kill_mtx
+
+    echo "[S25mediamtx] waiting for rkipc RTSP :554 ..."
+    if wait_rtsp; then
+        echo "[S25mediamtx] rkipc RTSP ready"
+    else
+        echo "[S25mediamtx] 60s 内没等到 554, 仍然启动 (mediamtx 会自己重连)"
+    fi
+
+    # setsid + 三个 fd 全部挪走。
+    # 不这么做的话, ssh 执行本脚本时会被这个后台进程拖住不返回
+    # (它继承了 sshd 那端的 stdout 管道) —— 这个坑在 S24spinet_wd 里
+    # 已经踩过一次, 这里一并避免。
+    setsid "$BIN" "$CONF" </dev/null >"$LOG" 2>&1 &
+
+    sleep 3
+    if [ -n "$(mtx_running_pid)" ]; then
+        echo "[S25mediamtx] started"
+        return 0
+    else
+        echo "[S25mediamtx] !! 启动失败, 日志:"
+        tail -20 "$LOG"
+        return 1
+    fi
+}
+
+stop() {
+    echo "[S25mediamtx] stopping"
+    kill_mtx
+}
+
+status() {
+    p=$(mtx_running_pid)
+    if [ -n "$p" ]; then
+        echo "running (pid $p)"
+        netstat -tln 2>/dev/null | grep -E ':8889|:8189|:8888|:8554'
+    else
+        echo "not running"
+        exit 1
+    fi
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; sleep 1; start ;;
+    status)  status ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

@@ -376,21 +376,47 @@ def thread_cpu():
     return out[:8]
 
 
+# ---- 轻重分离 (2026-10-08) ------------------------------------------
+# sample() 曾被 telemetry_loop 每秒全量调用, 实测单次 **198.7 ms**
+# (detect_info 逐 fd readlink 扫 /proc + processes 逐 comm 扫 + thread_cpu
+# 逐线程 stat 读) —— 1Hz 就是 ~20% CPU, 仅仅是喂一个每秒刷新一次的
+# 状态面板。
+#
+# 现在: cpu/mem/load/uptime/temp 这些"读一个小文件"的轻字段保持 1Hz;
+# disk/npu/detect/proc/threads 这些"扫 /proc"的重字段每 FULL_EVERY 秒
+# 才算一次, 其余时间返回缓存。返回的 JSON **结构完全不变**, 只是重字段
+# 的刷新从 1s 变成 5s —— 状态面板上根本看不出来。
+# thread_cpu 的差分用真实采样间隔换算, 5s 间隔下百分比仍然正确。
+
+_FULL_EVERY = 5.0
+_last_full = {"t": 0.0, "heavy": None}
+
+
 def sample():
     """一次性采集全部系统状态。每秒调一次, 必须便宜。"""
+    now = time.time()
     pct, cores = cpu_percent()
-    return {
+    out = {
         "cpu": {"pct": pct, "cores": len(cores)},
         "mem": mem_info(),
         "load": loadavg(),
         "uptime_s": uptime_s(),
         "temp_c": temp_c(),
+    }
+    if _last_full["heavy"] is not None and now - _last_full["t"] < _FULL_EVERY:
+        out.update(_last_full["heavy"])
+        return out
+    heavy = {
         "disk": disk_info(),
         "npu": npu_info(),
         "detect": detect_info(),
         "proc": processes(),
         "threads": thread_cpu(),
     }
+    _last_full["t"] = now
+    _last_full["heavy"] = heavy
+    out.update(heavy)
+    return out
 
 
 if __name__ == "__main__":

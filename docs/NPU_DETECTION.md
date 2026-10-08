@@ -2,6 +2,20 @@
 
 > **状态：可用，已持久化（重启自动恢复）**
 >
+> 2026-10-07 晚：10-07 重刷机把整套部署清掉了（模型在 /usr/lib、PET rkipc 在 /oem、
+> ini 被重置），已按第七节步骤重新部署并重启验证：
+> 模型 ✓ enable_npu=1/npu_fps=15 ✓ PET rkipc (md5 c13eff70) ✓
+> 重启后 NPU load 41%，图传 25fps 正常。
+>
+> **本次重部署踩的新坑**：
+> 1. SSH 里跑 `video_ctl._restart_rkipc()` 时 SSH 断连会把 python 一起杀掉，
+>    rkipc/mediamtx 全灭。重活一律写成 .sh 传上去 `setsid` 跑。
+> 2. 杀 rkipc 后 554 被 **udhcpc** 抢占（文档第四节提过，这次真踩到）——
+>    `_restart_rkipc` 的 `_port554_free_force` 能处理，但 python 被杀后没跑到那步。
+>    纯 shell 版重启脚本见仓库根目录 `_npu_restart3.sh`（轮询 554 + inode 反查强杀）。
+> 3. 554 残留 socket 的症状是：554 在 LISTEN 但 Recv-Q 涨、DESCRIBE 超时，
+>    rkipc 日志有 `bind socket to address failed`。
+
 > 这块板子的 NPU 现在真的在跑 **人 / 脸 / 宠物（含狗）** 检测，
 > 检测框由 rkipc 自己画到视频流上 —— **不需要另起进程抢摄像头，不需要写解码器**。
 

@@ -685,6 +685,7 @@ async function playWHEP(){
     }
     if(!resp || !resp.ok) throw new Error('WHEP 不可达');
     await p.setRemoteDescription({type:'answer', sdp: await resp.text()});
+    whepFail = 0;                        // SDP 应答成功, 重试退避清零
   }catch(e){
     /* 没有 HLS 兜底 —— 重试 WebRTC。
        隧道下 WHEP 偶尔会在 C5 会话建立慢时超时, 重试即可恢复;
@@ -694,7 +695,15 @@ async function playWHEP(){
     schedule();
   }
 }
-function schedule(){ clearTimeout(retry); retry = setTimeout(playWHEP, 2000); }
+let whepFail = 0;
+function schedule(){
+  clearTimeout(retry);
+  /* 断线退避 (2026-10-07): 固定 2s 的重试会往 C5 的 NAPT 表堆半开条目
+     (每次重试 = WHEP fetch + ICE-TCP), 灌满后隧道恢复不了, 死锁。
+     连败退到 5s; 成功后清零, 在线时仍是 2s。 */
+  whepFail = Math.min(whepFail + 1, 3);
+  retry = setTimeout(playWHEP, whepFail >= 2 ? 5000 : 2000);
+}
 function stopWHEP(keepVideo){
   clearTimeout(retry); stopStats();
   if(pc){ try{pc.close()}catch(e){} pc=null; }
@@ -864,15 +873,22 @@ async function api(path, body){
    就会叠请求, 进一步挤占控制指令的带宽。 */
 let polling = false;
 let pageVer = null;      // 本页面加载时看到的 index.html 版本 (mtime)
+let pollDelay = 1000;
 async function poll(){
   if(polling) return;
   polling = true;
+  let ok = false;
   try{
     const st = await api('/api/status');
-    if(st) { checkPageVer(st); render(st); }
+    if(st) { checkPageVer(st); render(st); ok = true; }
   } finally { polling = false; }
+  /* 断线退避 (2026-10-07): 隧道断时每 1s 一次的 fetch 会往 C5 的 NAPT
+     连接表里堆半开 TCP 条目, 表灌满后连正向转发都停摆 —— 页面永远连不
+     回来, 死锁。退避到最多 8s 给 C5 的表排空时间; 在线时保持 1s 不变。 */
+  pollDelay = ok ? 1000 : Math.min(pollDelay * 2, 8000);
+  setTimeout(poll, pollDelay);
 }
-setInterval(poll, 1000); poll();
+poll();
 
 /* 陈旧页面自检 (2026-10-05)
  *

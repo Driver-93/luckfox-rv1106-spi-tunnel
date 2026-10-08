@@ -1,0 +1,60 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * Luckfox Pico Pro Max -- 4 路硬件 PWM (电机调速)  v4
+ *
+ * 2026-10-08 用户全部重接线后 (每路顺序: PWM / AIN1 / AIN2):
+ *   左前 FL: pwm 57 (pwm10m2)  AIN 56/72   -> pwmchip10
+ *   右前 FR: pwm 55 (pwm11m1)  AIN 43/42   -> pwmchip11
+ *   左后 BL: pwm 52 (pwm8m1)   AIN 53/54   -> pwmchip8
+ *   右后 BR: pwm 73 (pwm6m1)   AIN 59/58   -> pwmchip6
+ *
+ * phandle (250607 固件实测): pwm8m1=0x38 pwm11m1=0x3c pwm6m1=0x2a pwm10m2=0x3b
+ * 旧引脚 54/58/71 全部释放 (71 无 PWM 功能, v3 只开 pwm0/4/6/10 中的
+ * 0/6/10; v4 改开 6/8/10/11)。
+ *
+ * 老规矩: pinctrl-names 必须是 "active"; 不用 &symbol。
+ */
+
+/ {
+	/* 左前 FL: gpio 57 = pwm10m2 (pwmchip10) */
+	fragment@0 {
+		target-path = "/pwm@ff490020";
+		__overlay__ {
+			status = "okay";
+			pinctrl-names = "active";
+			pinctrl-0 = <0x3b>;
+		};
+	};
+
+	/* 右前 FR: gpio 55 = pwm11m1 (pwmchip11) */
+	fragment@1 {
+		target-path = "/pwm@ff490030";
+		__overlay__ {
+			status = "okay";
+			pinctrl-names = "active";
+			pinctrl-0 = <0x3c>;
+		};
+	};
+
+	/* 左后 BL: gpio 52 = pwm8m1 (pwmchip8) */
+	fragment@2 {
+		target-path = "/pwm@ff490000";
+		__overlay__ {
+			status = "okay";
+			pinctrl-names = "active";
+			pinctrl-0 = <0x38>;
+		};
+	};
+
+	/* 右后 BR: gpio 73 = pwm6m1 (pwmchip6) */
+	fragment@3 {
+		target-path = "/pwm@ff360020";
+		__overlay__ {
+			status = "okay";
+			pinctrl-names = "active";
+			pinctrl-0 = <0x2a>;
+		};
+	};
+};

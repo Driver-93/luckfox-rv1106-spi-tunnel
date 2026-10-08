@@ -1,0 +1,22 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * 启用 UART1 (m1 引脚 = GPIO 69/68, 物理脚 22/21) -- GPS 用
+ *
+ * GPS TXD/RXD 接在 GPIO 68/69 (物理 21/22, WIRING.md 的空闲备用脚)。
+ * uart1 的设备树节点 (serial@ff4b0000) 已经带着 pinctrl-0 = uart1m1
+ * 的 phandle, 所以这里只需 status = okay。
+ *
+ * 注意: 数字 phandle 0x41 已经在基座节点里, 本 overlay 不引用任何
+ * &symbol (本内核 DTB 无 __symbols__, 引用会编译成 0xffffffff)。
+ */
+
+/ {
+	fragment@0 {
+		target-path = "/serial@ff4b0000";
+		__overlay__ {
+			status = "okay";
+		};
+	};
+};

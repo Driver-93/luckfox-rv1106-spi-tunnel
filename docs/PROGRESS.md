@@ -3,7 +3,7 @@
 > 目标：**无线（无网线）下，图传 + 遥控稳定、延迟低。**
 > 原则：**删代码优于加代码**；优化优先，代码简洁高效。
 > 最近更新：内核 TUN 架构落地 → 应用层代理全部删除 → 460 次压测零失败。
-> 历史排查细节见 `docs/ISSUES.md`；本文档只保留**当前有效**的信息。
+> 历史排查细节见 `car/ISSUES.md`；本文档只保留**当前有效**的信息。
 
 ---
 
@@ -63,7 +63,7 @@
 
 ### 2. C3 侧 spi0 网卡 + NAPT + 端口映射
 
-`firmware/c5-tunnel/spinet.{c,h}`（约 230 行）：
+`spi_tunnel_c3/main/spinet.{c,h}`（约 230 行）：
 
 - 纯点对点 lwIP 网卡 `spi0 = 10.77.0.1/24`，无以太头、无 ARP
 - **`napt` 标志打在 spi0（LAN 侧）上** —— ESP-IDF NAPT 的关键约定，
@@ -374,7 +374,7 @@ netstat -lun | grep :8189
 tail -20 /tmp/mediamtx_run.log
 
 # 云端编译 / 本地烧录
-ssh -i server_car.pem ubuntu@YOUR_SERVER_IP "bash ~/c3_build_tun.sh"
+ssh -i server_car.pem ubuntu@150.109.12.233 "bash ~/c3_build_tun.sh"
 powershell -File _flash_c3.ps1        # COM5
 
 # 验证
@@ -398,8 +398,8 @@ powershell -File _soak_tun.ps1 -Count 400
 
 | 文件 | 作用 |
 |---|---|
-| `firmware/c5-tunnel/spinet.c/.h` | **新增** C3 侧 spi0 网卡 + NAPT + 端口映射 |
-| `firmware/c5-tunnel/tunnel.c/.h` | `TUN_T_IP` 帧类型 + 高优先 IP 队列（已删应用层状态机）|
+| `spi_tunnel_c3/main/spinet.c/.h` | **新增** C3 侧 spi0 网卡 + NAPT + 端口映射 |
+| `spi_tunnel_c3/main/tunnel.c/.h` | `TUN_T_IP` 帧类型 + 高优先 IP 队列（已删应用层状态机）|
 | `car/spinet.py` | 纯 TUN 隧道，634 行 |
 | `_install_tunko.sh` → 板子 `S14tun` | tun.ko 持久化与加载 |
 | `_build_tun_final.sh` / `_c3_build_tun.sh` | 云端编译 tun.ko / C3 固件 |
@@ -582,7 +582,7 @@ Fri Sep 25 11:06:18 UTC 2026  tunnel WEDGED (no status for 28800s) -> restarting
 **注意：`ABC_Wi-Fi5` 和 `HUAWEI-ER15NM_5G` 是同一台路由器**
 （BSSID 前缀都是 `e2:87:4b:fd:13`），只是不同 SSID。用户确认换 HUAWEI，密码相同。
 
-改了三处（`firmware/c5-tunnel/main.c`，**真正的 C5 工程**）：
+改了三处（`spi_tunnel_c3/main/main.c`，**真正的 C5 工程**）：
 
 1. **候选 SSID 列表 + 自动轮换**。原来写死一个 SSID，连不上就永远空转。
    现在 20 次失败后自动切下一个候选，配置改完立刻重连：
@@ -635,13 +635,13 @@ main: SCAN: 扫描失败 ESP_ERR_WIFI_STATE
 
 ### D. ⚠️ 踩到的大坑：**改错了工程**
 
-服务器 `YOUR_SERVER_IP` 上的 `~/firmware/c5-tunnel` 是 **`esp32c3`** 目标，
+服务器 `150.109.12.233` 上的 `~/spi_tunnel_c3` 是 **`esp32c3`** 目标，
 而板子跑的是 **ESP32-C5**（`band mode:0x3`、240MHz、`HAL_MAC_ESP32AX`）。
 服务器的 esp-idf 里**只有 c3/c6，根本没有 c5**。
 
 **真正的 C5 工程在本机**：
 ```
-C:\Users\pcX\Documents\luckfox-flash\firmware/c5-tunnel      ← esp32c5, 240MHz
+C:\Users\pcX\Documents\luckfox-flash\spi_tunnel_c3      ← esp32c5, 240MHz
 C:\Espressif\frameworks\esp-idf-v5.5.5                  ← 本机工具链
 ```
 `main.c` 时间戳 `2026/9/30 19:00:25`、bin `19:02:14`，与 C5 启动日志里
@@ -1060,7 +1060,7 @@ bind socket to address failed : Address already in use
 | 锁定 | 开/关 | 防止 ISP 的 AE 把手动值改回去 |
 | 恢复自动 | | 解除锁定交回 ISP |
 
-新增文件：`board/app/cam_ctl.py`（v4l2 读写 + 锁定后每 0.5s 重写压住 AE）
+新增文件：`car/cam_ctl.py`（v4l2 读写 + 锁定后每 0.5s 重写压住 AE）
 接口：`GET /api/cam` 读、`POST /api/cam` 写 `{exposure,gain,lock}`
 
 **为什么必须"锁定"**：ISP 自带的自动曝光每秒都在重算，会把手动设的值
@@ -1134,7 +1134,7 @@ RTC 本身完全正常（`hwclock` 与系统时间差 1 秒），纯粹是时区
 
 用户要求"根据所在位置自动设置"，所以不是写死 CST-8。
 
-新增 `board/app/gps_tz.py`：
+新增 `car/gps_tz.py`：
 1. 从 `/api/status` 读 GPS 经纬度（web_server 已在解析 NMEA）
 2. 经度 / 15 得粗略时区，再用**国家边界表覆盖** —— 中国横跨 73~135 度，
    按经度会算出 UTC+5~+9，实际统一 UTC+8
@@ -1832,7 +1832,7 @@ frames=200038 fail=477 bad_magic=477 bad_csum=0
 
 #### ✅ 已烧录验证（2026-10-05，实测数据）
 
-构建：`firmware/c5-tunnel.bin` 985,296 字节（`spi_slave.c` / `tunnel.c` / `main.c` 全部重编），
+构建：`spi_tunnel_c3.bin` 985,296 字节（`spi_slave.c` / `tunnel.c` / `main.c` 全部重编），
 esptool 烧 COM6，哈希校验通过。
 
 | 指标 | 修复前 | **修复后** |
@@ -1956,7 +1956,7 @@ $env:PATH = 'C:\Espressif\tools\cmake\3.30.2\bin;C:\Espressif\tools\ninja\1.12.1
 1. **摄像头曝光滑块上游未决**（见 C 节）—— 平台不支持实时调 raw exposure。
 2. **GPS 无定位**（见 D 节，疑似天线/室外条件）。
 3. **init 脚本没进固件**：`/etc/init.d/S*` 每次刷机都会被清掉。
-   已提供 `tools/deploy/deploy-all.sh` 一键重装（见下文 二十）。
+   已提供 `deploy_all.sh` 一键重装（见下文 二十）。
 
 ---
 
@@ -2090,9 +2090,9 @@ mediamtx 二进制 38MB，放不进 2.2MB 的 `/userdata`，所以一直在
 
 | 文件 | 用途 |
 |---|---|
-| `board/init.d/S20lo` | 修 `lo` 回环地址 |
-| `board/init.d/S25mediamtx` | 图传服务 init 脚本 |
-| `tools/deploy/deploy-all.sh` | **刷机后一键重装全部 init 脚本并启动** |
+| `car/S20lo` | 修 `lo` 回环地址 |
+| `car/S25mediamtx` | 图传服务 init 脚本 |
+| `deploy_all.sh` | **刷机后一键重装全部 init 脚本并启动** |
 | `verify_reboot.sh` | 重启后 12 项自动验收 |
 | `verify_all.sh` | 隧道/服务/摄像头/网页综合体检 |
 | `test_video.ps1` | 从 PC 测 HLS + WHEP |
@@ -2194,7 +2194,7 @@ wdt: watchdog@ff5a0000 {
    - 用 **pidfile** 停进程，**不用** `ps | grep watchdog | kill` ——
      那个写法在本项目已经踩过三次坑（见二十节 D）。
 
-3. **`tools/deploy/deploy-all.sh`** 加入 S21wdt。
+3. **`deploy_all.sh`** 加入 S21wdt。
 
 ### E. ⏳ 仍待解决：卡死的**根本原因**
 
@@ -2344,14 +2344,14 @@ Usage: watchdog [-t N[ms]] [-T N[ms]] [-F] DEV
 
 | 文件 | 说明 |
 |---|---|
-| `board/init.d/S21wdt` | **新增** 硬件看门狗喂狗服务 |
-| `board/init.d/S20lo` | 修 `lo` 回环地址（上轮新增） |
-| `board/init.d/S25mediamtx` | 图传 init 脚本（上轮新增，本轮修自杀 bug） |
-| `board/app/video_ctl.py` | **新增曝光档位**（EXPOSURE 表 + exposure_switch/info） |
-| `board/app/index.html` | 曝光滑块 → 曝光档位按钮（删掉无效的实时滑块） |
-| `board/app/web_server.py` | **新增 `/api/exposure`** GET/POST |
-| `tools/deploy/flash-boot.sh` | **新增** MTD 直写烧内核（含备份+校验） |
-| `tools/deploy/deploy-all.sh` | 加入 S21wdt |
+| `car/S21wdt` | **新增** 硬件看门狗喂狗服务 |
+| `car/S20lo` | 修 `lo` 回环地址（上轮新增） |
+| `car/S25mediamtx` | 图传 init 脚本（上轮新增，本轮修自杀 bug） |
+| `car/video_ctl.py` | **新增曝光档位**（EXPOSURE 表 + exposure_switch/info） |
+| `car/index.html` | 曝光滑块 → 曝光档位按钮（删掉无效的实时滑块） |
+| `car/web_server.py` | **新增 `/api/exposure`** GET/POST |
+| `flash_boot.sh` | **新增** MTD 直写烧内核（含备份+校验） |
+| `deploy_all.sh` | 加入 S21wdt |
 | `verify_wdt.sh` / `wdt_reset_test.sh` | 看门狗验证脚本 |
 | `firmware_out/boot_wdt.img` | 带 `&wdt` 的新内核 |
 | 设备树 | `&wdt { status = "okay"; };`（SDK 内，需重新 build 才生效） |
@@ -2469,9 +2469,9 @@ if(m !== lastMove){ pending = {path:'/api/move', ...}; lastMove = m; }
 
 | 文件 | 说明 |
 |---|---|
-| `board/app/web_server.py` | **新增失控保护** `_failsafe_check()` / `MOVETIMEOUT=1.0` / `/api/status` 增加 `failsafe`+`cmd_age` |
-| `board/app/index.html` | 控制循环从"变了才发"改成 **5Hz 心跳**（安全关键，两边必须一起改） |
-| `tools/diagnose/test-failsafe.sh` | **新增** 失控保护验证脚本（6 步，覆盖"误停"和"漏停"两个方向） |
+| `car/web_server.py` | **新增失控保护** `_failsafe_check()` / `MOVETIMEOUT=1.0` / `/api/status` 增加 `failsafe`+`cmd_age` |
+| `car/index.html` | 控制循环从"变了才发"改成 **5Hz 心跳**（安全关键，两边必须一起改） |
+| `test_failsafe.sh` | **新增** 失控保护验证脚本（6 步，覆盖"误停"和"漏停"两个方向） |
 
 ---
 
@@ -2497,7 +2497,7 @@ if(m !== lastMove){ pending = {path:'/api/move', ...}; lastMove = m; }
 * 批量流量（图传）把 64 深的 FIFO 灌满 → 控制指令/响应**排在大包后面**（队头阻塞）
 * 实测：空载 23ms，加载 3.4 Mbps 后 **95ms** —— 3.4 Mbps 远低于隧道能搬的字节数，**瓶颈是排队不是带宽**
 
-**修复**（`driver/spitun.c`，只改板子侧，**C5 固件不用改**）：
+**修复**（`spitun_kmod/spitun.c`，只改板子侧，**C5 固件不用改**）：
 
 1. **每帧打包最多 3 个报文**（3×1352 = 4056 ≤ 4080，格式与 C5 解析端完全一致）
 2. **小包优先队列**：载荷 ≤256B 的（`/api/move` 请求/响应、所有纯 ACK）走高优先级队列，
@@ -2514,7 +2514,7 @@ if(m !== lastMove){ pending = {path:'/api/move', ...}; lastMove = m; }
 **证据**：`/userdata/failsafe.log` 里 20 条记录，**全部集中在用户驾驶时段**
 （18:20 / 18:21 / 18:28 / 18:29 四段 burst，每次"失联 1.0~1.4s -> 停车"）。
 
-**修复**（`board/app/index.html`）：
+**修复**（`car/index.html`）：
 
 * 25ms 巡检，**目标向量一变立刻发**（前导沿，最短间隔 60ms = 最坏 16Hz）
 * 向量没变时按 100ms 发心跳（维持失控保护；停住只发一次 stop）
@@ -2585,10 +2585,10 @@ rst:0x3 (RTC_SW_HPSYS),boot:0x18 (SPI_FAST_FLASH_BOOT)
 
 | 文件 | 说明 |
 |---|---|
-| `driver/spitun.c` | **双队列 + 每帧打包 3 个报文**（`TXQ_HI_LEN` / `TXQ_HI_MAX` / `spitun_tx_pack`），状态行新增 `hi_enq/hi_drop/multipack` |
-| `board/app/index.html` | 控制循环重写：前导沿立即发 + 100ms 心跳 + **400ms 请求超时** |
-| `tools/deploy/reload-tunnel.sh` | **模块热替换 + 自动回滚**（remmod/insmod 会切断远程通道，必须 setsid 后台跑）|
-| `tools/build/build-spitun.sh` | WSL 里编 spitun.ko（`objs_kernel` + 交叉工具链）|
+| `spitun_kmod/spitun.c` | **双队列 + 每帧打包 3 个报文**（`TXQ_HI_LEN` / `TXQ_HI_MAX` / `spitun_tx_pack`），状态行新增 `hi_enq/hi_drop/multipack` |
+| `car/index.html` | 控制循环重写：前导沿立即发 + 100ms 心跳 + **400ms 请求超时** |
+| `reload_spitun.sh` | **模块热替换 + 自动回滚**（remmod/insmod 会切断远程通道，必须 setsid 后台跑）|
+| `_wsl_build_spitun.sh` | WSL 里编 spitun.ko（`objs_kernel` + 交叉工具链）|
 | `ctl_browser_bench.js` | **真浏览器控制延迟基准**（CDP Input 事件 + 页面内 fetch 打桩）|
 | `video_hold.js` | 只开图传的对照实验（用来分离"图传在不在流"的影响）|
 | `_hb_sim.ps1` / `_http_load.ps1` / `_ctl_lat.ps1` | 心跳仿真 / 隧道压测 / 单次往返测量 |
@@ -2652,7 +2652,7 @@ ip route replace 192.168.3.0/24 dev spitun0 src 10.77.0.2 table 100
 * 网线侧发出的包源地址是 eth0 的 → 走主表，**完全不受影响**
 * **不需要知道客户端是谁**，DHCP 怎么变都不会失联
 
-写进 `board/init.d/S22spinet`（开机装）与 `board/init.d/S24spinet_wd`（故障撤掉、恢复补回）。
+写进 `car/S22spinet`（开机装）与 `car/S24spinet_wd`（故障撤掉、恢复补回）。
 
 ### D. ❌ 走过的弯路（重要）
 
@@ -2670,10 +2670,10 @@ ip route replace 192.168.3.0/24 dev spitun0 src 10.77.0.2 table 100
 
 | 文件 | 说明 |
 |---|---|
-| `board/app/index.html` | 页面上新增**心跳指示**（"心跳 N · xxms"）；启动时向板子**自报身份**（版本/参数/UA）；`/api/status` 带页面版本，**文件更新自动重载**（专治"改了没生效"） |
-| `board/app/web_server.py` | `/api/pageinfo`（记录页面身份到 `pageinfo.log`）、`/api/motordbg`（电机内部状态）、`/api/move|cmd|speed` 指令追踪到 `cmd_trace.log`、`/api/status` 增加 `ver` |
-| `board/app/car_motor.py` | 软件 PWM 线程**加异常保护**（原来自旋一次 GPIO 写失败就静默死掉，API 照样返回 ok 而车永远不动）+ `calls/dir_writes/pwm_edges/pwm_alive/pwm_err` 计数器 |
-| `tools/diagnose/watch-failsafe.py` | 单进程观测量（原来 `sh` 循环里每 0.5s 起 python，把单核打到 0% idle，**自己造成了一轮"按了没反应"**）|
+| `car/index.html` | 页面上新增**心跳指示**（"心跳 N · xxms"）；启动时向板子**自报身份**（版本/参数/UA）；`/api/status` 带页面版本，**文件更新自动重载**（专治"改了没生效"） |
+| `car/web_server.py` | `/api/pageinfo`（记录页面身份到 `pageinfo.log`）、`/api/motordbg`（电机内部状态）、`/api/move|cmd|speed` 指令追踪到 `cmd_trace.log`、`/api/status` 增加 `ver` |
+| `car/car_motor.py` | 软件 PWM 线程**加异常保护**（原来自旋一次 GPIO 写失败就静默死掉，API 照样返回 ok 而车永远不动）+ `calls/dir_writes/pwm_edges/pwm_alive/pwm_err` 计数器 |
+| `fs_watch.py` | 单进程观测量（原来 `sh` 循环里每 0.5s 起 python，把单核打到 0% idle，**自己造成了一轮"按了没反应"**）|
 | `c3_serial_capture.ps1` | C5 串口抓取（复位原因）——注意**开串口本身会复位 C5**（`rst:0x15`）|
 
 ---
@@ -2738,11 +2738,11 @@ ip_drop=0
 
 | 文件 | 说明 |
 |---|---|
-| `driver/spitun.c` | 帧级重传 + `TXQ_LEN 256` + `tun_stats` sysfs 属性 + 日志拆两行 |
-| `tools/build/build-spitun.sh` | WSL 构建（`objs_kernel` + 交叉工具链）|
+| `spitun_kmod/spitun.c` | 帧级重传 + `TXQ_LEN 256` + `tun_stats` sysfs 属性 + 日志拆两行 |
+| `_wsl_build_spitun.sh` | WSL 构建（`objs_kernel` + 交叉工具链）|
 | `_ctl_audit.ps1` | **带超时**的控制链路丢包/长尾审计（不会挂住）|
-| `tools/diagnose/watch-spi-loss.py` / `tools/diagnose/tcp-retransmits.py` | 板子侧帧失败率 & TCP 重传观测（单进程，开销 <1%）|
-| `tools/deploy/reload-tunnel.sh` | 热替换 + 自动回滚（回滚目标改成 `/userdata/spitun_prev.ko`）|
+| `spi_loss_mon.py` / `tcp_retx.py` | 板子侧帧失败率 & TCP 重传观测（单进程，开销 <1%）|
+| `reload_spitun.sh` | 热替换 + 自动回滚（回滚目标改成 `/userdata/spitun_prev.ko`）|
 
 ### E. 回滚
 
@@ -2771,25 +2771,3 @@ ip addr: spitun0 10.77.0.2/24   lsmod: spitun 11087 0   (旧版 6359)
 * 4 路基站压测下 **p50 36ms / p90 65ms**，批量吞吐 **6.8 Mbps**（修复前 3.4 Mbps）
 * 真浏览器：动作→请求发出 **p50 15~24ms**，心跳 100~126ms
 
-
-
----
-
-## 附录：时钟 —— 五轮没修好，最后靠"删代码"解决
-
-前面第十几节里记了多次"时区修复"，每次都是**补一层新逻辑**（写 `/etc/TZ`、
-加 `S99rtcinit`、停 `ntpd`、改 `hwclock` 用法），结果是"看着对了、重启又坏"。
-
-最终定位：错误发生在**开机读 RTC 那一刻**（`/proc/stat` 的 `btime` 一开机就快 8 小时），
-所以任何"开机后纠正"的脚本都只能治症。真正的解法是**把所有补偿层删掉**，
-让 `RTC == 系统时钟 == 北京时间读数`，零换算：
-
-* 删除 `/etc/TZ`（`CST-8`）、`/etc/localtime`
-* 删除 `S14timezone`、`S99rtcinit`、`S49ntp`、`gps_tz.py`
-* 不再有任何校时脚本，完全交给内核 `RTC_HCTOSYS`
-
-**完整证据链、实测数据、以及"我自己用错 ioctl 把 RTC 写坏成 2016 年"的事故记录：
-见 [`TIME.md`](TIME.md)。**
-
-> 教训：四层各自做 ±8 换算时，修好一层只是把错误推给下一层。
-> **层数越少、事实来源越少，越不容易坏。**

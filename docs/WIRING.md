@@ -1,11 +1,11 @@
-﻿# Luckfox Pico MAX 4G 遥控小车 — 接线与调试状态说明
+# Luckfox Pico MAX 4G 遥控小车 — 接线与调试状态说明
 
 > 更新: 2026-09-08  实测调通情况见每节【状态】标注
 
 ## ⚠️ 通用前提
 - USB 切 host 模式后 ADB 失效，用网线+SSH（已配置免密 `sshx.ps1` → `SshB "命令"`）访问
 - 板子: `root@192.168.3.66`（Luckfox Pico Pro Max, RV1106, 内核 5.10.160）
-- 服务器: `ubuntu@YOUR_SERVER_IP`（密钥 `Documents\car.pem`，EMQX + mediaMTX 都在上面）
+- 服务器: `ubuntu@150.109.12.233`（密钥 `Documents\car.pem`，EMQX + mediaMTX 都在上面）
 - 所有 GPIO 在 `/etc/luckfox-car/car_config.json` 配置
 
 ## 引脚对照（官方 40pin 实测确认）
@@ -22,17 +22,21 @@
 
 ## 1. SC3336 摄像头 → CSI【✅ 已通】
 - `rkipc` 自启, RTSP: `rtsp://192.168.3.66:554/live/1`
-- ffmpeg 中继循环把流推到服务器 `rtsp://YOUR_SERVER_IP:8554/car` (mediaMTX)
+- ffmpeg 中继循环把流推到服务器 `rtsp://150.109.12.233:8554/car` (mediaMTX)
 
 ## 2. TB6612 四路驱动【✅ 四轮全通 - 2026-09-22】
 实际接线与配置 (已逐个实测确认, 四轮前进方向均正确):
 
 | 通道 | 轮子 | 驱动板信号 | 板子物理脚 | GPIO | 配置项 |
 |------|------|-----------|-----------|------|--------|
-| C | 左前 | CIN1/CIN2/PWMC | **24/25/27** | 65/64/67 | FL (IN1↔IN2 已对调) |
-| A | 右前 | AIN1/AIN2/PWMA | 4/5/9 | 54/55/58 | FR (IN1↔IN2 已对调) |
-| D | 左后 | DIN1/DIN2/PWMD | **14/15/16** | 49/50/51 | BL (IN1↔IN2 已对调) |
-| B | 右后 | BIN1/BIN2/PWMB | 10/11/12 | 59/41/48 | BR |
+| C | 左前 | CIN1/CIN2/PWMC | (2026-10-08 重接) | 56/72/57 | FL (PWM=57=pwm10m2, chip10) |
+| A | 右前 | AIN1/AIN2/PWMA | (2026-10-08 重接) | 53/54/52 | FR (PWM=52=pwm8m1, chip8) |
+| D | 左后 | DIN1/DIN2/PWMD | (2026-10-08 重接) | 59/58/73 | BL (PWM=73=pwm6m1, chip6) |
+| B | 右后 | BIN1/BIN2/PWMB | (2026-10-08 重接) | 65/64/55 | BR (PWM=55=pwm11m1, chip11) |
+
+> 2026-10-08 最终定稿（用户确认）。已弃用/不可用引脚：**42/43**（调试串口脚，
+> 写不进低电平）、**58 曾因 overlay 泄漏假死**（重启恢复，可用）、**71**（250607
+> 固件无 PWM 功能）。GPS: uart1 GPIO 68/69（物理 21/22），PPS=64。
 | — | — | STBY | **未接 (悬空)** | — | 靠驱动板内部上拉 |
 
 ### 🔴 重要: 物理脚 17/19/20 损坏/不通 (已弃用)
@@ -51,7 +55,7 @@
 | 用途 | 物理脚 | GPIO |
 |------|--------|------|
 | 电机 A/B/C/D | 4,5,9,10,11,12,14,15,16,24,25,27 | 54,55,58,59,41,48,49,50,51,64,65,67 |
-| GPS uart4 TX/RX | 6 / 7 | 53 / 52 |
+| GPS uart1 TX/RX | **22 / 21** | **69 / 68** ← 2026-10-08 改接 (uart1m1, overlay: /userdata/hwcfg/uart1_gps.dts, 开机 S21uart1 应用; 软件读 car_config.json 的 gps_uart=/dev/ttyS1) |
 | GPS PPS | 26 | 66 |
 | 电池 ADC (SARADC_IN1) | 32 | 145 |
 | 电源/GND/NC | 3,8,13,18,23,28,34,35,36,37,38,39,40 | — |
@@ -159,7 +163,7 @@
    注: usbat2 响应会错位; 更可靠的是自写的纯 Python usbfs 客户端 `_atclient3.py`
    (**要点: ARMv7 的 USBDEVFS_BULK ioctl = 0xC0105502, 非 x86_64 的 0xC0185502**)
 
-### ✅ SIM 卡测试结果 (2026-09-11, PIN YOUR_SIM_PIN)
+### ✅ SIM 卡测试结果 (2026-09-11, PIN 84602971)
 | 项目 | 结果 |
 |------|------|
 | `ATI` | Quectel EC801E, Rev EC801ECNCGR07A03M02 |
@@ -255,7 +259,7 @@
 
 ## 控制端 / 网页【✅ 已更新】
 - 网页: `/userdata/car/index.html` (本地直接打开)
-- MQTT: `ws://YOUR_SERVER_IP:8083/mqtt`, 用户 car / YOUR_MQTT_PASSWORD, token: YOUR_API_TOKEN
+- MQTT: `ws://150.109.12.233:8083/mqtt`, 用户 car / LuckfoxCar2025!, token: test-secret-123
 - 状态消息 `luckfox/car/status` 新增 `tel` 字段:
   - `bat_mv`/`bat_v`: 电池电压 (ADC×ratio)
   - `gps`: {present, fix, lat, lon, sats, speed_kmh}

@@ -1,0 +1,125 @@
+#!/bin/sh
+# /etc/init.d/S25rkipc -- 摄像头服务 (带硬件检测)
+#
+# ⚠️ 严格遵守"不阻塞 rcS": start 只派发后台任务, 立刻返回。
+#
+# ⚠️ 踩过的坑 (第一版 bug):
+#   `( do_start ) >/dev/null 2>&1 &` 在 rcS 阶段**不可靠** ——
+#   父 shell 退出时子 shell 的 insmod/rkipc 会被连带回收, 结果:
+#   开机后 sc3336 模块没加载、rkipc 也没起来。
+#   改用 setsid 彻底脱离会话 (和 S23web/S24spinet_wd 一致)。
+#
+# 行为:
+#   1) 加载 sc3336.ko
+#   2) 检测 sensor 是否应答
+#   3) 应答了才启动 rkipc; 不应答就记日志退出 (不刷屏)
+#
+# 摄像头接好后: 重启板子自动起, 或手动 /etc/init.d/S25rkipc restart
+
+KO=/oem/usr/ko/sc3336.ko
+RKIPC=/oem/usr/bin/rkipc
+IQDIR=/oem/usr/share/iqfiles
+LOG=/tmp/rkipc.log
+LIBPATH=/oem/usr/lib:/oem/lib
+WORKER=/tmp/.s25rkipc_worker
+
+log() { echo "[S25rkipc] $1"; }
+
+# ⚠️ 不能用 `ps | grep '[r]kipc'` —— 当启动命令的字符串里含 "rkipc" 时
+#    (例如 `sh -c "... /etc/init.d/S25rkipc status ..."`), 那个 shell 自身
+#    也会被匹配到, 造成"rkipc 已在运行"的假象。
+#    改用 ps 的 comm/args 精确匹配二进制路径。
+running() {
+    for p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+        c=$(cat /proc/$p/comm 2>/dev/null)
+        [ "$c" = "rkipc" ] && return 0
+    done
+    return 1
+}
+
+rkpid() {
+    for p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+        c=$(cat /proc/$p/comm 2>/dev/null)
+        [ "$c" = "rkipc" ] && { echo "$p"; return; }
+    done
+}
+
+# 写一个 worker 脚本, 由 setsid 拉起来 (彻底脱离 rcS 会话)
+make_worker() {
+    cat > "$WORKER" <<'EOF'
+#!/bin/sh
+KO=/oem/usr/ko/sc3336.ko
+RKIPC=/oem/usr/bin/rkipc
+IQDIR=/oem/usr/share/iqfiles
+LOG=/tmp/rkipc.log
+LIBPATH=/oem/usr/lib:/oem/lib
+
+# 1) sensor 驱动
+lsmod | grep -q '^sc3336' || { insmod "$KO" 2>/dev/null; sleep 2; }
+
+# 2) 检查 sensor 应答
+if dmesg | grep -q 'sc3336.*Unexpected sensor id'; then
+    echo "[S25rkipc] !! SC3336 无应答 (I2C 无设备) -- 检查 CSI 排线与供电"
+    exit 1
+fi
+
+# 3) 启动 rkipc
+#    ⚠️ 竞态 (2026-10-07 实测踩到): S21appinit -> RkLunch.sh 也会起一个
+#    rkipc, 但它带 2~3 秒延迟。这里立即检查会误判"没在跑"而起第二个,
+#    后者 bind 554 失败却不退出, 白占 ~20MB (128MB 板上很伤)。
+#    所以: 最多等 20 秒, 期间发现 rkipc 出现 (RkLunch 起的) 就让位退出。
+i=0
+while [ $i -lt 20 ]; do
+    for p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+        [ "$(cat /proc/$p/comm 2>/dev/null)" = "rkipc" ] && exit 0
+    done
+    i=$((i + 1))
+    sleep 1
+done
+cd /userdata 2>/dev/null || cd /
+LD_LIBRARY_PATH="$LIBPATH" exec "$RKIPC" -a "$IQDIR" > "$LOG" 2>&1
+EOF
+    chmod 755 "$WORKER"
+}
+
+start() {
+    if running; then
+        log "rkipc 已在运行, 跳过"
+        return 0
+    fi
+    make_worker
+    log "派发后台 worker (setsid, 不阻塞启动)"
+    setsid "$WORKER" </dev/null >/dev/null 2>&1 &
+    return 0
+}
+
+case "$1" in
+    start)   start ;;
+    stop)
+        log "停 rkipc"
+        P=$(rkpid)
+        [ -n "$P" ] && kill -9 "$P" 2>/dev/null
+        log "已停"
+        ;;
+    restart)
+        P=$(rkpid)
+        [ -n "$P" ] && kill -9 "$P" 2>/dev/null
+        sleep 1
+        start
+        ;;
+    status)
+        if running; then
+            echo "rkipc: running (pid $(rkpid))"
+        else
+            echo "rkipc: NOT running"
+        fi
+        echo "sc3336 模块: $(lsmod | grep -c '^sc3336')"
+        if dmesg | grep -q 'sc3336.*Unexpected sensor id'; then
+            echo "sensor:  !! 无应答 (硬件问题)"
+        else
+            echo "sensor:  OK"
+        fi
+        netstat -ltn 2>/dev/null | grep -q ':554' && echo "RTSP :554 监听中" || echo "RTSP :554 未监听"
+        ;;
+    *) echo "usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

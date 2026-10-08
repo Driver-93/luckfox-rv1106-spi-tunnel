@@ -139,7 +139,11 @@ def init_motor():
         # 用配置而不是改代码, 是因为"板子怎么装"属于装配差异,
         # 换一套安装方式不该改源码。
         inv = CONF.get("axis_inv") or {}
-        motor = FourMotor(CONF["pin"], simulate=False, inv=inv)
+        # pwm_chip 必须从配置传入: car_motor 的 DEFAULT_PWM_CHIP 是旧接线的
+        # 硬编码 (FL10/FR6/BL4/BR0), 2026-10-08 重接线后 (FR=11 BL=8) 不传
+        # 就会按旧表 export, 表现为"pwmchip 不存在"。
+        motor = FourMotor(CONF["pin"], simulate=False, inv=inv,
+                          pwm_chip=CONF.get("pwm_chip"))
         motor.start_pwm()
         print("[motor] 已启动 (真实电机模式)  axis_inv=%s"
               % (inv if inv else "{}"))
@@ -179,7 +183,24 @@ def read_adc_mv(ch):
         return raw * ADC_SCALE_MV
     return None
 
-_gps = {"present": os.path.exists("/dev/ttyS4"), "fix": False,
+def _gps_dev():
+    """GPS 串口设备。car_config.json 里 "gps_uart" 可配 (默认 ttyS4)。
+
+    2026-10-08: GPS 实际接在 UART1 (GPIO 68/69, 物理脚 21/22),
+    板上配置为 /dev/ttyS1。uart4 (ttyS4) 是 9 月版方案, 引脚已被占用。
+    """
+    try:
+        with open("/userdata/car/car_config.json", encoding="utf-8") as f:
+            d = json.load(f)
+        v = d.get("gps_uart")
+        if v:
+            return v
+    except Exception:
+        pass
+    return "/dev/ttyS4"
+
+
+_gps = {"present": os.path.exists(_gps_dev()), "fix": False,
         "lat": None, "lon": None, "sats": None, "speed_kmh": None,
         "state": "init", "snr": None, "seen": 0, "bad": 0, "age": None}
 
@@ -222,7 +243,7 @@ def gps_reader():
     + GP (GPS) + BD (北斗) 混发, 且有 '$GNGLL' 也带经纬度。现在按语句类型
     判断, 不依赖 talker 前缀, 稳得多。
     """
-    dev = "/dev/ttyS4"
+    dev = _gps_dev()
     if not os.path.exists(dev):
         return
     import termios

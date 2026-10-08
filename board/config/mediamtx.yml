@@ -42,7 +42,7 @@ webrtcLocalTCPAddress: :8189
 hls: yes
 hlsAddress: :8888
 hlsVariant: lowLatency
-hlsAlwaysRemux: yes
+hlsAlwaysRemux: no
 
 # ---- RTSP 服务 (调试用) ----
 rtsp: yes
