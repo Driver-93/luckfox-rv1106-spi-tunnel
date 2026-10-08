@@ -255,10 +255,28 @@ static int txq_len[TXQ_MAX];
 static int txq_head = 0, txq_cnt = 0;   /* FIFO ring */
 static int txq_full = 0;
 
+/* Small-packet priority queue (ported from the kernel version's design):
+ * control/ACK packets (<= PRIO_MAX bytes) must not wait behind 1350B video
+ * packets. Under streaming, a FIFO tun queue adds 50-200ms to every control
+ * round trip (measured RTT 216 ms while video ran); with priority the
+ * control packet rides in the very next SPI frame. */
+#define PRIO_MAX     128
+#define PRIO_SLOTS   64
+static uint8_t txq_prio[PRIO_SLOTS][PRIO_MAX];
+static int txqp_len[PRIO_SLOTS];
+static int txqp_head = 0, txqp_cnt = 0;
+
 static void txq_push(const uint8_t *pkt, int n)
 {
     int tail;
-    if (n > 1500) n = 1500;
+    if (n <= PRIO_MAX) {
+        if (txqp_cnt >= PRIO_SLOTS) { txq_full++; return; }
+        tail = (txqp_head + txqp_cnt) % PRIO_SLOTS;
+        memcpy(txq_prio[tail], pkt, n);
+        txqp_len[tail] = n;
+        txqp_cnt++;
+        return;
+    }
     if (txq_cnt >= TXQ_MAX) { txq_full++; return; }
     tail = (txq_head + txq_cnt) % TXQ_MAX;
     memcpy(txq[tail], pkt, n);
@@ -269,6 +287,13 @@ static void txq_push(const uint8_t *pkt, int n)
 static int txq_pop(uint8_t *dst)
 {
     int n;
+    if (txqp_cnt > 0) {
+        n = txqp_len[txqp_head];
+        memcpy(dst, txq_prio[txqp_head], n);
+        txqp_head = (txqp_head + 1) % PRIO_SLOTS;
+        txqp_cnt--;
+        return n;
+    }
     if (txq_cnt == 0) return 0;
     n = txq_len[txq_head];
     memcpy(dst, txq[txq_head], n);
@@ -694,6 +719,7 @@ static void pump(void)
     int tun_retry = 0;
     static uint8_t pktbuf[FRAME];
     static uint8_t framebuf[MAX_PAYLOAD];
+    double last_exchange = 0;
 
     outbox_clear();
 
@@ -857,7 +883,24 @@ static void pump(void)
             }
         }
 
-        /* stats + rate line every 200 frames */
+        /* Pace to ~300 exchanges/s max.
+         *
+         * The C pump is FASTER than the C5 slave can re-arm its DMA slots:
+         * at full tilt (340-360 fps) the slave is occasionally unarmed when
+         * the master clocks a frame -> bad magic -> retx (~1% of frames).
+         * Each retx is a 3ms stall + an arrival-latency spike; the spikes
+         * inflate Chrome's jitter buffer (measured 105 ms) and that -- not
+         * the wire -- is the dominant video latency. spinet.py never saw
+         * this because its interpreter overhead accidentally paced it to
+         * 200-290 fps with fails ~= 0.
+         * 3.2ms floor ~= 300 fps cap; wire throughput stays ~7.5 Mbps,
+         * far above the 1.9 Mbps video stream, and the sleep is CPU-free. */
+        {
+            double since = now_s() - last_exchange;
+            if (since >= 0 && since < 0.0032)
+                usleep((useconds_t)((0.0032 - since) * 1e6));
+        }
+        last_exchange = now_s();
         frames++;
         rate_n++;
         if (send_type == T_IP && !is_retseq) rate_bytes += send_len;

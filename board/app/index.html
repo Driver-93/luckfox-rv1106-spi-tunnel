@@ -653,6 +653,10 @@ async function playWHEP(){
       const v = $('video');
       if(e.streams[0]) v.srcObject = e.streams[0];
       else { let s = v.srcObject || new MediaStream(); s.addTrack(e.track); v.srcObject = s; }
+      /* 压低浏览器抖动缓冲 (2026-10-08): 默认 jb 50-100ms 是端到端延迟的大头。
+         30ms 目标 + 本链路 RTT ~25ms, 总延迟可进 60ms 内; WiFi 突发时靠
+         jb 自动回弹兜底 (目标值只是下限, 丢包时 Chrome 会自行拉高)。 */
+      try{ if(e.receiver && 'jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 30; }catch(_){}
       v.play().catch(()=>{});
     };
     p.onconnectionstatechange = () => {
