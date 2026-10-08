@@ -2,371 +2,214 @@
 
 **English** · [中文](README.zh-CN.md)
 
-A complete implementation on a **single-core Linux board**: camera streaming, browser-based
-remote control, failsafe deadman, and the core of this project — a **kernel-mode network
-tunnel that uses an ESP32-C5 as an SPI slave**.
+A complete implementation on a **single-core Linux board**: low-latency video
+streaming, browser remote control, failsafe deadman, NPU person/pet detection,
+GPS — and the core of the project: a **network tunnel that uses an ESP32-C5 as
+an SPI slave to put a board with no wireless interface onto WiFi**.
 
 ```
-        ┌──────────────┐   WiFi    ┌────────────┐   SPI 20MHz   ┌─────────────────┐
-        │  Browser /   │ ────────► │  ESP32-C5  │ ◄───────────► │  Luckfox RV1106 │
-        │    Phone     │           │  WiFi br.  │  4096B frames │  single A7 core │
-        └──────────────┘           │  + NAPT    │               │  spitun.ko      │
-                                   └────────────┘               └─────────────────┘
+      ┌──────────────┐   WiFi    ┌────────────┐  SPI 20MHz    ┌─────────────────┐
+      │  Browser /   │ ────────► │  ESP32-C5  │ ◄───────────► │  Luckfox RV1106 │
+      │    Phone     │  WebRTC   │  WiFi br.  │  4096B frames │  single A7 core │
+      └──────────────┘  ICE-TCP  │  + NAPT    │  spinet_c     │  tun0 = 10.77.0.2
+                                 └────────────┘               └─────────────────┘
 ```
 
-The board has **no IP address on the WiFi subnet** — the SPI tunnel is its only path
-to the outside world.
+The board has **no IP address on the WiFi subnet** — the SPI tunnel is its only
+path to the outside world. Video (WebRTC) and control commands all cross that
+one SPI wire.
 
 ---
+
+## Current state (2026-10-08)
+
+| Item | Status |
+|---|---|
+| Video | H.264 720p 25fps, WebRTC (ICE-TCP) through the tunnel |
+| Tunnel | **C pump** (user space), 6-8% CPU under streaming, 340 frames/s, frame-level retransmit, zero loss |
+| Control | p50 ~28ms, deadman failsafe (auto-stop after 0.5s without heartbeat) |
+| NPU | person/face/pet detection (in-rkipc inference), pet boxes drawn, +3ms latency |
+| GPS | UART1 (GPIO 68/69), NMEA parsing, position/satellites on the web page |
+| Web UI | responsive (PC/phone), joystick + spin buttons + speed slider, status panels |
 
 ## Layout
 
 ```
-firmware/c5-tunnel/     ESP32-C5 firmware (SPI slave + WiFi + NAPT)
-driver/spitun.c         Board-side kernel module: the SPI tunnel (the core)
+firmware/c5-tunnel/     ESP32-C5 firmware (SPI slave + WiFi + NAPT + port maps)
 board/
-  app/                  Board apps (web server / motors / video / camera / GPS)
-  init.d/               Boot chain (filenames match the device EXACTLY, see below)
+  app/                  Board-side applications
+    spinet.py           Tunnel pump (Python version, kept as C fallback)
+    web_server.py       Web server :80 (API / failsafe / telemetry cache)
+    car_motor.py        4x TB6612 motors (hardware PWM + failsafe)
+    sys_stats.py        System stats collection (light/heavy field split)
+    index.html          Control page (single file)
+    video_ctl.py        Video profile/exposure (rkipc config management)
+    cam_ctl.py          Camera parameters
+  spinet_c/spinet.c     Tunnel pump **in C** (current workhorse, see below)
+  init.d/               Boot chain (filenames match the device EXACTLY)
   config/               Config templates (car_config / mediamtx)
-  dts/                  Device-tree overlay for the SPI0 + spitun node
+  dts/                  Device-tree overlays (SPI / PWM / UART1)
+driver/spitun.c         Kernel-mode tunnel (historic, replaced by spinet_c)
 tools/
-  build/                Cross-compilation (kernel / kernel module)
-  deploy/               Deploy (full deploy / module hot-swap / boot-only flash)
-  diagnose/             Measurement (control latency / failsafe / SPI loss / TCP retx)
-  npu/                  NPU person+pet detection (models, patched rkipc, probes)
-docs/                   Documentation and screenshots
+  build/                Cross-compilation
+  deploy/               Deployment (post-flash restore / hot swap)
+  diagnose/             Measurement & observation
+  npu/                  NPU detection (models / patched rkipc / probes)
+docs/                   Documentation (design / lessons / ops)
 ```
 
-### Boot chain (`board/init.d/`)
+### Boot chain (`board/init.d/`, filenames match the device, drop-in usable)
 
-The scripts invoke **each other by name** (e.g. `S24spinet_wd` calls
-`/etc/init.d/S22spinet restart`), so the filenames here match the device
-**one-to-one and are deliberately not renamed** — copying them over just works,
-and it avoids silent failures from "repo name ≠ device name". Purpose is documented
-in a `# 用途:` (purpose) comment at the top of each file:
-
-| File | Purpose |
+| Script | Purpose |
 |---|---|
-| `S20lo` | `lo` loopback (onboard services talk to 127.0.0.1) |
-| `S21wdt` | Hardware watchdog (resets the board if the kernel hangs) |
-| `S22spinet` | **SPI tunnel interface**: address `spitun0` + install the policy route |
-| `S23web` | Onboard web control service (`web_server.py`, listens on :80) |
-| `S24spinet_wd` | **Tunnel watchdog**: restarts on hang/module loss, fixes the route |
-| `S25mediamtx` | Video service (pulls rkipc's RTSP, serves WebRTC/HLS) |
+| `S21spitun` | Mount configfs + apply SPI0 overlay (spidev) + load tun.ko |
+| `S21uart1` | Apply UART1 overlay (GPS on GPIO 68/69) |
+| `S22pwm` | Apply 4-channel hardware PWM overlay (motor speed) |
+| `S22spinet` | Start **spinet_c** (falls back to spinet.py) + tun0 address + return policy route |
+| `S23web` | web_server.py (:80, control + video page) |
+| `S24spinet_wd` | Tunnel watchdog (relaunches the pump if it dies) |
+| `S25rkipc` | Camera (starts rkipc only after the SC3336 answers on I2C) |
+| `S26mediamtx` | Video service (pulls rkipc RTSP → WebRTC; HLS on demand only) |
 
-> **Clock**: this board **deliberately has no timezone** and no time-sync script.
-> `/etc/TZ`, `/etc/localtime`, `S99rtcinit` and `S49ntp` were all removed.
-> `RTC == system clock == Beijing wall-clock reading`, zero conversion, so the
-> camera's burned-in OSD timestamp is simply correct.
-> Root cause and evidence: [`docs/TIME.md`](docs/TIME.md) —
-> **it took five failed attempts to find the real cause; worth a read.**
+> Naming: "spinet" in `S22spinet`/`S24spinet_wd` is a historic name (the tunnel
+> used to be a Python process). The current pump is the C program built from
+> `board/spinet_c/spinet.c`.
 
-> Note: "spinet" in `S22spinet` / `S24spinet_wd` is a **historical name** (the tunnel
-> used to be a userspace Python process, `spinet.py`). The tunnel now lives in the
-> kernel; these two scripts only configure the interface and run the watchdog.
-> The names stay because that is what the device calls them.
+### Why the tunnel pump is C (spinet_c)
 
-### Where to look
+The tunnel is a **340 exchanges/s full-duplex SPI loop** — per-frame overhead
+is everything:
 
-| Interested in | Read |
-|---|---|
-| How the tunnel works and why | `driver/spitun.c` + `docs/SPI_TUNNEL_DESIGN.md` |
-| Measured latency-bottleneck analysis | `docs/SPI_LATENCY_ANALYSIS.md` |
-| **Why the clock has no timezone** | `docs/TIME.md` |
-| **The correct way to restart rkipc** | `docs/VIDEO_RESTART.md` (a procedure born from mistakes) |
-| **NPU person+pet detection (live)** | `docs/NPU_DETECTION.md` (measured: works, persistent, +3ms latency) |
-| **Deploy "didn't take effect" — check first** | `docs/USERDATA_SPACE.md` (`/userdata` is only 2.2MB) |
-| Full development log and pitfalls | `docs/PROGRESS.md` |
-| Hardware wiring | `docs/WIRING.md` |
-| Deploying to the board | `board/init.d/` + `tools/deploy/` |
-| Debugging | `docs/ISSUES.md` + `tools/diagnose/` |
-
----
-
-## Interface
-
-Browser client (same page for PC and phone, responsive):
-
-![Control UI - desktop](docs/images/ui-desktop.png)
-
-| Mobile | Telemetry / debug panels |
-|---|---|
-| ![Control UI - mobile](docs/images/ui-mobile.png) | ![Debug panels](docs/images/ui-debug-panels.jpg) |
-
-### System status
-
-Four **ordinary status cards**, visually identical in size to 电池 / GPS / WiFi / 4G / 状态
-(all nine measured at exactly `161x75`, equal width within every row):
-
-| Card | Value | Sub-label |
+| Implementation | CPU under streaming | Notes |
 |---|---|---|
-| **系统** (system) | CPU usage % | load · uptime |
-| **NPU 检测** | detection fps | NPU in use / idle · holder |
-| **内存 / 温度** | memory usage % | used/total · SoC temperature |
-| **SD 卡** | **free space** | used % · capacity |
+| Python (spinet.py) | 17~25% | ~0.5ms/frame interpreter tax |
+| Kernel module (spitun.ko) | ~1-3% | Was deployed; not fully validated against the C5 firmware; **shelved** |
+| **C user space (spinet_c)** | **6~8%** | Current: nearly all of the kernel version's benefit; a bug just kills a process that the watchdog relaunches |
 
-The page reads a `sys` snapshot that the board collects inside its **existing 1Hz
-telemetry loop** — the browser never triggers collection itself, so these cards add
-**zero** load to the board (and ~570 bytes to the response).
+spinet.py → spinet.c is a line-faithful port. All protocol details preserved:
+sliding window + frame-level retransmit, 3 IP packets per frame, idle probes
+that never consume a sequence number, C5-reboot resync, idle backoff
+(1→4→8ms). Rollback: delete the spinet_c binary and reboot.
 
-Design choices:
-
-* **CPU/memory/SD use progress bars** (utilisation); **NPU/detection use a dot + value**
-  (on/off state).
-* **The SD card shows *free* space, not used** — what matters is how much is left, and
-  filling it makes deployment fail silently (see `docs/USERDATA_SPACE.md`).
-* With no card inserted it says `未挂载 / 没插卡或挂载失败` rather than `--`.
-
-⚠️ Two opposite meanings — thresholds must stay separate (sharing them caused a bug):
-
-| Kind | Meaning | Colours |
-|---|---|---|
-| CPU / memory / SD | **Utilisation** | more = worse (CPU ≥70% yellow, ≥90% red; SD ≥75% yellow, ≥90% red) |
-| NPU / detection | **On/off state** | healthy green / unconfirmed yellow / fault red |
-
-> **Three pitfalls, all reproduced on hardware**:
->
-> 1. **`repeat(4, 1fr)` is not strictly equal-width.** A grid item's `min-width`
->    defaults to `auto` (no smaller than the content's minimum), so the WiFi card's long
->    sub-label (`C5 192.168.3.69 · 堆 109KB · 在线 4304s`) stretched that column to
->    193px — 44px wider than its neighbours in the same row. Fixed with
->    `repeat(4, minmax(0, 1fr))`, letting `.s`'s existing `ellipsis` handle overflow.
-> 2. **`web_server.py`'s `/proc/<pid>/comm` is `python3`** (comm is the thread name,
->    not the script name), so matching on comm made the "web" service look permanently
->    missing. It now re-reads `cmdline` for `python*` processes.
-> 3. **A stray hardcoded `font-size:13px`** among otherwise-unified sizes made some
->    cards' values and bars sit 1px higher than their row neighbours. All values now
->    use the stylesheet's unified size.
-
-
-### On-screen controls (OSD)
-
-Controls are styled like a **video player's OSD** (they fade in when you hover or tap
-the video) and are deliberately small so they don't cover the picture:
-
-* **Top-left HUD (always visible)**: `RTT xxms · video …`, placed just below the
-  camera's burned-in watermark so the two don't overlap. RTT is the true round-trip of
-  a control command — the fastest way to see whether the control link is healthy.
-  It **stays visible even when video is down** (`0B/s`), because that is exactly when
-  you need to know whether control still works. Colour-coded: <80ms green, <200ms yellow, above red.
-* **Bottom control bar**: tapping "exposure 1/1000" or "quality 720p" opens a
-  **pop-up menu** (semi-transparent, the video shows through), which closes on select.
-* **Failsafe warning** — the board tracks the fraction of command intervals that exceed
-  the deadman timeout ("false-stop rate") and turns the page red above 5%.
-
-### Controls: press, don't drag
-
-The panel has exactly **one** slider (speed) and **one** big button:
-
-* **Spin in place**: two **rounded isosceles right triangles** anchored to the
-  **top-left / top-right corners of the joystick disc**. The right angle is at the
-  outer top corner and the hypotenuse slopes inward-down (left `◤`, right `◥`, strictly
-  mirrored), each containing 左/右 (left/right) text placed on the triangle's
-  **centroid** (measured centring error: 0.0px).
-
-  ```
-  ╭──────────╮
-   ╲  left   │
-    ╲        │
-     ╲       │
-      ╲      │
-  ```
-
-  Sitting on the disc's corners and sized generously (86px on mobile) means both thumbs
-  land there naturally without moving your palm. The triangles sit over the disc's
-  **empty bounding-box corners** (222px from centre vs a 150px radius, measured), so
-  they never block the joystick — the centre and the "forward" zone remain clickable.
-  This replaced a rotation *slider*: holding a slider position one-handed is awkward,
-  whereas **hold to turn, release to recentre** is both better feel and a natural
-  failsafe. Turn amount ramps smoothly to ±70% over ~700ms and the triangle turns blue
-  while held.
-
-  > Implemented with **`clip-path: path()`** (SVG path) rather than `polygon()`:
-  > `polygon()` has only sharp corners and **cannot round them**, while `path()`
-  > supports arcs, letting each corner get its own radius (r=12 at the right angle,
-  > r=4 at the two acute corners). `border`-drawn triangles were also ruled out —
-  > they are pseudo-elements and **cannot contain text**.
-
-* **"■ Stop / recentre" is one button doing both jobs.** It used to be three buttons
-  (stop / recentre stick / brake), but while driving, "stop" and "recentre" are always
-  the same action. Splitting them just invites a mis-tap under pressure. The single
-  button zeroes the motion vector → **clears keyboard state** → visually recentres the
-  knob → stops the spin and sends `stop`.
-
-> **Three pitfalls, all reproduced on hardware**:
->
-> 1. **`setPointerCapture` makes `pointerleave` never fire.** The triangle buttons
->    originally captured the pointer, which broke "hold, then drag the pointer away" —
->    the car kept spinning. That is dangerous on an RC car. Now there is no capture;
->    `pointerup/pointercancel` are bound on `window` and `pointerleave` covers the rest.
-> 2. **The stop button must clear keyboard state.** Otherwise "hold `W`, then click stop"
->    makes the car **immediately drive again** (`w` is still in `keys`, and the next
->    `keyApply` pushes it back).
-> 3. **`border`-drawn triangles with two transparent sides give an isosceles triangle**,
->    and pseudo-elements cannot hold text. Shape is therefore cut from the button itself
->    with `clip-path`. (There was also a detour: assembling "vertical edge against the
->    disc" arrows out of borders — correct direction, wrong shape and position.)
-
-> **Why exposure/quality are presets, not sliders**: ISP parameters are latched when
-> rkipc starts, so changing any camera parameter requires **restarting rkipc (~20s of
-> video interruption)** — a hard constraint. Hence discrete presets.
-> Exposure presets are measurably effective (1/1000 → ISP exposure=41, 1/25 → 1624,
-> monotonic and controllable), whereas writing `/dev/v4l-subdev2` directly for a "live
-> slider" is **completely ineffective** on this board — the ISP auto-exposure overwrites
-> it within 800ms. That code was removed.
+> ⚠️ Lesson (two incidents): **device-tree overlays and kernel modules must
+> only be switched at a reboot boundary** — swapping them on a live system
+> leaks IOMUX/properties and causes phantom pin failures or kernel crashes.
+> See `docs/RECOVERY_REPORT.md`.
 
 ---
 
-## Why it's worth a look
-
-Most of this code was not "written" so much as **forced out by three constraints:
-one CPU core, no link-layer retransmission, and no IP path**. Every non-obvious design
-decision has **measured data and the mistakes that led to it** recorded in the comments.
-
-### 1. The SPI tunnel lives in the kernel (`driver/spitun.c`)
-
-It used to be userspace Python (`spinet.py`), which **burned 25–36% CPU busy-polling**
-on the single A7 core and starved the video encoder. Moving it into the kernel dropped
-CPU usage to ~0% and restored the frame rate.
-
-- **Pack multiple IP packets per frame**: frames are a fixed 4096B and one exchange
-  costs 3.1ms. Carrying a single 1350B packet wastes two thirds of every frame →
-  pack 3, throughput ×2.5
-- **Small-packet priority queue**: control commands/ACKs are tens of bytes and should
-  not queue behind 1350B video packets
-- **Frame-level retransmission**: the SPI slave's "arming window" colliding with a host
-  transfer loses an entire frame (measured 0.6–4% steady state, **30% bursts** during
-  boot). The tunnel has no retransmission → a lost frame = the packet is gone forever →
-  you wait for TCP's **RTO ≥200ms**. Retransmitting at the **lowest layer** (~3ms cost)
-  recovered **all** boot-phase failures (`retry=5, retry_ok=5, fail=0`)
-- **Retry budget**: when the C5 is entirely offline every frame fails, and blind retries
-  just spin the main loop (measured 6183 pointless retries) → a budget hands control
-  back to the upper layer
-
-### 2. Return routing uses **source-based policy routing**, not a hardcoded client IP
-
-The board has two paths (eth0 cable / spitun0 tunnel) and a mis-routed reply means total
-loss of contact. It used to hardcode `192.168.3.64`; when the client's DHCP lease changed
-(to `.65`) control went **completely dead** while the board looked perfectly healthy
-(C5 online, tunnel up, CPU idle, local API 12ms).
-
-Now traffic is split by **source address**, so it never needs to know who the client is:
-
-```sh
-ip rule add from 10.77.0.2 lookup 100 pref 100
-ip route replace 192.168.3.0/24 dev spitun0 src 10.77.0.2 table 100
-```
-
-> A dead end worth recording: "self-healing the route per request" inside web_server —
-> **does not work**. The SYN-ACK is emitted by the kernel; without a route the handshake
-> never completes and the handler is never invoked.
-
-### 3. Failsafe deadman + leading-edge heartbeat
-
-The page used to send commands **only when a value changed**, so holding the stick still
-meant no heartbeat, the board stopped the car, and the symptom was "the car stutters".
-Now: **send immediately on any input change + a 100ms heartbeat + request timeout**,
-with a configurable timeout (`failsafe_s` in `board/config/car_config.example.json`) and
-page version self-check (a stale page auto-reloads).
-
-### 4. On one core, every millisecond counts
-
-The comments contain many "this used to cost X% CPU" records: software PWM dropped from
-1kHz to 250Hz; telemetry collection dropped from 5Hz back to 1Hz (`read_adc_mv` costs
-264ms per call — at 5Hz that is 132% of one core, physically impossible); disabling
-Nagle saved 36ms per command.
-
----
-
-## Key measured numbers
+## Measured numbers
 
 | Metric | Value |
 |---|---|
-| SPI single frame | 3.10 ms (1.64ms on the wire @20MHz, **1.46ms fixed overhead**) |
-| Tunnel throughput | 3.42 Mbps before → **9.21 Mbps** after |
-| Control latency (loaded) | p50 95ms → **p50 36ms / p90 61ms / max 78ms** |
-| Control packet loss (loaded) | long tail → **200/200 delivered, 0 loss** |
-| Frame failures (boot phase) | tens of thousands → **fail=0** (all recovered by retransmit) |
-| Control latency (idle) | p50 **24ms**, local loopback 12ms |
-| NPU detection (person+pet) | p50 29ms at `npu_fps=15`; **+3ms** vs no detection |
+| SPI frame | 1.64ms on the wire @20MHz, ~3ms round trip |
+| Tunnel throughput | up to 9.2 Mbps (packing + sliding window) |
+| Control latency (loaded) | p50 36ms / p90 61ms, 0 loss (frame retransmit) |
+| Control latency (idle) | p50 ~25ms |
+| Tunnel pump CPU | 6-8% streaming (Python: 17-25%) |
+| NPU detection | +3ms control latency (npu_fps=15), person/face/pet |
+| web_server idle | 6% (after light/heavy stats split; was 15%) |
 
 ---
 
 ## Hardware
 
-| Part | Model |
+| Part | Model / notes |
 |---|---|
-| Main SoC | Luckfox Pico Pro Max (RV1106, single Cortex-A7, 128MB) |
-| WiFi bridge | ESP32-C5 (SPI slave + NAPT) |
-| Camera | SC3336 3MP (CSI; H.264 encoding done by rkipc) |
-| Chassis | 4WD mecanum wheels + TB6612 ×2 (MD240A) |
-| Video | rkipc (RTSP) → mediamtx (WebRTC / HLS) |
-| NPU | RV1106 NPU (0.5 TOPS) via rockiva, PFP model (Person/Face/Pet) |
+| SoC | Luckfox Pico Pro Max (RV1106, single Cortex-A7, 128MB) |
+| WiFi bridge | ESP32-C5 (SPI slave + NAPT + port maps 80/22/554/8889/8189) |
+| Camera | SC3336 3MP (CSI, H.264 encoded by rkipc) |
+| Chassis | 4WD mecanum + 2× TB6612 |
+| GPS | NMEA serial module (UART1, GPIO 68/69) |
+| NPU | RV1106 NPU, rockiva PFP model (person/face/pet) |
 
-> ⚠️ **Motors must be powered independently.** Running motors off USB/debug power makes
-> inrush current collapse the rail → board/C5 brown out → the tunnel drops for 2 seconds.
-> The C5's serial log has direct evidence: `E BOD: Brownout detector was triggered`.
+### Motor wiring (final, 2026-10-08; per motor: PWM / AIN1 / AIN2)
+
+| Wheel | PWM | AIN1 | AIN2 | pwmchip |
+|---|---|---|---|---|
+| FL | 57 | 56 | 72 | 10 (pwm10m2) |
+| FR | 52 | 53 | 54 | 8 (pwm8m1) |
+| BL | 73 | 59 | 58 | 6 (pwm6m1) |
+| BR | 55 | 65 | 64 | 11 (pwm11m1) |
+
+> ⚠️ **Unusable-pin blacklist** (measured the hard way):
+> GPIO 42/43 — debug-UART pins, output driver dead (write 0 reads 1);
+> GPIO 71 — no PWM function in the 250607 firmware.
+> Battery ADC = SARADC_IN1 (GPIO 145 / header pin 32). Full pin table and
+> change history: [`docs/WIRING.md`](docs/WIRING.md).
+
+> ⚠️ **Motors need their own power supply.** Powering them from USB sags the
+> rail → brownout → tunnel drops (C5 log: `E BOD: Brownout detector was
+> triggered`).
 
 ---
 
-## Deploy
+## Deployment
 
-**1. Configuration** (real credentials are not in this repo; fill in the templates):
+**Full rebuild (after a re-flash)**:
 
-```sh
-cp board/config/car_config.example.json /userdata/car/car_config.json
-# fill in MQTT broker / password / pins
-cp firmware/c5-tunnel/main.c.example firmware/c5-tunnel/main.c
-# fill in WiFi SSID / password, then idf.py build flash
+```bash
+# Flash: board USB into MaskRom, the SocToolKit upgrade_tool works from CLI:
+#   upgrade_tool uf Luckfox_Pico_Pro_Max_Flash_250607/update.img
+# Then one-shot rebuild (over adb or ssh; reinstalls every service):
+tools/deploy/_postflash_restore.sh <board-ip>
+# Two /userdata files still needed by hand: hwcfg/spi0_spidev.dts + hwcfg/tun.ko
 ```
 
-**2. Board side**:
+**Day-to-day app updates**:
 
-```sh
-# apps
+```bash
 scp board/app/* root@<board-ip>:/userdata/car/
-# boot chain (init.d filenames must match the device exactly)
-scp board/init.d/S* root@<board-ip>:/etc/init.d/
-ssh root@<board-ip> "chmod 755 /etc/init.d/S*; reboot"
-# device-tree overlay
-scp board/dts/spi0-tunnel.dts ...     # compile to .dtbo, loaded by hwcfg
+scp board/init.d/S* root@<board-ip>:/etc/init.d/   # filenames must match
+scp board/spinet_c/spinet_c root@<board-ip>:/userdata/car/   # optional
 ```
 
-**3. Kernel module** (must be built against a kernel matching the running one):
+**Config**: `board/config/car_config.example.json` → motor pins / MQTT / GPS
+port. Real secrets never enter the repo (template says CHANGE_ME).
 
-```sh
-tools/build/build-spitun.sh        # run in WSL; produces spitun.ko
-tools/deploy/reload-tunnel.sh      # hot-swap (drops the link for seconds, auto-rollback)
-```
-
-**4. NPU detection** (optional): see [`docs/NPU_DETECTION.md`](docs/NPU_DETECTION.md).
-Summary: copy `object_detection_pfp.data` to `/usr/lib/`, set `enable_npu = 1` and
-`npu_fps = 15`, and (to also draw pet boxes) install the patched rkipc from
-`tools/npu/rkipc-pet-6/`.
+**NPU detection** (optional): models into `/usr/lib/`, `enable_npu=1`,
+`npu_fps=15` (both the ini and the template); for pet boxes also install the
+patched rkipc from `tools/npu/rkipc-pet-6/`.
+See [`docs/NPU_DETECTION.md`](docs/NPU_DETECTION.md).
 
 ---
 
-## Diagnostic tools
+## UI
 
-| Tool | Purpose |
+One responsive page for PC and phone:
+
+![Control UI - desktop](docs/images/ui-desktop.png)
+
+| Mobile | Telemetry / debug panels |
 |---|---|
-| `tools/diagnose/measure-control-latency.sh` | Control round-trip latency breakdown |
-| `tools/diagnose/check-video-stream.sh` | Verify RTSP really produces a stream (not just a listening port) |
-| `tools/diagnose/test-failsafe.sh` | Failsafe verification (covers both false and missed stops) |
-| `tools/diagnose/watch-failsafe.py` | Board-side observation of failsafe trips and C5 resets |
-| `tools/diagnose/watch-spi-loss.py` | SPI frame failure rate / retransmissions |
-| `tools/diagnose/tcp-retransmits.py` | TCP retransmit counters (indirect evidence of loss) |
-| `tools/diagnose/check-boot-time.py` | Verify the clock is right **at boot** (not just after) |
-| `tools/diagnose/measure-frame-exposure.py` | Objective over/under-exposure measurement |
-| `tools/npu/measure-control-latency.py` | Latency measurement with baseline comparison |
-| `tools/npu/probe-npu-stack.sh` | Check the NPU stack is complete |
-| `tools/npu/watch-crash-log.sh` | Persist dmesg to SD so a crash survives a reboot |
-| `tools/npu/rknn_probe.c` | Cross-compiled RKNN probe (validates the inference path) |
-| `tools/npu/verify-npu-detection.sh` | NPU detection acceptance test |
+| ![mobile](docs/images/ui-mobile.png) | ![debug panels](docs/images/ui-debug-panels.jpg) |
+
+The video area carries a player-style OSD: a persistent `RTT · bitrate` HUD
+(color-coded), exposure/quality as pop-up gear menus (ISP parameters require an
+rkipc restart — sliders are pointless), and a red warning when the failsafe
+mis-stop rate exceeds 5%. Spin is two rounded-triangle buttons (hold to spin,
+release to stop). Design notes and pitfalls: [`docs/PROGRESS.md`](docs/PROGRESS.md).
+
+---
+
+## Docs
+
+| Doc | Content |
+|---|---|
+| [`docs/SPI_TUNNEL_DESIGN.md`](docs/SPI_TUNNEL_DESIGN.md) | Tunnel protocol & design |
+| [`docs/SPI_LATENCY_ANALYSIS.md`](docs/SPI_LATENCY_ANALYSIS.md) | Latency breakdown, measured |
+| [`docs/WIRING.md`](docs/WIRING.md) | Final wiring + unusable-pin blacklist |
+| [`docs/RECOVERY_REPORT.md`](docs/RECOVERY_REPORT.md) | Re-flash rebuild / incident post-mortems / ops manual |
+| [`docs/NPU_DETECTION.md`](docs/NPU_DETECTION.md) | NPU detection deployment & tuning |
+| [`docs/VIDEO_RESTART.md`](docs/VIDEO_RESTART.md) | How to restart rkipc safely |
+| [`docs/USERDATA_SPACE.md`](docs/USERDATA_SPACE.md) | /userdata is 2.2MB — deployment discipline |
+| [`docs/TIME.md`](docs/TIME.md) | Why the clock deliberately has no timezone |
+| [`docs/ISSUES.md`](docs/ISSUES.md) | Known issues |
+| [`docs/PROGRESS.md`](docs/PROGRESS.md) | Full development log |
 
 ---
 
 ## Licence
 
 For study and reference only. This involves real hardware — assess safety yourself,
-and **always get the failsafe working before running the car**.
+and **always build the deadman failsafe first**.
