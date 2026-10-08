@@ -75,6 +75,26 @@ def csum16(b):
     return zlib.adler32(b) & 0xFFFF
 
 
+def is_lan_addr(ip):
+    """True for addresses that could collide with a local LAN subnet.
+
+    Only these need a /32 host route over the tunnel: the whole point of
+    learning a peer is that the main routing table would otherwise send its
+    replies out a *different* interface (eth0's 192.168.3.0/24). A public
+    address has no such conflict -- it already follows the default route, which
+    is the tunnel anyway.
+    """
+    try:
+        o = [int(x) for x in ip.split(".")]
+    except ValueError:
+        return False
+    if len(o) != 4:
+        return False
+    return (o[0] == 10
+            or (o[0] == 172 and 16 <= o[1] <= 31)
+            or (o[0] == 192 and o[1] == 168))
+
+
 def _sh(cmd):
     """Best-effort shell command; returns (rc, output) and never raises."""
     try:
@@ -224,6 +244,24 @@ TUN_LOCAL_IP = "10.77.0.2"
 TUN_ADDR     = TUN_LOCAL_IP + "/24"
 TUN_PEER     = "10.77.0.1"        # the C3's spi0 address
 IP_CMD       = "/sbin/ip"
+
+# 高优先级队列的阈值: 载荷 ≤ 这个字节数的报文视为"控制小包", 插队发送。
+#
+# 为什么是 256: 控制指令 (POST /api/move 的请求/响应) 通常几十~一百多字节;
+# 而图传是 H.264 分片, 每片 1350B (TUN_MTU)。256 能干净地把两者分开,
+# 又不会把图传的大包误判成小包。
+# 这个值与内核模块 spitun.c 的 TXQ_HI_MAX 一致。
+#
+# 作用: 图传把普通队列塞满时, 控制包仍能立刻挤进当前帧, 而不是排在
+# 几百个视频包后面 —— 这是把 p90 从 269ms 拉下来的关键。
+SPINET_HI_MAX = 256
+
+# 已学到的对端 /32 主机路由, 每隔这么多秒重新下发一次。
+#
+# 路由表在内核里, 不在本进程里: eth0 的 udhcpc 助手脚本、tun0 重建、
+# 任何一次 `ip route flush` 都能把它抹掉, 而 lan_peers 这个内存字典
+# 完全不知情。不重新下发就会卡死 —— 见 learn_peer() 里的实测记录。
+PEER_REASSERT = 5.0
 
 # _IOW('T', 202, int); the argument is a struct ifreq even though the encoded
 # size is sizeof(int).
@@ -407,10 +445,30 @@ class Tunnel:
 
         # ---- TUN ----
         self.tun = None
+        # 两条发送队列: 普通(图传大包) + 高优先级(控制小包)。
+        #
+        # ⚠️ 为什么需要高优先级队列 (2026-10-08 实测):
+        #   原来只有一条 FIFO。图传满速时队列里全是 1350 字节的视频包,
+        #   控制指令/响应(几十~两百字节)只能排在它们后面等。
+        #   实测后果: p50 只有 39.7ms, 但 **p90 高达 269ms、p99 329ms** ——
+        #   中位数好、体验差的典型"长尾"。
+        #   队列里每积压 3 个包就是 1 帧(约 4.5ms),积压 60 个包就是 90ms,
+        #   再加上 TCP 因丢包触发的 RTO(200ms 起), 就出现了 200~300ms 的尖峰。
+        #
+        #   内核模块版 (spitun.c) 一直有这套机制:
+        #       #define TXQ_HI_LEN  32   /* 高优先级队列 (小包/控制/ACK) */
+        #       #define TXQ_HI_MAX  256  /* 载荷 ≤ 256B 视为小包 */
+        #   用户态 spinet.py 漏掉了, 这里补上。
+        #
+        #   判据: 载荷 ≤ 256B 视为"小包"(控制指令、HTTP 响应、ACK)。
+        #   图传的 H264 分片是 1350B, 不会误入高优先级队列。
         self.ip_txq = collections.deque(maxlen=128)
+        self.ip_txq_hi = collections.deque(maxlen=32)   # 控制/ACK 专用, 插队
         self.ip_tx = 0
         self.ip_rx = 0
         self.ip_drop = 0
+        self.hi_enq = 0             # 高优先级入队计数 (诊断用)
+        self.hi_drop = 0
         self.lan_peers = {}         # ip -> last time a packet arrived from it
         self.peer_idle = 120.0      # seconds before a learned route is withdrawn
         self._last_carrier = None   # eth0 link state
@@ -488,6 +546,22 @@ class Tunnel:
         """
         buf = bytearray()
         limit = FRAME - HDR
+        # ---- 1) 高优先级队列优先上帧 (控制小包插队) ----
+        #
+        # 这一步是"降低控制延迟长尾"的关键: 图传把普通队列塞满时,
+        # 控制包仍然能立刻挤进这一帧, 而不是排在几百个视频包后面。
+        # 只影响发送顺序, 不丢任何包 —— 高优先级空了就照旧走普通队列。
+        q = self.ip_txq_hi
+        while q:
+            pkt = q[0]
+            need = 2 + len(pkt)
+            if len(buf) + need > limit:
+                break
+            q.popleft()
+            buf += len(pkt).to_bytes(2, "little")
+            buf += pkt
+
+        # ---- 2) 再用普通队列填满这一帧剩余空间 ----
         q = self.ip_txq
         while q:
             pkt = q[0]
@@ -540,10 +614,23 @@ class Tunnel:
             if len(pkt) > TUN_MTU:
                 self.ip_drop += 1        # the kernel should not produce these
                 continue
-            if len(self.ip_txq) >= self.ip_txq.maxlen:
-                self.ip_drop += 1
-                continue
-            self.ip_txq.append(pkt)
+            # 小包走高优先级队列(插队), 大包(图传)走普通队列。
+            # 见 __init__ 里对 TXQ_HI 的说明: 这只影响**谁先上帧**, 不丢包。
+            if len(pkt) <= SPINET_HI_MAX:
+                if len(self.ip_txq_hi) >= self.ip_txq_hi.maxlen:
+                    # 高优先级队列满: 退回普通队列, 不要丢
+                    if len(self.ip_txq) >= self.ip_txq.maxlen:
+                        self.ip_drop += 1
+                        continue
+                    self.ip_txq.append(pkt)
+                else:
+                    self.ip_txq_hi.append(pkt)
+                    self.hi_enq += 1
+            else:
+                if len(self.ip_txq) >= self.ip_txq.maxlen:
+                    self.ip_drop += 1
+                    continue
+                self.ip_txq.append(pkt)
             got = True
         return got
 
@@ -569,17 +656,58 @@ class Tunnel:
             return
         src = socket.inet_ntoa(pkt[12:16])
         now = time.time()
-        if src in self.lan_peers:
-            self.lan_peers[src] = now
+        seen = self.lan_peers.get(src)
+        first = seen is None
+        if first:
+            if src.startswith("10.77.") or len(self.lan_peers) >= 16:
+                return
+            if not is_lan_addr(src):
+                # A public source address (the board's default route is the
+                # tunnel, so internet replies arrive over it too) can never
+                # collide with a directly-connected interface subnet, so it
+                # needs no host route. Learning it anyway burned one of the 16
+                # peer slots and installed a pointless /32 -- 119.28.183.184
+                # was observed doing exactly that.
+                return
+        elif now - seen < PEER_REASSERT:
+            # Do NOT touch the timestamp here. It records when the route was
+            # last ASSERTED, and housekeeping() uses it both to decide when to
+            # re-assert and to expire peers. Refreshing it on the fast path
+            # (every packet, so many times per second) is what made the
+            # re-assertion below dead code: `now - seen` was always < 5s, so
+            # the /32 was never re-added after something else deleted it.
+            # Measured symptom: 853 packets received from 192.168.3.64 with no
+            # /32 in the routing table and every new connection timing out.
             return
-        if src.startswith("10.77.") or len(self.lan_peers) >= 16:
-            return
+
+        # Re-assert, do not just remember.
+        #
+        # This used to be `if src in self.lan_peers: return`. That cache is a
+        # LIE about the kernel: the host route lives in the routing table, not
+        # in this process, and it can be destroyed by anything else on the
+        # board. Measured failure (2026-10-08): the boot DHCP client for eth0
+        # reinvoked its helper script, which flushes routes, and the /32 for the
+        # browser disappeared -- while lan_peers still held the address, so
+        # learn_peer() returned early forever and NEVER put it back. Result was
+        # a self-locking outage that looked like a tunnel failure:
+        #
+        #   * the browser's existing sessions kept working (Linux caches the
+        #     route in each socket's dst entry at connect time),
+        #   * every NEW connection died, because the board answered the SYN out
+        #     eth0 with its tunnel source address 10.77.0.2.
+        #   * /proc/net/tcp showed the SYN arriving and sitting in state 03
+        #     (SYN_RECV) -- the SYN-ACK was sent out the wrong interface.
+        #
+        # So: re-assert on a timer. Once per PEER_REASSERT seconds per peer is
+        # cheap even on the hot path (one `ip route` fork per 5s, versus 300
+        # frames/s of tunnel traffic).
         self.lan_peers[src] = now
         for verb in ("replace", "add"):
             rc, out = _sh([IP_CMD, "route", verb, src + "/32", "dev", TUN_NAME])
             if rc == 0:
-                print("  [tun] learned peer %s -> replies go via %s"
-                      % (src, TUN_NAME))
+                if first:
+                    print("  [tun] learned peer %s -> replies go via %s"
+                          % (src, TUN_NAME))
                 return
         print("  [tun] !! could not add host route for %s: %s" % (src, out))
 
@@ -991,10 +1119,13 @@ class Tunnel:
                     # actually started carrying traffic, separately from when
                     # tun0 merely existed.
                     print("  [pump] t=%6.1fs  %.0f frames/s, %.1f KB/s up "
-                          "(fails=%d, retx=%d, ip tx=%d rx=%d drop=%d)"
+                          "(fails=%d, retx=%d, ip tx=%d rx=%d drop=%d "
+                          "q=%d/%d hi=%d)"
                           % (_up, rate_n / dt, rate_bytes / dt / 1024,
                              self.stats["err"], retx_count,
-                             self.ip_tx, self.ip_rx, self.ip_drop))
+                             self.ip_tx, self.ip_rx, self.ip_drop,
+                             len(self.ip_txq), self.ip_txq.maxlen,
+                             len(self.ip_txq_hi)))
                 rate_t0 = time.time()
                 rate_n = 0
                 rate_bytes = 0
@@ -1051,23 +1182,33 @@ class Tunnel:
             if not payload and not got_work:
                 idle_streak += 1
                 if idle_streak >= 2:
-                    # Escalating idle backoff. 1ms keeps worst-case added
-                    # latency ~1 frame while giving rkipc/mediamtx/web_server
-                    # the CPU they need -- but 1ms alone still polls at ~230
-                    # probes/s (each round trip is ~3.4ms of wire time), which
-                    # burned ~12% CPU 24/7 whenever nobody was watching the
-                    # video. So keep escalating: after sustained true idle the
-                    # probe rate decays toward ~75/s (8ms), and ANY real work
-                    # (an IP packet to send, T_IP/T_STAT in the reply) resets
-                    # to full speed immediately. Worst-case added latency for
-                    # the first control packet after idle is <= 8ms on top of
-                    # ~28ms RTT. While video streams the queue never empties,
-                    # so this path never runs.
-                    _d = 0.001
-                    if idle_streak >= 30:
-                        _d = 0.008
-                    elif idle_streak >= 10:
-                        _d = 0.004
+                    # Escalating idle backoff -- but a MUCH shallower one than
+                    # the original 1/4/8ms ladder.
+                    #
+                    # Why it matters: the board is the SPI master, so a packet
+                    # waiting on the C5 is only collected when THIS loop next
+                    # clocks a frame. The backoff is therefore added directly to
+                    # control latency, twice per round trip (request in, reply
+                    # out). At the old 8ms cap the idle round trip was
+                    # 2 x (8ms sleep + 2.1ms wire) ~= 20ms on its own; measured
+                    # idle p50 through the tunnel was 28ms.
+                    #
+                    # Measured raw frame cost is only 2.1ms (see
+                    # _spi_bench.py: 470 frames/s is reachable), so the sleep,
+                    # not the wire, was the dominant term.
+                    #
+                    # CPU is why a backoff exists at all: a 4096-byte frame is
+                    # 1.64ms of wire time no matter how empty it is, so polling
+                    # flat out costs ~2.1ms of every iteration forever. This
+                    # ladder keeps the ceiling at 2ms (about 1/3 of the old
+                    # idle CPU) while cutting idle round-trip latency roughly in
+                    # half. While video streams the outbox is never empty, so
+                    # this branch never runs and the loop stays at full speed.
+                    _d = 0.0005
+                    if idle_streak >= 60:
+                        _d = 0.002
+                    elif idle_streak >= 20:
+                        _d = 0.001
                     time.sleep(_d)
             else:
                 idle_streak = 0

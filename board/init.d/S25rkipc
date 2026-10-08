@@ -10,11 +10,24 @@
 #   改用 setsid 彻底脱离会话 (和 S23web/S24spinet_wd 一致)。
 #
 # 行为:
-#   1) 加载 sc3336.ko
-#   2) 检测 sensor 是否应答
-#   3) 应答了才启动 rkipc; 不应答就记日志退出 (不刷屏)
+#   1) 等网络就绪 (bind 需要接口地址)
+#   2) 加载 sc3336.ko
+#   3) 检测 sensor 是否应答
+#   4) 启动 rkipc (带正确 LIBPATH, 含 NPU 模型目录)
 #
-# 摄像头接好后: 重启板子自动起, 或手动 /etc/init.d/S25rkipc restart
+# ⚠️ 2026-10-08 重要变更: RkLunch.sh 里的 rkipc 启动已被禁用
+#    (/oem/usr/bin/RkLunch.sh, 备份在 /userdata/RkLunch.sh.bak)。
+#    现在 **本脚本是 rkipc 的唯一启动者**。
+#
+#    为什么必须这样:
+#      RkLunch 用原厂环境起 rkipc (LD_LIBRARY_PATH 缺 /usr/lib),
+#      NPU 模型加载不了; 本脚本必须杀掉它重建, 于是 rkipc 开机被启两次。
+#      dmesg 实证: venc 初始化 6 次 / 释放 2 次 / rkisp stream on 2 次。
+#      两次 ISP 初始化让"开机到图传"耗时在 29~41s 之间**波动 12s**。
+#      禁用 RkLunch 那份之后: 波动降到 1.8s。
+#
+#    因此原来的"20 秒竞态检测 / 让位 / 杀重建"逻辑**已全部删除** ——
+#    没有竞争者了, 那些等待纯属浪费启动时间。
 
 KO=/oem/usr/ko/sc3336.ko
 RKIPC=/oem/usr/bin/rkipc
@@ -56,6 +69,29 @@ IQDIR=/oem/usr/share/iqfiles
 LOG=/tmp/rkipc.log
 LIBPATH=/oem/usr/lib:/usr/lib:/oem/lib
 
+# 0) 等网络就绪 —— 但**要快**
+#
+#    ⚠️ 症状: rkipc 日志里每次开机都有
+#        RKSockServer {initNetServer:088} bind failed,
+#        reason: Cannot assign requested address
+#    原因: 本脚本是 S25, 而 **S40network 在网络就绪**。rkipc 起来时
+#    eth0 还没有 IP, 它的 RKSockServer 想 bind 到接口地址就 EADDRNOTAVAIL,
+#    导致 RTSP 要再等约 5 秒才真正可用。
+#
+#    实测: dmesg 里 `eth0: Link is Up` 出现在 ~6.1s, DHCP 地址随后即到。
+#    所以这里只需要一个**短轮询**(最多 15s, 100ms 粒度), 不能像以前那样
+#    1 秒粒度死等 40 秒 —— 那会把启动时间白白拖长, 而网络其实早好了。
+i=0
+while [ $i -lt 150 ]; do
+    if ifconfig eth0 2>/dev/null | grep -q 'inet addr:'; then
+        echo "[S25rkipc] network ready after $((i / 10)).$((i % 10))s"
+        break
+    fi
+    i=$((i + 1))
+    sleep 0.1
+done
+[ $i -ge 150 ] && echo "[S25rkipc] !! network not ready after 15s, starting anyway"
+
 # 1) sensor 驱动
 lsmod | grep -q '^sc3336' || { insmod "$KO" 2>/dev/null; sleep 2; }
 
@@ -66,18 +102,11 @@ if dmesg | grep -q 'sc3336.*Unexpected sensor id'; then
 fi
 
 # 3) 启动 rkipc
-#    ⚠️ 竞态 (2026-10-07 实测踩到): S21appinit -> RkLunch.sh 也会起一个
-#    rkipc, 但它带 2~3 秒延迟。这里立即检查会误判"没在跑"而起第二个,
-#    后者 bind 554 失败却不退出, 白占 ~20MB (128MB 板上很伤)。
-#    所以: 最多等 20 秒, 期间发现 rkipc 出现 (RkLunch 起的) 就让位退出。
-i=0
-while [ $i -lt 20 ]; do
-    for p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
-        [ "$(cat /proc/$p/comm 2>/dev/null)" = "rkipc" ] && exit 0
-    done
-    i=$((i + 1))
-    sleep 1
-done
+#    RkLunch.sh 里的那份已经禁用了, 所以这里**不需要**再等/让位/杀重建。
+#    (旧逻辑见 git 历史: 曾用 20 秒轮询 + /usr/lib 环境检查, 因为当时
+#     RkLunch 会抢先用错误环境起一个。现在没有竞争者, 直接启动即可。)
+#
+#    注意 exec 前必须 cd 到一个可写目录(日志/临时文件), 且带 LIBPATH。
 cd /userdata 2>/dev/null || cd /
 LD_LIBRARY_PATH="$LIBPATH" exec "$RKIPC" -a "$IQDIR" > "$LOG" 2>&1
 EOF

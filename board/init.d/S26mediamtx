@@ -49,14 +49,43 @@ mtx_running_pid() {
     ps | grep '[m]ediamtx/mediamtx' | awk '{print $1}' | head -1
 }
 
-# 等 rkipc 的 RTSP 起来。C5/板子开机时 rkipc 要初始化 ISP, 可能要十几秒,
-# 期间连 554 会失败 —— mediamtx 连不上会自己重试, 但先把 554 等出来
-# 能少很多无谓的报错日志。
+# 等 rkipc 的 RTSP **真正可用**（不只是端口在监听）。
+#
+# ⚠️ 为什么不能只看 netstat（2026-10-08 实测）:
+#   原实现是 `netstat -tln | grep ':554 '` —— 只判断端口**在监听**。
+#   但 rkipc 的 RTSP 在 `bind` 之后还有一段初始化，此时端口**开着却不应答**。
+#   于是 mediamtx 一启动就连接，撞上它内置的 **10 秒 i/o timeout**，
+#   再等 **5 秒**重试 —— 白白浪费 15 秒。实测日志:
+#       12:29:23 [path car] [RTSP source] started
+#       12:29:33 ERR dial tcp 127.0.0.1:554: i/o timeout     <- 10s 超时
+#       12:29:38 INF [path car] [RTSP source] ready: 2 tracks <- 再等 5s 重试
+#   而同一时刻 rkipc 日志显示 `rtsp server demo starting on port 554`
+#   已经在 12:29:20 打出来了 —— 端口在, 但还不能用。
+#
+#   多轮重启实测的后果: 图传就绪时间在 16.5s ~ 25.4s 之间波动 (spread 9s)。
+#
+# 正确做法: 真的发一次 RTSP DESCRIBE，确认拿到 m=video 才算就绪。
 wait_rtsp() {
     i=0
     while [ $i -lt 60 ]; do
+        # 先快速看一眼端口，没有就继续等（省掉 v4l2 探测开销）
         if netstat -tln 2>/dev/null | grep -q ':554 '; then
-            return 0
+            # 端口在 —— 再确认它**真的应答**且出流
+            if python3 - <<'PY' 2>/dev/null
+import socket, sys
+try:
+    s = socket.create_connection(('127.0.0.1', 554), timeout=3)
+    s.sendall(b'DESCRIBE rtsp://127.0.0.1:554/live/0 RTSP/1.0\r\n'
+              b'CSeq: 1\r\nAccept: application/sdp\r\n\r\n')
+    d = s.recv(4096)
+    s.close()
+    sys.exit(0 if b'm=video' in d else 1)
+except Exception:
+    sys.exit(1)
+PY
+            then
+                return 0
+            fi
         fi
         i=$((i + 1))
         sleep 1

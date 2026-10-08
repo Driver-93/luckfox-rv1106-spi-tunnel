@@ -34,10 +34,20 @@ webrtcAddress: :8889
 # 192.168.3.69 (经 SPI 隧道 + C5 的 NAPT 端口映射转发)。
 webrtcAdditionalHosts: [192.168.3.69]
 
-# 只留 TCP 候选。
-# WebRTC 媒体默认走 UDP, 而 SPI 隧道只转发 TCP —— 浏览器如果拿到
-# UDP 候选就永远连不上, 表现为"视频一直转圈"。
-webrtcLocalUDPAddress: ""
+# UDP 媒体候选: 这是**低延迟的关键**, 不要再关掉它。
+#
+# 这里曾经写着 webrtcLocalUDPAddress: "" 并附一句话"SPI 隧道只转发 TCP"。
+# 那句话是错的: C5 固件 spinet.c 里的 FWD_UDP 表一直映射着 8189/udp,
+# 只是没人试过。实测 (PC -> 192.168.3.69:8189 发 UDP, 板子上收到并回包)
+# 双向都通, 见 docs/LATENCY.md。
+#
+# 为什么必须开 UDP: 浏览器只拿到 TCP 候选时会走 ICE/TCP, 于是整条图传
+# (视频+RTCP+DataChannel) 挤在一条 TCP 流里。隧道上任何一次丢包都会让
+# TCP 头阻塞, 而 RTO 最小 200ms (板子上 tcp_rto_min 不存在, RTO 实测
+# 就是 200ms) —— 用户看到的"200多毫秒"就是这个数。UDP 没有重传队列,
+# 丢一帧只丢一帧, 浏览器的 jitter buffer 因此可以压到 50ms 左右。
+webrtcLocalUDPAddress: :8189
+# TCP 候选保留作为兜底: 万一 UDP 那条路被(隧道/路由)打断, 还能连上。
 webrtcLocalTCPAddress: :8189
 
 # ---- HLS 兜底 (延迟大, 只在 WebRTC 不通时用) ----
