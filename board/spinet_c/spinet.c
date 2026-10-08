@@ -283,10 +283,12 @@ typedef struct {
     uint32_t seq;
     int plen;
     double last_send;
+    unsigned long long ord;   /* insertion order -- see outbox_oldest() */
     uint8_t payload[MAX_PAYLOAD];
 } outbox_ent;
 
 static outbox_ent outbox[WINDOW];
+static unsigned long long g_ord = 0;
 
 static outbox_ent *outbox_find(uint32_t seq)
 {
@@ -296,12 +298,24 @@ static outbox_ent *outbox_find(uint32_t seq)
     return NULL;
 }
 
+/* Oldest = SMALLEST INSERTION ORDER, not lowest slot index.
+ *
+ * spinet.py used a dict, which iterates in insertion order. This array
+ * reuses freed slots: after a partial ack frees slots 0..2, the next
+ * inserts (seq 17,18,19) land there while seq 4..16 still sit in slots
+ * 3..15 -- at that point slot 0 holds the NEWEST frame. Retransmitting
+ * "slot 0" then retransmits the newest frame, the hole at seq 4 never
+ * fills, the C5's cumulative ack freezes, the window wedges and the stall
+ * guard re-handshakes every 3 s (measured: 103 stalls = the reported
+ * video stutter). Exactly the livelock spinet.py's comment warns about. */
 static outbox_ent *outbox_oldest(void)
 {
     int i;
-    for (i = 0; i < WINDOW; i++)   /* slots fill in insertion order */
-        if (outbox[i].used) return &outbox[i];
-    return NULL;
+    outbox_ent *best = NULL;
+    for (i = 0; i < WINDOW; i++)
+        if (outbox[i].used && (!best || outbox[i].ord < best->ord))
+            best = &outbox[i];
+    return best;
 }
 
 static outbox_ent *outbox_add(uint32_t seq, const uint8_t *payload, int plen,
@@ -314,6 +328,7 @@ static outbox_ent *outbox_add(uint32_t seq, const uint8_t *payload, int plen,
             outbox[i].seq = seq;
             outbox[i].plen = plen;
             outbox[i].last_send = t;
+            outbox[i].ord = ++g_ord;
             memcpy(outbox[i].payload, payload, plen);
             return &outbox[i];
         }

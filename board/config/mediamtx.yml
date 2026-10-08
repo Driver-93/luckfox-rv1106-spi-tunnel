@@ -13,6 +13,8 @@
 
 logLevel: info
 logDestinations: [stdout]
+# 扛隧道突发 (默认 512 在 ICE-TCP+突发下溢出, 表现为周期性卡顿)
+writeQueueSize: 2048
 
 # ---- 视频源: 读 rkipc 的 RTSP ----
 paths:
