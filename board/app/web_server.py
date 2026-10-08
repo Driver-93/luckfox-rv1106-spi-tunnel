@@ -20,6 +20,7 @@ API:
   python3 web_server.py [端口]     # 默认 80
 """
 import json, os, subprocess, sys, time, threading
+import http.client          # 只用来调 mediamtx 的本地 API (见 mtx_enforce)
 import sys_stats
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -936,15 +937,303 @@ def _failsafe_check():
 # ---------------- HTTP ----------------
 # 快路径用的最小 headers 对象。stdlib 的 http.client.HTTPMessage 是大块头,
 # 而控制接口只用得上 Content-Length。
-class _Headers:
-    __slots__ = ("_cl",)
+# ============================================================================
+# 单客户端接管 (2026-10-08): 一个时刻只允许一个页面上车
+# ============================================================================
+# 需求: 新打开的浏览器把旧的踢掉 —— 车只有一个司机, 而且多一个观众就多一份
+# 隧道带宽 (总共 ~970KB/s) 和单核 CPU (mediamtx 要给**每个**观众单独做
+# SRTP 加密 + 发送, rkipc 只编码一次是共享的)。
+#
+# ⚠️ 为什么不能只做"谁新谁赢, 直接踢掉旧的"
+# ------------------------------------------
+# index.html 的图传重连是**无限**的 (schedule(): 连败退避到 5s, 然后一直
+# 重试下去)。只按下发时间踢, 会变成抢来抢去:
+#
+#     A 被踢 -> 5s 后自动重连, 变成"最新的" -> B 被踢 -> 2s 后 B 又抢回来 …
+#
+# 两个浏览器永远在互踢, 谁都看不成。所以**必须让被踢的那一方知道自己被踢了,
+# 主动闭嘴**。现成的两个通道正好够用:
+#
+#   * /api/pageinfo  每次页面加载只发一次  => 天然的"新浏览器到了"锚点
+#   * /api/status    每秒轮询一次          => 天然的"通知旧页面你被踢了"通道
+#
+# 反过来,**自动重连永远不认领所有权**, 所以它抢不回来。这是整个设计的关键:
+# 认领只发生在页面加载 (pageinfo) 和用户点"接管"按钮 (takeover) 这两处,
+# 都是"人主动做的动作"。
+#
+# 粒度是**页面标签**, 不是 IP
+# ---------------------------
+# 每个页面加载时生成一个随机 TAB_ID, 随请求头 X-Page-Id 上报。用 IP 做不到
+# "同一台电脑开两个标签也互踢" —— 两个标签是同一个地址。用 TAB_ID 就干净了。
+#
+# 三层保险, 任何一层失效都不影响其它层
+# ------------------------------------
+#   1. 板子侧: 非所有者的控制请求一律 403; 认领的瞬间**主动停车一次**
+#      (旧页面已经被 403 禁掉了, 指望它自己发 stop 不可靠)
+#   2. 页面侧: 轮询发现 owner=false -> 停图传 + 停控制 + 显示横幅 (1 秒内)
+#   3. mediamtx 兜底: 后台线程轮询 /v3/webrtcsessions/list, 把不属于当前
+#      所有者的会话踢掉 —— 专门防"旧页面卡死了, 自己不会停"
+#
+# 第 3 层要 mediamtx 的 API (见 mediamtx.yml 的 api / apiAddress)。
+# 失败方向是安全的: 任何一层出问题最多只是"没踢掉", 绝不会"连不上" ——
+# API 拿不到时 mtx_enforce() 直接返回, 图传照常。
+OWN_LOCK = threading.Lock()
+_OWN = {"page": None, "ip": None, "since": 0.0, "n": 0}
+MTX_API = ("127.0.0.1", 9997)
+PAGE_HDR = "X-Page-Id"
 
-    def __init__(self, content_length=0):
+# 需要"当前所有者"身份的 POST 接口。
+#
+# 包含摄像头/画质/曝光那三个: 它们会**重启 rkipc (20-30 秒)**, 被接管的旧
+# 页面要是还能触发, 就成了"谁都能把图传掐掉"。
+# 不含 /api/status (通知通道) 和 /api/ping (诊断探针)。
+OWNED_POST_PATHS = frozenset((
+    "/api/move", "/api/cmd", "/api/speed",
+    "/api/cam", "/api/video", "/api/exposure", "/api/quality",
+))
+
+# mediamtx 会话清理状态。不比较时间戳, 见 mtx_enforce() 里的说明。
+_MTX = {"gen": -1, "condemned": set()}
+
+# 所有者存盘。
+#
+# 为什么必须存: 所有者本来只在内存里, 于是**每次重启这个服务, 所有者就没了**,
+# 而 owner_claim 只发生在"页面加载"和"点接管按钮"这两个时刻 —— 已经打开着的
+# 标签页不会再发 pageinfo。结果: 重启之后两个标签页都会看到 owner=true
+# ("还没有人认领"), 双双在图传, 单客户端策略静默失效, 直到有人手动刷新。
+#
+# 存 /tmp (tmpfs): 重启服务时保留, 重启板子时自动清掉 —— 正是想要的语义。
+# pageId 是页面加载时随机生成的, 所以恢复出来的那个 id 只会匹配"同一个标签页",
+# 不会误伤别人。
+OWN_FILE = "/tmp/owner.json"
+
+
+def _owner_load():
+    try:
+        with open(OWN_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict) and isinstance(d.get("page"), str) and d["page"]:
+            with OWN_LOCK:
+                _OWN.update(page=d["page"], ip=d.get("ip") or None,
+                            since=float(d.get("since") or 0.0),
+                            n=int(d.get("n") or 0))
+            print("[owner] 恢复所有者: page=%s ip=%s (%s)"
+                  % (d["page"], d.get("ip"), OWN_FILE))
+    except Exception:
+        pass        # 文件不存在/坏了都无所谓, 下一个人加载页面就重新认领
+
+
+def _owner_save():
+    try:
+        with OWN_LOCK:
+            d = dict(_OWN)
+        with open(OWN_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except Exception:
+        pass
+
+
+def owner_view(page):
+    """给 /api/status 用的所有权快照。"""
+    with OWN_LOCK:
+        cur = _OWN["page"]
+        n = int(_OWN.get("n", 0))
+    if not page:
+        # 没带 TAB_ID 的客户端 (旧页面 / 探针)。控制类接口会被 403 挡掉,
+        # 只读接口照常 —— 别把诊断用的 /api/ping 也一起挡了。
+        return {"owner": False, "no_id": True, "takeovers": n}
+    if cur is None:
+        # 还没有人认领 (板子刚起来, 或者页面刚加载、pageinfo 还没到)。
+        # 这里**只读不认领** —— 认领必须发生在页面加载那一刻, 否则被踢的
+        # 页面靠每秒轮询就能把自己抢回来, 那就又变成抢来抢去了。
+        return {"owner": True, "pending": True, "takeovers": n}
+    return {"owner": cur == page, "takeovers": n}
+
+
+def _snapshot_live_sessions():
+    """把此刻还活着的 mediamtx 会话全部记为待踢。
+
+    必须在**认领的同一刻**调用, 不能等 enforce_loop 下一秒醒来再做。
+    原因: "凡是活着的会话都属于上一个页面" 这句话只在认领那一刻成立 ——
+    新页面紧接着就要开始拉流 (index.html 的 claimThenStart() 保证先认领、
+    后拉流)。晚一秒再快照, 就会把新页面自己刚建立的会话也判死, 白踢一次,
+    用户看到多一次 2 秒的图传重连。
+    """
+    try:
+        st, body = _mtx_api("GET", "/v3/webrtcsessions/list")
+        if st != 200:
+            return
+        data = json.loads(body.decode("utf-8")) or []
+        items = data.get("items") if isinstance(data, dict) else data
+        ids = set(it["id"] for it in (items or [])
+                  if isinstance(it, dict) and it.get("id"))
+    except Exception:
+        return          # mediamtx 没起来/没开 API: 跳过, 兜底层让位于前两层
+    with OWN_LOCK:
+        _MTX["condemned"] = ids
+        _MTX["gen"] = int(_OWN.get("n", 0))
+
+
+def owner_claim(page, ip):
+    """认领所有权。返回 (ok, 是否发生了接管)。"""
+    if not page:
+        return False, False
+    with OWN_LOCK:
+        prev_page, prev_ip = _OWN["page"], _OWN["ip"]
+        changed = (prev_page != page)
+        _OWN.update(page=page, ip=ip, since=time.time())
+        if changed:
+            _OWN["n"] = int(_OWN.get("n", 0)) + 1
+    if changed:
+        _owner_save()
+        print("[owner] 接管: page=%s ip=%s (上一个 page=%s ip=%s)"
+              % (page, ip, prev_page, prev_ip))
+        try:
+            with open("/userdata/takeover.log", "a", encoding="utf-8") as f:
+                f.write("%s 接管 page=%s ip=%s (上一个 page=%s ip=%s)\n"
+                        % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                           page, ip, prev_page, prev_ip))
+        except Exception:
+            pass
+        # 快照要在 stop 之前 —— 两件事互不影响, 但先把"谁该被踢"记下来,
+        # 后面即使 stop 出问题也不影响这条链路。
+        _snapshot_live_sessions()
+        if prev_page is not None:
+            _stop_now("被 page=%s 接管" % page)
+    return True, changed
+
+
+def _stop_now(reason):
+    """立刻停车。
+
+    接管时必须主动停一次, 不能只依赖 0.5s 失控保护: 旧页面此刻已经被 403
+    挡掉了, "让它自己发一条 stop" 是不可靠的。安全关键路径, 所以整个函数
+    包在 try 里 —— 它绝不能让 HTTP 处理器挂掉。
+    """
+    try:
+        now = time.time()
+        with MOTOR_LOCK:
+            if motor is not None:
+                motor.stop()
+            STATE.update(dir="stop", vx=0.0, vy=0.0, w=0.0, ts=now)
+        try:
+            with open("/userdata/takeover.log", "a", encoding="utf-8") as f:
+                f.write("%s 接管停车: %s\n"
+                        % (time.strftime("%Y-%m-%d %H:%M:%S"), reason))
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _mtx_api(method, path):
+    """调 mediamtx 的本地 API。返回 (status, body); 失败返回 (0, b"")。"""
+    try:
+        c = http.client.HTTPConnection(MTX_API[0], MTX_API[1], timeout=2)
+        c.request(method, path)
+        r = c.getresponse()
+        b = r.read()
+        c.close()
+        return r.status, b
+    except Exception:
+        return 0, b""
+
+
+def mtx_enforce():
+    """把不属于当前所有者的 WebRTC 会话踢掉 (兜底层)。
+
+    "不属于" 的判据只有两条, 而且**不需要时间戳**:
+      * 对端 IP 不是所有者的 -> 别的设备, 踢
+      * 对端 IP 是所有者, 但这个会话在**最近一次接管之前就存在** -> 旧的
+        标签页留下的, 踢
+
+    为什么不用 mediamtx 的 created 字段比时间: 它是带时区的 RFC3339, 在这块
+    uClibc 板子上解析 + 时区对齐都是额外的出错面; 而"接管瞬间还活着的会话都
+    该死"这句话不需要时间戳就能表达 —— 记下那一刻的 id 集合, 之后只要它们还
+    出现就继续踢 (消失了就忘掉)。
+    """
+    with OWN_LOCK:
+        page, ip = _OWN["page"], _OWN["ip"]
+        gen = int(_OWN.get("n", 0))
+    if not page or not ip:
+        return
+
+    st, body = _mtx_api("GET", "/v3/webrtcsessions/list")
+    if st != 200:
+        return
+    try:
+        data = json.loads(body.decode("utf-8")) or []
+    except Exception:
+        return
+    # ⚠️ mediamtx v1.11.3 返回的是**分页信封**, 不是一个裸数组:
+    #     {"itemCount":0,"pageCount":0,"items":[]}
+    # 老版本返回裸数组。只认数组的话这里会永远静默返回 —— 表现为"接管了但
+    # 旧的图传没断", 而且日志里一行都不出, 极难排查 (实测踩到)。两种都收。
+    if isinstance(data, dict):
+        items = data.get("items") or []
+    else:
+        items = data
+    if not isinstance(items, list):
+        return
+
+    live = {}
+    for it in items:
+        if isinstance(it, dict) and it.get("id"):
+            # remoteAddr 形如 "192.168.3.65:57476"; 取 IP 部分。
+            live[it["id"]] = str(it.get("remoteAddr", ""))
+
+    with OWN_LOCK:
+        if gen != _MTX["gen"]:
+            # 兜底: 所有权变了但没走 owner_claim 的快照 (例如 enforce_loop
+            # 在 owner_claim 的 API 调用失败之后才醒来)。此时只能拿眼前这份
+            # 列表当快照 —— 不如认领那一刻准, 但比不踢安全。
+            _MTX["condemned"] = set(live.keys())
+            _MTX["gen"] = gen
+        condemn = set(_MTX["condemned"])
+        _MTX["condemned"] = {s for s in condemn if s in live}   # 消失的忘掉
+
+    for sid, addr in live.items():
+        peer = addr.rsplit(":", 1)[0] if addr else ""
+        if peer == ip and sid not in condemn:
+            continue                       # 当前页面自己的会话, 留着
+        st2, _ = _mtx_api("POST", "/v3/webrtcsessions/kick/" + sid)
+        if st2 == 200:
+            print("[owner] 踢掉旧图传会话 %s (对端 %s)" % (sid, addr))
+
+
+def enforce_loop():
+    while True:
+        try:
+            mtx_enforce()
+        except Exception:
+            pass
+        time.sleep(1.0)
+
+
+class _Headers:
+    """快路径用的极简 headers 对象。
+
+    只保留服务端真正要看的头 —— 构造 http.client.HTTPMessage 去解析全部头
+    在单核 A7 上不划算 (见 handle_one_request 的说明)。
+
+    ⚠️ 加新头时**必须**同时改 handle_one_request 里的扫描循环, 否则这里的
+    get() 永远返回 default。单客户端接管第一次就是栽在这: X-Page-Id 没被
+    扫进来, 于是每个请求都被当成"没有页面标识", **所有**控制请求一律 403
+    (连当前所有者自己的也被挡掉), 而日志里一行错都没有 —— 只表现为
+    "按了没反应"。所以扫描循环和这里的键名必须成对维护。
+    """
+    __slots__ = ("_cl", "_page")
+
+    def __init__(self, content_length=0, page=""):
         self._cl = int(content_length or 0)
+        self._page = page or ""
 
     def get(self, name, default=None):
-        if name.lower() == "content-length":
+        n = (name or "").lower()
+        if n == "content-length":
             return str(self._cl)
+        if n == "x-page-id":
+            return self._page
         return default
 
     def get_all(self, name, default=None):
@@ -1062,7 +1351,12 @@ class H(BaseHTTPRequestHandler):
         command = line[:sp1]
         # --- header 扫描 (快慢路径共用, 一次读完) ---
         # 只留我们可能用到的头, 避免构造 http.client.HTTPMessage (大块头)。
+        #
+        # ⚠️ 这里扫进来的每一个头, 都必须在 _Headers 里有对应的 get() 分支,
+        # 否则读到的永远是 default (单客户端接管第一次就是栽在这里:
+        # x-page-id 漏扫 -> 所有控制请求被误判成"无页面标识" -> 一律 403)。
         clen = 0
+        page = ""
         while True:
             try:
                 h = self.rfile.readline(65537)
@@ -1076,11 +1370,14 @@ class H(BaseHTTPRequestHandler):
             c = h.find(b":")
             if c < 0:
                 continue
-            if h[:c].strip().lower() == b"content-length":
+            k = h[:c].strip().lower()
+            if k == b"content-length":
                 try:
                     clen = int(h[c + 1:].strip())
                 except ValueError:
                     clen = 0
+            elif k == b"x-page-id":
+                page = h[c + 1:].strip().decode("latin-1", "replace")[:64]
 
         body = b""
         if clen > 0:
@@ -1103,7 +1400,7 @@ class H(BaseHTTPRequestHandler):
         self.requestline = "%s %s %s" % (self.command, self.path,
                                          self.request_version)
         self.close_connection = False
-        self.headers = _Headers(clen)
+        self.headers = _Headers(clen, page)
         self._body_raw = body
         try:
             if self.command == "POST":
@@ -1160,6 +1457,16 @@ class H(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    def _page_id(self):
+        """这个请求来自哪个页面标签 (单客户端接管用)。见文件末尾的说明。
+
+        没有就返回空串 —— 旧页面 (还没加载新 JS) 和 curl/探针都属于这一类。
+        """
+        try:
+            return (self.headers.get(PAGE_HDR) or "").strip()[:64]
+        except Exception:
+            return ""
+
     # ---- GET ----
     def do_GET(self):
         p = urlparse(self.path).path
@@ -1170,7 +1477,12 @@ class H(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(500, "index.html 读取失败: %s" % e, "text/plain; charset=utf-8")
         elif p == "/api/status":
-            self._json(200, build_status())
+            st = build_status()
+            # 所有权状态。页面靠它发现自己被接管了 (1 秒内)。
+            # ⚠️ 这个接口**永远不能被 403 挡掉** —— 它正是"通知旧页面你被
+            # 踢了"的唯一通道, 挡掉旧页面就永远不知道自己该闭嘴了。
+            st["owner"] = owner_view(self._page_id())
+            self._json(200, st)
         elif p == "/api/ping":
             self._json(200, {"ok": True, "ts": int(time.time())})
         elif p == "/api/cam":
@@ -1204,6 +1516,12 @@ class H(BaseHTTPRequestHandler):
             # 它一直高于 5% 就说明超时调得太短了, 别靠感觉判断。
             q = parse_qs(urlparse(self.path).query)
             if "t" in q:
+                # 改失控超时是**安全参数**, 只有当前所有者能改 ——
+                # 否则被接管的旧页面可以把超时拉长, 让车在没人控制时继续跑。
+                if not owner_view(self._page_id()).get("owner"):
+                    self._json(403, {"ok": False, "taken_over": True,
+                                     "err": "已被其它设备接管"})
+                    return
                 ok, val = set_failsafe_timeout(q["t"][0])
                 self._json(200, {"ok": ok, "now": val, "stats": _fs_stats()})
             else:
@@ -1229,6 +1547,32 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         p = urlparse(self.path).path
         d = self._body()
+        page = self._page_id()
+
+        # ---- 单客户端接管: 认领 / 抢回 (见文件末尾的长说明) ----
+        # 只有这两个入口能认领所有权, 而且都是**人主动做的动作**:
+        #   * /api/pageinfo  每次页面加载只发一次
+        #   * /api/takeover  横幅上那个"点此接管回来"按钮
+        # 自动重连永远走不到这里, 所以它抢不回所有权 —— 这是避免两个浏览器
+        # 无限互踢的关键。
+        if p == "/api/takeover":
+            ok, _ = owner_claim(page, self.client_address[0])
+            self._json(200 if ok else 400,
+                       {"ok": ok, "err": None if ok else "缺少页面标识",
+                        "owner": owner_view(page)})
+            return
+
+        # ---- 控制类接口: 只有当前所有者能动 ----
+        # 被接管之后旧页面一律 403。返回体带 taken_over, 前端据此显示横幅。
+        # 注意 /api/status 和 /api/ping **不**在这里 —— 前者是通知通道,
+        # 后者是诊断探针, 挡掉它们只会让排查变难。
+        if p in OWNED_POST_PATHS:
+            with OWN_LOCK:
+                cur = _OWN["page"]
+            if not page or (cur is not None and cur != page):
+                self._json(403, {"ok": False, "taken_over": True,
+                                 "err": "已被其它设备接管"})
+                return
 
         # ---- 指令追踪 (诊断): 把每条控制指令连"谁发的"一起记下来 ----
         # 2026-10-05 加: 控制"时好时坏"时, 必须能回答"这段时间到底有没有
@@ -1263,8 +1607,9 @@ class H(BaseHTTPRequestHandler):
                 self._json(500, {"ok": False, "err": str(e)})
             return
 
-        # ---- 页面自报家门: 记录到底跑的是哪一版前端 ----
-        # 排"按了没反应"时, 先要能回答"浏览器里是哪一版页面"。
+        # ---- 页面自报家门 + **认领所有权** ----
+        # 每次页面加载只发一次, 所以这就是"新浏览器到了"的锚点。见文件末尾
+        # "单客户端接管" 的说明: 认领只在这一处和 /api/takeover 发生。
         if p == "/api/pageinfo":
             try:
                 with open("/userdata/pageinfo.log", "a", encoding="utf-8") as f:
@@ -1274,7 +1619,10 @@ class H(BaseHTTPRequestHandler):
                         json.dumps(d, ensure_ascii=False)))
             except Exception:
                 pass
-            self._json(200, {"ok": True, "page_ver": _page_ver()})
+            ok, took = owner_claim(page, self.client_address[0])
+            self._json(200, {"ok": True, "page_ver": _page_ver(),
+                             "claim": ok, "takeover": took,
+                             "owner": owner_view(page)})
             return
 
         if p == "/api/video":
@@ -1403,6 +1751,9 @@ def main():
     print("=" * 52)
     # 失控超时: 先读配置, 再启动保护循环 (顺序不能反)
     init_motor()
+    # 恢复"谁在上车"。见 OWN_FILE 的说明 —— 不恢复的话, 重启服务之后
+    # 两个标签页会同时以为自己可以控制 (单客户端策略静默失效)。
+    _owner_load()
     print("[failsafe] 失控超时 = %.2fs (来自 %s 的 failsafe_s, 缺省 %.1fs)"
           % (_load_failsafe_timeout(), CONF_PATH, MOVETIMEOUT_DEFAULT))
 
@@ -1410,6 +1761,9 @@ def main():
     threading.Thread(target=telemetry_loop, daemon=True).start()
     threading.Thread(target=failsafe_loop, daemon=True).start()
     threading.Thread(target=cam_loop, daemon=True).start()
+    # 单客户端接管的兜底层: 每秒问一次 mediamtx, 把不属于当前所有者的
+    # WebRTC 会话踢掉。见文件末尾 "单客户端接管" 的说明。
+    threading.Thread(target=enforce_loop, daemon=True).start()
     try:
         srv = ThreadingHTTPServer(("0.0.0.0", PORT), H)
         # 单核板上 GIL 是稀缺资源: 让 accept 循环少醒一点, 把 CPU 让给

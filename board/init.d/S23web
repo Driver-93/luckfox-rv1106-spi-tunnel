@@ -9,9 +9,30 @@
 APP=/userdata/car/web_server.py
 LOG=/tmp/web.log
 
+# 杀掉正在跑的 web 服务。
+#
+# ⚠️ 这里**不能**用 `ps | grep '[w]eb_server.py'` —— 那是本文件原来的写法,
+# 也是这个项目里第三次踩同一类坑 (前两次见 S26mediamtx 和 S24spinet_wd 的注释)。
+# `[w]` 只挡得住 grep 自己, 挡不住**命令行里恰好提到这个路径**的其它进程。
+# 实测 (2026-10-08): 我在 adb shell 里执行
+#     python3 -m py_compile /userdata/car/web_server.py && /etc/init.d/S23web restart
+# 于是那个 `sh -c "...web_server.py..."` 的命令行里含 "web_server.py", 被
+# kill_web 当成服务自己 kill -9 掉了 —— 表现是"重启之后服务不见了", 而
+# web.log 最后一行还是 "[http] 监听 0.0.0.0:80", 看起来起得好好的。
+#
+# 正确判据: 从 /proc/<pid>/cmdline 读真实参数, 要求**第一个参数是 python3**
+# 且参数里出现这个脚本的完整路径。shell 包装进程的第一参数是 /bin/sh, 不会被误杀。
 kill_web() {
-    for p in $(ps | grep '[w]eb_server.py' | awk '{print $1}'); do
-        kill -9 "$p" 2>/dev/null
+    for d in /proc/[0-9]*; do
+        p=${d#/proc/}
+        [ "$p" = "$$" ] && continue
+        # 进程随时可能消失 (杀掉之后 /proc 条目就没了), 先判可读,
+        # 否则 shell 自己会往 stderr 吐 "can't open /proc/N/cmdline"。
+        [ -r "$d/cmdline" ] || continue
+        c=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null) || continue
+        case "$c" in
+            python3*"$APP"*) kill -9 "$p" 2>/dev/null ;;
+        esac
     done
 }
 
@@ -20,14 +41,51 @@ case "$1" in
         kill_web
         echo "[S23web] starting onboard web control service"
         setsid sh -c "python3 -u $APP 80 > $LOG 2>&1" </dev/null >/dev/null 2>&1 &
+
+        # ⚠️ 这里的等待 + 轮询校验都是**必需**的, 不是"礼貌"。
+        #
+        # 1) 为什么必须等一下: busybox 的 setsid 是"先 fork, 再在子进程里
+        #    setsid()" (见 setsid --help: "Run PROG in a new session")。
+        #    脚本如果 launch 完立刻退出, 那个**还没完成 detach** 的子进程会
+        #    被会话清理连带杀掉。实测 (2026-10-08): 完全同一个 start 分支,
+        #    后面跟一句 sleep 3 时 100% 活着 (ps 里 PID 稳定 20s+); 直接退出
+        #    则服务不见了, 而 web.log 最后一行仍是 "[http] 监听 0.0.0.0:80"
+        #    —— 日志看着启动成功, 实际 :80 根本不监听。这个假象极难排查:
+        #    会去怀疑端口占用/防火墙, 而真正原因是进程没活下来。
+        #    (S26mediamtx 一直没这个问题, 正是因为它 setsid 之后有 sleep 3。)
+        #
+        # 2) 为什么要**轮询**而不是睡固定时长: 这个服务启动并不快 —— 要
+        #    import 一堆模块 + 初始化电机 PWM。实测睡 2s 还不够, 校验会误报
+        #    "启动失败"(而它其实 1 秒后就起来了)。所以最多等 12 秒。
+        i=0
+        while [ $i -lt 12 ]; do
+            sleep 1
+            if netstat -tln 2>/dev/null | grep -q ':80 '; then
+                echo "[S23web] started (listening :80, ${i}s)"
+                exit 0
+            fi
+            i=$((i + 1))
+        done
+        echo "[S23web] !! 启动失败 (等了 ${i}s), 日志:"
+        tail -20 "$LOG"
+        exit 1
         ;;
     stop)
         kill_web
         echo "[S23web] stopped"
         ;;
     restart)
+        # ⚠️ 这里**不要**用 `exec "$0" start`。
+        #
+        # 实测 (2026-10-08): `/etc/init.d/S23web restart 2>&1 | tail -4` 跑完
+        # 之后服务是**死的** —— 日志里连 "[S23web] starting" 都被 web.log 的
+        # 内容顶掉了, 说明 exec 让新 shell 复用了原来的 fd, 而 setsid 那层
+        # 重定向没能把管道摘干净; 命令一结束 (管道读端关闭) 子进程就跟着没了。
+        # 症状极具误导性: 日志最后一行是 "[http] 监听 0.0.0.0:80", 看起来
+        # 起得好好的, 但 :80 根本不监听。
+        # 普通子 shell 调用没有这个问题。
         kill_web; sleep 1
-        exec "$0" start
+        "$0" start
         ;;
     status)
         if netstat -tln 2>/dev/null | grep -q ':80 '; then

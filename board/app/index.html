@@ -103,6 +103,19 @@ main{max-width:1100px;margin:0 auto;padding:10px 12px 24px}
   align-items:center;justify-content:center;background:rgba(0,0,0,.6);
   color:var(--dim);font-size:13px}
 #vstate.hide{display:none}
+/* 被其它设备接管 (单客户端策略)。盖住整块画面, 并且不给"重试" —— 重试是
+   自动行为, 而抢回所有权必须是用户主动点的动作, 否则两个浏览器会无限互踢。 */
+#vtake{position:absolute;inset:0;display:none;flex-direction:column;gap:12px;
+  align-items:center;justify-content:center;background:rgba(0,0,0,.82);
+  color:#f0f6fc;font-size:13px;text-align:center;padding:16px;z-index:6}
+#vtake.on{display:flex}
+#vtake .big{font-size:15px;font-weight:700;color:#d29922}
+#vtake .sub{font-size:11.5px;color:var(--dim);line-height:1.6;max-width:340px}
+#vtakeBtn{margin-top:2px;padding:9px 20px;border-radius:8px;cursor:pointer;
+  border:1px solid #d29922;background:#2d2413;color:#f0d68a;
+  font-size:13px;font-weight:700}
+#vtakeBtn:hover{background:#3d3119}
+#vtakeBtn:disabled{opacity:.5;cursor:default}
 #vstate button{background:var(--accent);color:#fff;border:0;border-radius:9px;
   padding:9px 20px;font-size:13px;font-weight:600;cursor:pointer}
 
@@ -396,6 +409,16 @@ kbd{background:#21262d;border:1px solid var(--line);border-bottom-width:2px;
         <button id="vretry">重试</button>
       </div>
 
+      <!-- 被其它设备接管 (单客户端策略)。见脚本开头 TAB_ID 那一段的说明。
+           注意这里**故意不放"重试"** —— 抢回所有权只能是用户点这个按钮,
+           自动重试会让两个浏览器无限互踢。 -->
+      <div id="vtake">
+        <span class="big">⚠ 已被其它设备接管</span>
+        <span class="sub">同一时刻只允许一个页面上车。<br>
+          图传和遥控都已停止, 车已自动停下。</span>
+        <button id="vtakeBtn">点此接管回来</button>
+      </div>
+
       <!-- 画面下方控制条 (悬停/点击画面时出现) -->
       <div id="vctrl">
         <button class="vcbtn sel" id="vcExp" title="点一下弹出曝光档位">
@@ -527,15 +550,15 @@ kbd{background:#21262d;border:1px solid var(--line);border-bottom-width:2px;
  * 只用 WebRTC/WHEP。HLS 已彻底移除 —— 它虽然能穿过隧道, 但有 3-6 秒延迟,
  * 对遥控车没有意义。
  *
- * 无线时靠什么穿隧道:
- *   WebRTC 媒体默认走 UDP, 而 SPI 隧道只能承载 TCP。mediamtx 已关掉 UDP ICE
- *   (webrtcLocalUDPAddress: ""), 应答里只留 TCP 候选 192.168.3.69:8189 ——
- *   而 8189 正在隧道转发列表里。浏览器"只能"用 ICE-TCP, 于是 WebRTC 的
- *   亚秒级延迟就能穿过隧道。
+ * 无线时靠什么穿隧道 (2026-10-08 更正):
+ *   媒体走 **UDP**。这里曾经写着"隧道只能承载 TCP, 所以 mediamtx 关掉了
+ *   UDP ICE" —— 那是错的: C5 固件 spinet.c 的 FWD_UDP 一直映射着 8189/udp,
+ *   只是没人试过 (已实测双向可达)。走 ICE/TCP 时整条图传挤在一条 TCP 流里,
+ *   任何丢包都要等 TCP 头阻塞, 而这块板子的最小 RTO 就是 200ms ——
+ *   这正是用户感觉到的"延迟 200 多毫秒"。改回 UDP 后 p90 从 269ms 降到 42ms。
  *
  * 这里曾有个错误的捷径: 判断主机名含 .69 就直接跳去 HLS, 理由是"隧道下
- * WebRTC 必败"。实际相反 —— 正是 ICE-TCP 让 WebRTC 可以走隧道, 那个捷径
- * 反而把实时性丢了。
+ * WebRTC 必败"。实际相反, WebRTC 能走隧道, 那个捷径反而把实时性丢了。
  */
 const WHEP_URLS = [
   /* Build the URL from location.hostname, NOT from location.origin.
@@ -550,6 +573,38 @@ const WHEP_URLS = [
 ];
 const $ = id => document.getElementById(id);
 let pc=null, retry=null, statsT=null, lastBytes=0, activeUrl='';
+
+/* ============================================================================
+ * 单客户端接管 (2026-10-08)
+ * ============================================================================
+ * 一个时刻只允许一个页面上车: 新打开的浏览器把旧的那个踢掉。
+ *
+ * ⚠️ 这三个变量必须声明在**这里** (playWHEP 第一次被调用之前), 不能挪到下面
+ * 轮询那一段去 —— 755 行的 `if(!document.hidden) playWHEP()` 会立刻读
+ * tabRevoked, 声明在后面就是 `let` 的 TDZ ReferenceError, 而且在
+ * playWHEP 的 catch 里被静默吞掉, 表现是"图传永远连不上"。这个坑本文件
+ * 已经踩过两次 (见 ctlRtt 和 sendPageInfo 的注释)。
+ *
+ * TAB_ID: 每次页面加载随机生成。粒度是**页面标签**而不是 IP —— 同一台电脑
+ * 开两个标签也要互踢, 而两个标签的 IP 是一样的, 用 IP 区分不了。
+ *
+ * tabClaimed: 守卫"被接管"的误报。页面加载后 /api/pageinfo 还没送达时,
+ *   板子那边所有者可能还是上一个页面, 这时轮询会看到 owner:false —— 但那是
+ *   自己还没认领, 不是被踢。所以只在认领过之后才理会 owner:false。
+ *
+ * tabRevoked: 被接管后置位。它同时掐掉两条路: 图传不再重连、控制不再发送。
+ *   板子侧还会对这些请求回 403 (双保险), 但这里主动停手更重要 —— 否则
+ *   每秒一次的无用重连会往 C5 的 NAPT 表里堆半开条目。
+ *   注意**抢回所有权不靠这个变量**: 只有用户点横幅上的按钮才会 POST
+ *   /api/takeover 重新认领, 自动重连永远抢不回来。
+ */
+const TAB_ID = (function(){
+  try{
+    if(window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  }catch(e){}
+  return 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+})();
+let tabClaimed = false, tabRevoked = false;
 
 /* 控制往返时间 (RTT), 由控制循环每次成功请求更新。
  *
@@ -645,6 +700,10 @@ function vBusy(on, txt){
 }
 
 async function playWHEP(){
+  /* 被接管了就不再连图传。这道守卫是"两个浏览器无限互踢"的唯一闸门:
+     schedule() 的重连是无限的, 少了这一行, 被踢的页面 5 秒后就会重连、
+     把对方踢掉、然后自己被踢回来, 永远循环。 */
+  if(tabRevoked) return;
   stopWHEP(); vShow('图传连接中…', false); setVid('warn','连接中');
   try{
     const p = new RTCPeerConnection(); pc = p;
@@ -714,6 +773,57 @@ function stopWHEP(keepVideo){
   if(!keepVideo){
     const v = $('video'); v.srcObject = null; v.removeAttribute('src'); v.load();
   }
+}
+
+/* ============================================================================
+ * 单客户端接管: 被踢 / 抢回
+ * ============================================================================
+ * 被踢之后这个页面**必须彻底闭嘴**, 这是整个设计能成立的前提。因为
+ * schedule() 的重连是无限的, 只要还允许自动重连, 两个浏览器就会无限互踢。
+ * 所以这里做三件事: 关掉图传、把重连定时器清掉、立一个"别再连"的标志。
+ * 控制那边由 ctlFlush() 的 tabRevoked 守卫掐掉。
+ *
+ * 注意: 车不需要这个页面去停 —— 板子在**认领所有权的那一刻**就已经主动
+ * 停过一次了 (_stop_now)。指望被 403 挡掉的页面自己发 stop 是不可靠的。
+ */
+function onTakenOver(){
+  if(tabRevoked) return;
+  tabRevoked = true;
+  stopWHEP();
+  clearTimeout(retry);
+  /* 清掉待发的控制指令: 否则用户点"接管回来"之后, 那条**接管之前**的旧
+     向量会被立刻补发出去 —— 手感上是"一接管车就窜一下"。
+     ⚠️ ctlPending/ctlLastKey 是用 let 声明在后面的 (控制循环那一段), 而
+     本函数最早会在第一次 poll 时就被调用 —— 那时它们在 TDZ 里, 直接读写会
+     抛 ReferenceError (而且是在 async 回调里, 页面毫无迹象)。所以包 try。 */
+  try{ ctlPending = null; ctlLastKey = null; }catch(e){}
+  setVid('bad','已被接管');
+  const el = $('vtake'); if(el) el.classList.add('on');
+  const b = $('vtakeBtn'); if(b) b.disabled = false;
+}
+
+/* 抢回所有权: **只能由用户点击触发**。这是唯一能抢回的路径 —— 自动重连
+   永远不认领, 否则又变成互踢。 */
+async function takeBack(){
+  const b = $('vtakeBtn');
+  if(b){ b.disabled = true; }
+  let j = null;
+  try{
+    const r = await fetch(API+'/api/takeover', {
+      method:'POST', cache:'no-store',
+      headers:{'Content-Type':'application/json', 'X-Page-Id': TAB_ID},
+      body: '{}'});
+    j = await r.json();
+  }catch(e){ j = null; }
+  if(!j || !j.ok){
+    if(b){ b.disabled = false; }
+    return;
+  }
+  tabRevoked = false;
+  tabClaimed = true;
+  const el = $('vtake'); if(el) el.classList.remove('on');
+  vShow('图传连接中…', false);
+  playWHEP();
 }
 function startStats(p){
   clearInterval(statsT); lastBytes = 0;
@@ -800,13 +910,39 @@ function hudRtt(){
   el.classList.remove('no-rtt');
 }
 $('vretry').onclick = playWHEP;
+/* 接管横幅上的按钮: 唯一能抢回所有权的路径 (见 takeBack 的说明)。 */
+$('vtakeBtn').onclick = takeBack;
 $('vfull').onclick = () => {
   const w = $('videoWrap');
   if(document.fullscreenElement) document.exitFullscreen();
   else (w.requestFullscreen ? w.requestFullscreen() : w.webkitRequestFullscreen());
 };
+/* 先认领所有权, 再开始拉流。
+ *
+ * ⚠️ 这个顺序是**功能性的**, 不是风格问题。板子判定"接管"的时候要快照那一刻
+ * 还活着的 mediamtx 会话, 把旧标签页的会话全判死; 而"凡是活着的都属于上一个
+ * 页面"只有在本页还没开始拉流时才成立。如果先 playWHEP() 再认领, 本页刚建的
+ * 会话会被当成"接管前就存在的"一起踢掉 —— 表现是页面加载后图传要白等一轮
+ * 2 秒重连。
+ *
+ * 为什么不用 sendPageInfo(): 那个函数引用了 CTL_TICK_MS/HB_MS 等一堆后面才
+ * 声明的 const, 在这里调用会 TDZ ReferenceError (见它的注释)。这里只发
+ * TAB_ID 和一个 claim 标记, 不碰那些常量。 */
+async function claimThenStart(){
+  try{
+    const r = await fetch(API+'/api/pageinfo', {
+      method:'POST', cache:'no-store',
+      headers:{'Content-Type':'application/json', 'X-Page-Id': TAB_ID},
+      body: JSON.stringify({page: PAGE_ID, tab: TAB_ID, claim: 1,
+                            early: 1, ua: navigator.userAgent})});
+    const j = await r.json();
+    if(j && j.claim) tabClaimed = true;
+  }catch(e){}
+  if(!tabRevoked) playWHEP();
+}
+
 document.addEventListener('visibilitychange', () => { if(document.hidden) stopWHEP(); else playWHEP(); });
-if(!document.hidden) playWHEP();
+if(!document.hidden) claimThenStart();
 
 /* ============ 控制: 直连板载 API ============ */
 const API = '';                       // 同源, 直接用相对路径
@@ -826,11 +962,15 @@ function sendPageInfo(){
   try{
     fetch(API+'/api/pageinfo', {
       method:'POST', cache:'no-store',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({page: PAGE_ID, tick: CTL_TICK_MS, hb: HB_MS,
+      headers:{'Content-Type':'application/json', 'X-Page-Id': TAB_ID},
+      body: JSON.stringify({page: PAGE_ID, tab: TAB_ID, tick: CTL_TICK_MS, hb: HB_MS,
                             gap: SEND_MIN_GAP, to: REQ_TIMEOUT,
                             ua: navigator.userAgent})
-    }).catch(()=>{});
+    }).then(r => r.json()).catch(()=>({})).then(j => {
+      /* 认领成功才把 tabClaimed 置位。它是"被接管"判断的守卫: 在认领之前
+         看到的 owner:false 只说明板子那边所有者还是上一个页面, 不是被踢。 */
+      if(j && j.claim) tabClaimed = true;
+    });
   }catch(e){}
 }
 let apiOk = false, failCount = 0;
@@ -860,10 +1000,21 @@ function setApi(cls, txt){ $('pillApi').className='pill '+cls; $('apiTxt').textC
 
 async function api(path, body){
   try{
-    const opt = body ? {method:'POST', headers:{'Content-Type':'application/json'},
-                        body: JSON.stringify(body)} : {};
+    const h = {'X-Page-Id': TAB_ID};      // 单客户端接管用, 见脚本开头的说明
+    let opt;
+    if(body){
+      opt = {method:'POST', headers: Object.assign({'Content-Type':'application/json'}, h),
+             body: JSON.stringify(body)};
+    }else{
+      opt = {headers: h};
+    }
     const r = await fetch(API+path, Object.assign({cache:'no-store'}, opt));
-    if(!r.ok) throw new Error('HTTP '+r.status);
+    if(!r.ok){
+      // 403 = 被接管了。立刻停手, 不要当成"板子离线"重试 —— 那只会
+      // 让两个浏览器抢来抢去。
+      if(r.status === 403){ onTakenOver(); return null; }
+      throw new Error('HTTP '+r.status);
+    }
     apiOk = true; failCount = 0; setApi('ok','板载直连');
     return body ? await r.json().catch(()=>({})) : await r.json();
   }catch(e){
@@ -884,7 +1035,7 @@ async function poll(){
   let ok = false;
   try{
     const st = await api('/api/status');
-    if(st) { checkPageVer(st); render(st); ok = true; }
+    if(st) { checkPageVer(st); render(st); checkOwner(st); ok = true; }
   } finally { polling = false; }
   /* 断线退避 (2026-10-07): 隧道断时每 1s 一次的 fetch 会往 C5 的 NAPT
      连接表里堆半开 TCP 条目, 表灌满后连正向转发都停摆 —— 页面永远连不
@@ -893,6 +1044,23 @@ async function poll(){
   setTimeout(poll, pollDelay);
 }
 poll();
+
+/* 单客户端接管: 每秒轮询里检查自己还是不是所有者。
+ *
+ * 这是"通知旧页面你被踢了"的那条通道。三个条件缺一不可:
+ *   * st.owner 存在        —— 板子还没升级 / 旧接口时不误判
+ *   * tabClaimed 已经为真  —— 自己认领过。认领之前看到的 owner:false 只说明
+ *                             板子那边所有者还是上一个页面 (比如刚重载),
+ *                             不是被谁踢了。少了这个守卫, 每次刷新页面都会
+ *                             先闪一下"已被接管"。
+ *   * owner === false      —— 确实不是自己了
+ * 故意**不**做任何"抢回来"的动作 —— 那必须是用户点按钮。
+ */
+function checkOwner(st){
+  if(!st || !st.owner) return;
+  if(!tabClaimed) return;
+  if(st.owner.owner === false) onTakenOver();
+}
 
 /* 陈旧页面自检 (2026-10-05)
  *
@@ -1116,6 +1284,11 @@ function ctlSchedule(delay){
 }
 
 function ctlFlush(){
+  /* 被接管: 一条控制指令都不再发。板子侧对这些请求本来就会回 403
+     (双保险), 但这里主动停手更重要 —— 否则 5Hz 的无用请求会一直往
+     C5 的 NAPT 表里堆半开条目。车不需要我们停: 板子在认领所有权那一刻
+     就已经主动停过一次了。 */
+  if(tabRevoked) return;
   if(ctlSending || !ctlPending) return;
   const now = performance.now();
   const since = now - ctlLastAt;
