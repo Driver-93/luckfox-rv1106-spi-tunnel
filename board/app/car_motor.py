@@ -75,6 +75,29 @@ class HwPwm:
             self.err = "export 后 %s 仍未出现" % self.path
             return False
         self.ok = True
+
+        # ---- 极性必须显式设成 normal ----
+        #
+        # ⚠️ 这块板子上 Rockchip PWM 的**默认极性是 inversed**, 也就是说
+        # duty_cycle 表示的是"低电平时间"。实测四路 (pwmchip10/11/6/8) 开机后
+        # 全是 polarity=inversed。
+        #
+        # 而我们的调速按"duty 越大越快"来写 (set_speed: duty = 速度值%)。
+        # 极性一反, 整条速度轴就镜像了:
+        #     速度值 10  -> duty 10% -> 实际高电平 90%  -> 飞快
+        #     速度值 100 -> duty 100% -> 实际高电平 0%   -> 停住
+        # 用户报的"滑条往右拖数字变大反而更慢"就是这个, 代码里怎么查都是对的。
+        #
+        # 必须在 enable **之前**做: PWM 一旦使能, 多数驱动的 polarity 写入会
+        # 直接返回 -EBUSY。而 web_server 重启时通道可能还是上一次留下的
+        # "已导出且已使能" 状态, 所以先显式关掉再改极性, 否则这个修复会
+        # 只在冷启动生效、重启服务就失效 —— 那种"时好时坏"最难查。
+        if self._w("enable", 0):
+            self._last_enable = 0
+        if not self._w("polarity", "normal"):
+            # 不致命: 只是速度轴向会反, 电机仍可控。留痕便于排查。
+            print("[motor] !! pwmchip%d 极性设置失败: %s" % (self.chip, self.err))
+
         self._w("period", self.period_ns)   # period 必须先于 duty
         self._w("duty_cycle", 0)
         return True
@@ -107,11 +130,15 @@ class HwPwm:
         return True
 
     def read_back(self):
-        """回读实际寄存器值, 用于验证 (duty_cycle, enable)。"""
+        """回读实际寄存器值, 用于验证 (duty_cycle, enable, polarity)。
+
+        polarity 也回读: 它是"速度轴向对不对"的唯一硬件证据 —— 软件那边
+        duty 和速度值成正比是看不出问题的 (见 export() 里的说明)。
+        """
         out = {}
-        for k in ("period", "duty_cycle", "enable"):
+        for k in ("period", "duty_cycle", "enable", "polarity"):
             try:
-                out[k] = int(open(os.path.join(self.path, k)).read().strip())
+                out[k] = open(os.path.join(self.path, k)).read().strip()
             except Exception as e:
                 out[k] = "ERR:%s" % e
         return out
