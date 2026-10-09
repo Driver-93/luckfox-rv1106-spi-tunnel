@@ -51,8 +51,7 @@
     "gps_enabled": true,
     "check_4g": true
   },
-  "axis_inv": {
-    "vx": true
-  },
+  "_comment_axis_inv": "轴向取反。空对象 = 全部按 car_motor.drive() 的文档约定。⚠️ 这里曾经写着 {\"vx\": true}, 那是**错的**: 摇杆/A-D 键/方向键都把'往右'发成 vx>0, 再把 vx 取反, 整条左右轴就镜像了 —— 表现为'控制键左右是反的'(实测: 右移发出 FL- FR+ BL+ BR-, 车实际往左)。改这里之前请先用 tools/diagnose/check-axis.py 实测确认, 它会告诉你该不该开。",
+  "axis_inv": {},
   "gps_uart": "/dev/ttyS1"
 }
