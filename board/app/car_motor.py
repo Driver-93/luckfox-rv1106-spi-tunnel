@@ -43,6 +43,7 @@ class HwPwm:
         self.period_ns = int(1e9 / freq)
         self._last_duty = None
         self._last_enable = None
+        self.polarity = None     # export() 里回读, 供 FourMotor 汇总进 dbg
         self.ok = False
         self.err = ""
 
@@ -76,30 +77,47 @@ class HwPwm:
             return False
         self.ok = True
 
-        # ---- 极性必须显式设成 normal ----
+        # ---- 顺序是功能性的, 不能随便换 ----
         #
-        # ⚠️ 这块板子上 Rockchip PWM 的**默认极性是 inversed**, 也就是说
-        # duty_cycle 表示的是"低电平时间"。实测四路 (pwmchip10/11/6/8) 开机后
-        # 全是 polarity=inversed。
+        # 这块板子上 Rockchip PWM 的**默认极性是 inversed**, 也就是
+        # duty_cycle 表示"低电平时间"。而我们的调速模型是 "duty = 速度值%",
+        # 极性一反整条速度轴就镜像: 10 -> 实际高电平 90%(飞快),
+        # 100 -> 实际高电平 0%(停)。用户报的"数字越大越慢"就是这个。
         #
-        # 而我们的调速按"duty 越大越快"来写 (set_speed: duty = 速度值%)。
-        # 极性一反, 整条速度轴就镜像了:
-        #     速度值 10  -> duty 10% -> 实际高电平 90%  -> 飞快
-        #     速度值 100 -> duty 100% -> 实际高电平 0%   -> 停住
-        # 用户报的"滑条往右拖数字变大反而更慢"就是这个, 代码里怎么查都是对的。
+        # ⚠️ 但**必须先写 period 再写 polarity**。内核的 pwm_apply_state()
+        # 开头就校验 `state->period < 1 -> -EINVAL`, 而刚 export 出来的通道
+        # period 是 0 —— 于是 polarity 写入直接 EINVAL。踩过:
+        #   冷启动后四路全是 "极性设置失败: [Errno 22] Invalid argument",
+        #   极性问题原样回来; 而我第一次改完手动测/重启服务时都"成功", 因为
+        #   那时通道早就被上一次运行配好了 period —— 于是这个 bug 只在
+        #   **真正的冷启动**上出现, 表现正是用户说的"一开始正常, 重启后失效"。
         #
-        # 必须在 enable **之前**做: PWM 一旦使能, 多数驱动的 polarity 写入会
-        # 直接返回 -EBUSY。而 web_server 重启时通道可能还是上一次留下的
-        # "已导出且已使能" 状态, 所以先显式关掉再改极性, 否则这个修复会
-        # 只在冷启动生效、重启服务就失效 —— 那种"时好时坏"最难查。
+        # 顺序: enable=0 -> period -> polarity -> period(再写一次) -> duty=0
+        #   * 先 enable=0: web_server 重启时通道可能还使能着, 不先关掉的话
+        #     polarity 会失败; 不处理就变成"只有冷启动生效"
+        #   * period 再写一次: 保险 —— 改极性后如果驱动把 period 重置了,
+        #     这里补回去, 否则后面按 pct 算出来的 duty_ns 会是错的比例
         if self._w("enable", 0):
             self._last_enable = 0
-        if not self._w("polarity", "normal"):
-            # 不致命: 只是速度轴向会反, 电机仍可控。留痕便于排查。
-            print("[motor] !! pwmchip%d 极性设置失败: %s" % (self.chip, self.err))
-
-        self._w("period", self.period_ns)   # period 必须先于 duty
+        self._w("period", self.period_ns)
+        self._w("polarity", "normal")
+        self._w("period", self.period_ns)   # 改极性后驱动可能重置 period, 补一次
         self._w("duty_cycle", 0)
+
+        # 回读实际极性。
+        # ⚠️ 这里**只能**存在 HwPwm 自己的属性上, 不能写 self.dbg —— dbg 是
+        # FourMotor 的, HwPwm 没有它。踩过: 写成 self.dbg[...] 会抛
+        # AttributeError, 而它在 export() 中间, 于是循环到第一路就断了 ——
+        # 表现是 "[motor] 启动失败: 'HwPwm' object has no attribute 'dbg'",
+        # 电机整个没起来, 四个轮子里只有一个被导出。FourMotor 负责把这里的
+        # self.polarity 汇总进它自己的 dbg (见 start_pwm)。
+        try:
+            self.polarity = open(os.path.join(self.path, "polarity")).read().strip()
+        except Exception:
+            self.polarity = "??"
+        if self.polarity != "normal":
+            print("[motor] !! pwmchip%d 极性不是 normal (现在是 %s): %s"
+                  % (self.chip, self.polarity, self.err))
         return True
 
     def set_duty(self, pct):
@@ -227,6 +245,16 @@ class FourMotor:
                     print("[FourMotor] PWM %s (chip%d) 失败: %s"
                           % (c, chip[c], p.err))
             self.dbg["pwm_alive"] = len(self._pwm) == len(self.CH)
+            # 把每一路的实际极性汇总进 dbg, 这样 /api/motordbg 就能看到。
+            # 极性是"速度轴向对不对"的唯一硬件证据 —— 软件侧 duty 随速度值
+            # 单调上升, 极性反了在代码和日志里都看不出来 (见 HwPwm.export)。
+            self.dbg["polarity"] = {
+                c: (self._pwm[c].polarity if c in self._pwm else "not-exported")
+                for c in self.CH}
+            bad = [c for c, v in self.dbg["polarity"].items() if v != "normal"]
+            if bad:
+                print("[FourMotor] !! 极性不是 normal 的通道: %s "
+                      "(速度滑条会反向, duty 表示低电平时间)" % bad)
 
     # ---- 软件 PWM (仅 use_hw_pwm=False 时使用) ----
     def _pwm_loop(self):
