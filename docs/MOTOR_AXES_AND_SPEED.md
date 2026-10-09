@@ -79,25 +79,71 @@
 界面上的表现和代码完全对不上, 所以只能靠查硬件属性。
 
 ### 修法
-`car_motor.HwPwm.export()` 里, **在 enable 之前**写 `polarity=normal`:
+`car_motor.HwPwm.export()` 里, **顺序**是功能性的:
 
 ```python
 if self._w("enable", 0):        # 重启服务时通道可能还使能着
-    self._last_enable = 0       # polarity 在已使能时会返回 -EBUSY
-if not self._w("polarity", "normal"):
-    print("[motor] !! pwmchip%d 极性设置失败" % self.chip)
-self._w("period", self.period_ns)   # period 必须先于 duty
+    self._last_enable = 0
+self._w("period", self.period_ns)   # ⚠️ 必须在 polarity 之前!
+self._w("polarity", "normal")
+self._w("period", self.period_ns)   # 改极性后驱动可能重置 period, 补一次
 self._w("duty_cycle", 0)
 ```
 
-顺序很关键:
-1. **先 enable=0** —— 否则只在冷启动生效, 重启 web 服务就失效 (最难查的那种)
-2. **再 polarity** —— 使能状态下驱动会拒绝改极性
-3. **最后 period / duty** —— 改极性后驱动会重置 period, 必须重设
+#### ⚠️ 为什么 period 必须在 polarity 之前 (踩了两次)
+
+**内核的 `pwm_apply_state()` 开头就校验 `state->period < 1 -> -EINVAL`。**
+而刚 `export` 出来的通道 `period` 是 **0**。所以 "先写 polarity" 会直接:
+
+```
+[motor] !! pwmchip10 极性设置失败: polarity: [Errno 22] Invalid argument
+```
+
+后果是极性问题**原样回来**, 而且:
+
+* **只在真正的冷启动上出现**。已经跑起来的系统里通道早被上一次运行配好了
+  period, 所以写得过 —— 我第一版"改完测一下"和"重启服务测一下"都是通过的。
+  用户报的原话就是"一度正常, 重启后失效"。
+* 重启服务 (`/etc/init.d/S23web restart`) **测不出这个 bug**, 必须冷启动,
+  或者人为 `echo 0 > .../unexport` 把通道打回 period=0 再起服务。
+
+#### ⚠️ 另一个坑: 别把 dbg 写到 HwPwm 上
+
+回读极性时写 `self.dbg[...]` 会抛 `AttributeError` —— `dbg` 是 `FourMotor` 的,
+`HwPwm` 没有。而它在 `export()` 中间, 于是**循环到第一路就断了**:
+
+```
+[motor] 启动失败: 'HwPwm' object has no attribute 'dbg'
+```
+
+结果是只有一个通道被导出、电机整个没起来。现在极性存在 HwPwm 自己的
+`self.polarity` 上, 由 `FourMotor` 在 `__init__` 里汇总进 `dbg["polarity"]`。
+
+#### ⚠️ 单个指令测不出 duty —— 0.5s 失控保护会先把它归零
+
+`failsafe_s = 0.5`。发一条 `forward` 然后 `cat duty_cycle`, 等 wget 返回时
+deadman 往往已经停车了, 读到的就是 `duty=0` —— **看起来像"指令没生效",
+其实是保护正常工作**。我自己就被这个误导过一次。
+
+要测就得: 临时把超时放宽 (`POST /api/failsafe {"t":2}`) → 发一条低速度指令 →
+立刻读 sysfs → stop → 恢复 0.5s。或者干脆用 `FourMotor(simulate=False)` 直接
+调 `drive()` 再 `pwm_state()` 回读, 不走 HTTP (见 `verify-motor.py`)。
 
 ### 怎么验证
-`tools/diagnose/check-pwm-polarity.sh` —— 四路极性必须全是 `normal`。
-`car_motor.HwPwm.read_back()` 现在也回读 `polarity`。
+| 工具 | 查什么 |
+|---|---|
+| `tools/diagnose/check-pwm-polarity.sh` | 四路极性必须全是 `normal` |
+| `tools/diagnose/verify-motor.py` | 冷通道启动 + duty 是否随速度值严格成比例 |
+| `/api/motordbg` 的 `dbg.polarity` | 四路实际极性, 从隧道外面也能看到 |
+
+实测 (冷启动后, 走完整 HTTP 链路):
+
+```
+POST /api/cmd {"c":"forward","s":10}   -> {"ok":true,"dir":"forward"}
+    四路 duty=100000 enable=1 polarity=normal     (period=1000000)
+s=60 -> duty=600000
+stop -> 四路 duty=0 enable=0
+```
 
 ---
 
